@@ -52,11 +52,21 @@ line `<promise>COMPLETE</promise>`. Exhausting the budget without that marker is
 an incomplete, non-zero result.
 
 Questions, timeout, interruption, backend failure, or malformed output stop the
-loop without an automatic retry. Ralph prints a caffeinated full-auto command
-for resuming the affected backend session and, when budget remains, a complete
-command for starting a new Ralph invocation. A started handed-off session
-consumes its iteration. The first Ctrl-C requests graceful resumable shutdown;
-a second Ctrl-C force-kills the backend.
+loop without an automatic retry. Ralph prints a `ralph resume` command for the
+affected backend session and, when budget remains, a complete command for
+starting a new Ralph invocation. `ralph resume` re-establishes the same
+subscription-only trust boundary as an automated iteration: it sanitizes the
+environment, re-proves authentication, effective routing, model availability,
+and customization isolation, then relaunches the interactive session under
+`caffeinate -im` with isolated configuration and full-auto permissions. It
+therefore refuses a recovery environment that has gained an API credential,
+custom endpoint, or unsafe backend customization since the handoff. A started
+handed-off session consumes its iteration. The first Ctrl-C requests graceful
+resumable shutdown; a second Ctrl-C force-kills the backend.
+
+Known subscription credentials, including `CLAUDE_CODE_OAUTH_TOKEN`, are
+redacted from readable progress and every retained diagnostic stream in case
+backend output echoes an environment value.
 
 Runtime prompts, options, structured output, diagnostics, session checkpoints,
 and outcomes are retained under the selected worktree's resolved Git directory

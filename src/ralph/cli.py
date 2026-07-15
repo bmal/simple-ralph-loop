@@ -118,6 +118,62 @@ CLAUDE_SETTINGS = json.dumps(
     },
     separators=(",", ":"),
 )
+# Subscription credentials that legitimately reach the child environment or an
+# operator's shell and could be echoed back through backend output. API-key and
+# custom-endpoint variables are refused before a session starts, but their
+# values are still redacted defensively if they ever appear in retained streams.
+SECRET_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"} | {
+    name
+    for name in LLM_ENV_VARS
+    if any(marker in name for marker in ("API_KEY", "AUTH_TOKEN", "TOKEN", "HEADERS", "CREDENTIAL"))
+}
+REDACTION_PLACEHOLDER = "[redacted]"
+# Values shorter than this are indistinguishable from ordinary tokens (flags,
+# booleans) and redacting them would corrupt unrelated output. Real credentials
+# are far longer, so a conservative floor keeps redaction precise.
+MIN_SECRET_LENGTH = 8
+
+
+class Redactor:
+    def __init__(self, secrets: list[str]) -> None:
+        variants: set[str] = set()
+        for value in secrets:
+            if not value or len(value) < MIN_SECRET_LENGTH:
+                continue
+            variants.add(value)
+            # A secret embedded in a JSON string is escaped; redact that form too
+            # so control-flow parsing (which reads the raw line) stays intact.
+            escaped = json.dumps(value)[1:-1]
+            if escaped != value:
+                variants.add(escaped)
+        self._variants = sorted(variants, key=len, reverse=True)
+
+    def scrub(self, text: str) -> str:
+        if not self._variants or not text:
+            return text
+        for variant in self._variants:
+            if variant in text:
+                text = text.replace(variant, REDACTION_PLACEHOLDER)
+        return text
+
+    def __bool__(self) -> bool:
+        return bool(self._variants)
+
+
+_ACTIVE_REDACTOR = Redactor([])
+
+
+def redact(text: str) -> str:
+    return _ACTIVE_REDACTOR.scrub(text)
+
+
+def collect_secrets() -> list[str]:
+    return [os.environ[name] for name in SECRET_ENV_VARS if os.environ.get(name)]
+
+
+def set_active_redactor(secrets: list[str]) -> None:
+    global _ACTIVE_REDACTOR
+    _ACTIVE_REDACTOR = Redactor(secrets)
 
 
 class RalphError(Exception):
@@ -651,7 +707,7 @@ class EventResult:
             previous = self.printed.get(part_id, "")
             delta = text[len(previous) :] if text.startswith(previous) else text
             if delta:
-                print(delta, end="", flush=True)
+                print(redact(delta), end="", flush=True)
             self.printed[part_id] = text
 
     def _print_progress(self, event_type: str, part: dict[str, Any]) -> None:
@@ -660,7 +716,7 @@ class EventResult:
             state = part.get("state")
             status = state.get("status") if isinstance(state, dict) else None
             suffix = f" ({status})" if isinstance(status, str) else ""
-            print(f"[{tool}{suffix}]", flush=True)
+            print(redact(f"[{tool}{suffix}]"), flush=True)
             return
         print("[step started]" if event_type == "step_start" else "[step finished]", flush=True)
 
@@ -775,7 +831,7 @@ class ClaudeEventResult:
         )
         if text:
             self.assistant_results.append(text)
-            print(text, end="", flush=True)
+            print(redact(text), end="", flush=True)
 
     def _accept_result(self, event: dict[str, Any]) -> None:
         self._require_session(event.get("session_id"))
@@ -803,7 +859,7 @@ class ClaudeEventResult:
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(redact(json.dumps(value, indent=2, sort_keys=True)) + "\n", encoding="utf-8")
 
 
 def record_final_git_state(worktree: Path, run_dir: Path, initial_branch: str) -> str:
@@ -1117,7 +1173,7 @@ def _consume_opencode_iteration(
     def drain_stderr() -> None:
         with stderr_path.open("w", encoding="utf-8") as retained:
             for chunk in process.stderr:
-                retained.write(chunk)
+                retained.write(redact(chunk))
 
     thread = threading.Thread(target=drain_stderr, daemon=True)
     thread.start()
@@ -1132,7 +1188,7 @@ def _consume_opencode_iteration(
         raise RalphError("OpenCode exited before accepting the prompt") from None
     with stdout_path.open("w", encoding="utf-8") as retained:
         for line in process.stdout:
-            retained.write(line)
+            retained.write(redact(line))
             retained.flush()
             try:
                 result.accept(json.loads(line))
@@ -1306,7 +1362,7 @@ def _consume_claude_iteration(
     def drain_stderr() -> None:
         with stderr_path.open("w", encoding="utf-8") as retained:
             for chunk in process.stderr:
-                retained.write(chunk)
+                retained.write(redact(chunk))
 
     thread = threading.Thread(target=drain_stderr, daemon=True)
     thread.start()
@@ -1326,7 +1382,7 @@ def _consume_claude_iteration(
         raise RalphError("Claude exited before accepting the prompt") from None
     with stdout_path.open("w", encoding="utf-8") as retained:
         for line in process.stdout:
-            retained.write(line)
+            retained.write(redact(line))
             retained.flush()
             try:
                 event = json.loads(line)
@@ -1433,35 +1489,27 @@ def shell_command(args: list[str], worktree: Path) -> str:
 
 
 def resume_command(backend: str, model: str, worktree: Path, session_id: str) -> str:
-    if backend == "claude":
-        backend_args = [
-            "/usr/bin/caffeinate",
-            "-im",
-            "claude",
-            "--resume",
-            session_id,
+    # A dedicated `ralph resume` re-establishes the full subscription trust
+    # boundary (sanitized environment, per-session OAuth/routing proof, isolated
+    # configuration, full-auto permissions, and caffeinate) before handing an
+    # operator the interactive backend. A raw backend command would inherit the
+    # operator's ambient environment and skip that proof, so recovery is routed
+    # through Ralph itself. --session is placed last so callers can rely on it.
+    return shell_command(
+        [
+            "ralph",
+            "resume",
+            "--backend",
+            backend,
             "--model",
             model,
-            "--dangerously-skip-permissions",
-            "--setting-sources",
-            "project",
-            "--strict-mcp-config",
-            "--settings",
-            CLAUDE_SETTINGS,
-        ]
-    else:
-        backend_args = [
-            "/usr/bin/caffeinate",
-            "-im",
-            "opencode",
-            "--pure",
-            "--model",
-            model,
-            "--auto",
+            "--worktree",
+            str(worktree),
             "--session",
             session_id,
-        ]
-    return shell_command(backend_args, worktree)
+        ],
+        worktree,
+    )
 
 
 def restart_command(
@@ -1507,11 +1555,11 @@ def print_handoff(
     if terminal:
         print("\a\033[1;31m", end="", file=sys.stderr)
     print("========== RALPH NEEDS OPERATOR ==========", file=sys.stderr)
-    print(f"reason: {error.reason}", file=sys.stderr)
+    print(f"reason: {redact(error.reason)}", file=sys.stderr)
     print(f"ralph run: {run_id}", file=sys.stderr)
     print(f"{backend} session: {error.session_id}", file=sys.stderr)
     if error.detail:
-        print(f"question/error: {error.detail}", file=sys.stderr)
+        print(f"question/error: {redact(error.detail)}", file=sys.stderr)
     print(
         f"manual resume: {resume_command(backend, model, worktree, error.session_id)}",
         file=sys.stderr,
@@ -1590,6 +1638,9 @@ def run_protected(
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
     env = clean_environment(args.model, args.backend)
+    # Redact subscription credentials from every readable and retained stream in
+    # case backend output echoes an environment value.
+    set_active_redactor(collect_secrets())
     print(
         "WARNING: Ralph always uses dangerous full-auto mode permissions; the backend may edit files "
         "and run commands without confirmation.",
@@ -1724,18 +1775,20 @@ def run_protected(
     return 1
 
 
+def validate_model(backend: str, model: str) -> None:
+    if backend == "opencode" and (not model.startswith("openai/") or model == "openai/"):
+        raise RalphError("model must use the openai/ provider")
+    if backend == "claude" and not model.startswith("claude-"):
+        raise RalphError("model must be a Claude subscription model")
+
+
 def run(args: argparse.Namespace) -> int:
     if not 1 <= args.iterations <= 100:
         raise RalphError("iterations must be between 1 and 100")
     if not math.isfinite(args.timeout) or args.timeout < 0:
         raise RalphError("timeout must be zero or positive and finite")
     args.model = args.model or DEFAULT_MODELS[args.backend]
-    if args.backend == "opencode" and (
-        not args.model.startswith("openai/") or args.model == "openai/"
-    ):
-        raise RalphError("model must use the openai/ provider")
-    if args.backend == "claude" and not args.model.startswith("claude-"):
-        raise RalphError("model must be a Claude subscription model")
+    validate_model(args.backend, args.model)
 
     prompt_path, prompt = read_prompt(args.prompt)
     worktree, git_dir, branch, status, slug = git_context(args.worktree)
@@ -1762,6 +1815,62 @@ def clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def resume(args: argparse.Namespace) -> int:
+    validate_model(args.backend, args.model)
+    worktree, _git_dir, _branch, _status, slug = git_context(args.worktree)
+    # Re-establish the exact sanitized child environment and re-prove the
+    # subscription trust boundary (OAuth, effective routing, model availability,
+    # customization isolation) before any resumed model work. reject_unsafe_-
+    # environment inside preflight fails closed on a newly added API credential
+    # or custom endpoint, so recovery cannot silently inherit unsafe routing.
+    env = clean_environment(args.model, args.backend)
+    set_active_redactor(collect_secrets())
+    if args.backend == "claude":
+        claude_preflight(worktree, slug, args.model, env)
+        backend_args = [
+            "claude",
+            "--resume",
+            args.session,
+            "--model",
+            args.model,
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "project",
+            "--strict-mcp-config",
+            "--settings",
+            CLAUDE_SETTINGS,
+        ]
+    else:
+        opencode_preflight(worktree, slug, args.model, env)
+        backend_args = [
+            "opencode",
+            "--pure",
+            "--model",
+            args.model,
+            "--auto",
+            "--session",
+            args.session,
+            "--dir",
+            str(worktree),
+        ]
+    # caffeinate is resolved through PATH, exactly as automated iterations launch
+    # it; preflight has already proved /usr/bin/caffeinate exists. Holding the
+    # -im assertion for the interactive session's whole lifetime replaces Ralph's
+    # own loop-level assertion once control passes to the operator.
+    argv = ["caffeinate", "-im", *backend_args]
+    print(
+        "WARNING: Ralph is relaunching the backend session in dangerous full-auto mode; "
+        "it may edit files and run commands without confirmation.",
+        file=sys.stderr,
+    )
+    try:
+        os.chdir(worktree)
+        os.execvpe(argv[0], argv, env)
+    except OSError as error:
+        raise RalphError(f"could not launch {args.backend} for resume: {error.strerror}") from None
+    return 2
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="ralph")
     subcommands = result.add_subparsers(dest="command", required=True)
@@ -1779,6 +1888,13 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--worktree")
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")
+    resume_parser = subcommands.add_parser(
+        "resume", help="relaunch a handed-off session under Ralph's trust boundary"
+    )
+    resume_parser.add_argument("--backend", choices=["claude", "opencode"], required=True)
+    resume_parser.add_argument("--model", required=True)
+    resume_parser.add_argument("--session", required=True)
+    resume_parser.add_argument("--worktree")
     return result
 
 
@@ -1789,6 +1905,8 @@ def main() -> int:
             return run(args)
         if args.command == "clean":
             return clean(args)
+        if args.command == "resume":
+            return resume(args)
     except RalphError as error:
         print(f"ralph: {error}", file=sys.stderr)
         return 2

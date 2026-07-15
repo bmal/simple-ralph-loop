@@ -141,6 +141,10 @@ class RalphCliTest(unittest.TestCase):
                 printf '%s\\n' "backend diagnostic" >&2
                 exit "${FAKE_EXIT:-0}"
                 ;;
+              *"--session "*)
+                printf '%s\\n' "$*" >> "$FAKE_CALLS/opencode-resume"
+                env | sort > "$FAKE_CALLS/opencode-resume-env"
+                ;;
               *) exit 2 ;;
             esac
             """,
@@ -178,8 +182,16 @@ class RalphCliTest(unittest.TestCase):
                 if test -n "${FAKE_CLAUDE_MUTATE_CUSTOMIZATION:-}"; then
                   mkdir -p "$FAKE_CLAUDE_MUTATE_CUSTOMIZATION"
                 fi
-                printf '%s\n' "claude diagnostic" >&2
+                if test -n "${FAKE_CLAUDE_LEAK_STDERR:-}"; then
+                  printf 'diagnostic token %s here\n' "${CLAUDE_CODE_OAUTH_TOKEN:-}" >&2
+                else
+                  printf '%s\n' "claude diagnostic" >&2
+                fi
                 exit "${FAKE_CLAUDE_EXIT:-0}"
+                ;;
+              "--resume "*)
+                printf '%s\n' "$*" >> "$FAKE_CALLS/claude-resume"
+                env | sort > "$FAKE_CALLS/claude-resume-env"
                 ;;
               *) exit 2 ;;
             esac
@@ -397,6 +409,36 @@ class RalphCliTest(unittest.TestCase):
             capture_output=True,
         )
 
+    def resume_ralph(
+        self,
+        backend: str,
+        model: str,
+        session: str,
+        *,
+        env: dict[str, str] | None = None,
+        worktree: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ralph.cli",
+                "resume",
+                "--backend",
+                backend,
+                "--model",
+                model,
+                "--worktree",
+                str(worktree or self.repo),
+                "--session",
+                session,
+            ],
+            cwd=self.base,
+            env=self._environment(env),
+            text=True,
+            capture_output=True,
+        )
+
     def test_exact_completion_runs_safely_and_retains_evidence(self) -> None:
         result = self.run_ralph()
 
@@ -585,7 +627,8 @@ class RalphCliTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("Claude iteration timed out", result.stderr)
-        self.assertIn("--resume claude-session-1", result.stderr)
+        self.assertIn("ralph resume --backend claude", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         session = json.loads((run_dir / "session.json").read_text())
         self.assertEqual(session["session_id"], "claude-session-1")
@@ -702,9 +745,9 @@ class RalphCliTest(unittest.TestCase):
         self.assertIn("Should I preserve the legacy file?", result.stderr)
         self.assertIn("session: ses_1", result.stderr)
         self.assertIn("iterations remaining: 2", result.stderr)
-        self.assertIn("/usr/bin/caffeinate -im opencode", result.stderr)
+        self.assertIn("ralph resume --backend opencode", result.stderr)
         self.assertIn("--session ses_1", result.stderr)
-        self.assertIn("--model openai/gpt-5.6-sol --auto", result.stderr)
+        self.assertIn("--model openai/gpt-5.6-sol", result.stderr)
         self.assertIn("--iterations 2", result.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         outcome = json.loads((run_dir / "outcome.json").read_text())
@@ -793,8 +836,8 @@ class RalphCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Claude attempted a native question tool", result.stderr)
         self.assertIn("Which migration path should I take?", result.stderr)
-        self.assertIn("/usr/bin/caffeinate -im claude --resume claude-session-1", result.stderr)
-        self.assertIn("--dangerously-skip-permissions", result.stderr)
+        self.assertIn("ralph resume --backend claude", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
 
     def test_claude_marker_prose_question_and_malformed_stream_handoff(self) -> None:
         marker = "<promise>NEEDS_INPUT</promise>\nShould Claude continue with option B?"
@@ -824,7 +867,7 @@ class RalphCliTest(unittest.TestCase):
         )
         self.assertEqual(malformed_result.returncode, 2)
         self.assertIn("Claude emitted malformed structured output", malformed_result.stderr)
-        self.assertIn("--resume claude-session-1", malformed_result.stderr)
+        self.assertIn("--session claude-session-1", malformed_result.stderr)
         runs = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())
         self.assertEqual(
             json.loads((runs[-1] / "outcome.json").read_text())["outcome"],
@@ -1368,6 +1411,138 @@ class RalphCliTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("Claude session failed", failed.stderr)
 
+    def test_resume_relaunches_sanitized_full_auto_backend(self) -> None:
+        opencode = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_9")
+        self.assertEqual(opencode.returncode, 0, opencode.stderr)
+        resume_call = (self.calls / "opencode-resume").read_text()
+        self.assertIn("--session ses_9", resume_call)
+        self.assertIn("--auto", resume_call)
+        self.assertIn("--model openai/gpt-5.6-sol", resume_call)
+        self.assertIn(f"--dir {self.repo.resolve()}", resume_call)
+        self.assertIn("-im", (self.calls / "caffeinate").read_text())
+        resume_env = (self.calls / "opencode-resume-env").read_text()
+        self.assertIn("OPENCODE_DISABLE_AUTOUPDATE=true", resume_env)
+        self.assertIn("OPENCODE_CONFIG_CONTENT=", resume_env)
+        self.assertIn("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=2147483647", resume_env)
+        self.assertNotIn("OPENAI_API_KEY=", resume_env)
+        # Effective routing/auth is re-proved before the interactive session.
+        self.assertTrue((self.calls / "auth-count").exists())
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        claude = self.resume_ralph("claude", "claude-opus-4-8", "claude-session-1")
+        self.assertEqual(claude.returncode, 0, claude.stderr)
+        claude_call = (self.calls / "claude-resume").read_text()
+        self.assertIn("--resume claude-session-1", claude_call)
+        self.assertIn("--dangerously-skip-permissions", claude_call)
+        self.assertIn("--model claude-opus-4-8", claude_call)
+        self.assertIn("--setting-sources project --strict-mcp-config", claude_call)
+        self.assertIn("-im", (self.calls / "caffeinate").read_text())
+        claude_env = (self.calls / "claude-resume-env").read_text()
+        self.assertIn("DISABLE_AUTOUPDATER=1", claude_env)
+        self.assertIn("BASH_MAX_TIMEOUT_MS=2147483647", claude_env)
+        self.assertNotIn("ANTHROPIC_API_KEY=", claude_env)
+        self.assertTrue((self.calls / "claude-auth-count").exists())
+
+    def test_resume_refuses_unsafe_recovery_environment(self) -> None:
+        secret = "sk-live-secret-value"
+        api = self.resume_ralph(
+            "opencode", "openai/gpt-5.6-sol", "ses_1", env={"OPENAI_API_KEY": secret}
+        )
+        self.assertNotEqual(api.returncode, 0)
+        self.assertIn("API credential", api.stderr)
+        self.assertNotIn(secret, api.stdout + api.stderr)
+        self.assertFalse((self.calls / "opencode-resume").exists())
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        changed = self.resume_ralph(
+            "opencode",
+            "openai/gpt-5.6-sol",
+            "ses_1",
+            env={"FAKE_AUTH": "OpenAI oauth\nAnthropic api"},
+        )
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn("unfamiliar or ambiguous", changed.stderr)
+        self.assertFalse((self.calls / "opencode-resume").exists())
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        plugin_dir = self.repo / ".opencode" / "plugin"
+        plugin_dir.mkdir(parents=True)
+        plugin = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_1")
+        self.assertNotEqual(plugin.returncode, 0)
+        self.assertIn("external plugins or custom tools", plugin.stderr)
+        self.assertFalse((self.calls / "opencode-resume").exists())
+        plugin_dir.rmdir()
+        (self.repo / ".opencode").rmdir()
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        settings = self.repo / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"apiKeyHelper": "paid-key-command"}), encoding="utf-8")
+        customized = self.resume_ralph("claude", "claude-opus-4-8", "claude-session-1")
+        self.assertNotEqual(customized.returncode, 0)
+        self.assertIn("Claude customizations", customized.stderr)
+        self.assertFalse((self.calls / "claude-resume").exists())
+
+    def test_resume_rejects_provider_mismatched_model(self) -> None:
+        result = self.resume_ralph("opencode", "anthropic/claude", "ses_1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("openai/", result.stderr)
+        self.assertFalse((self.calls / "opencode-resume").exists())
+
+    def test_streamed_oauth_token_is_redacted_from_claude_streams(self) -> None:
+        token = "oauth-subscription-token-1234567890"
+        text = (
+            f"Token is {token} inside output.\n"
+            "Work complete.\n<promise>COMPLETE</promise>"
+        )
+        result = self.run_ralph(
+            backend="claude",
+            env={
+                "CLAUDE_CODE_OAUTH_TOKEN": token,
+                "FAKE_CLAUDE_EVENTS": self._claude_events(text),
+                "FAKE_CLAUDE_LEAK_STDERR": "1",
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(token, result.stdout)
+        self.assertIn("Token is [redacted] inside output.", result.stdout)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        stdout_ndjson = (run_dir / "stdout.ndjson").read_text()
+        self.assertNotIn(token, stdout_ndjson)
+        self.assertIn("[redacted]", stdout_ndjson)
+        stderr_log = (run_dir / "stderr.log").read_text()
+        self.assertNotIn(token, stderr_log)
+        self.assertIn("[redacted]", stderr_log)
+        # The child session still receives the real credential.
+        self.assertIn(
+            f"CLAUDE_CODE_OAUTH_TOKEN={token}", (self.calls / "claude-env").read_text()
+        )
+
+    def test_oauth_token_redaction_keeps_json_export_parseable(self) -> None:
+        token = "oauth-subscription-token-1234567890"
+        text = f"Echoed {token} back.\nWork complete.\n<promise>COMPLETE</promise>"
+        result = self.run_ralph(
+            env={
+                "CLAUDE_CODE_OAUTH_TOKEN": token,
+                "FAKE_EVENTS": self._events(text),
+                "FAKE_EXPORT": self._export(text),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        session_text = (run_dir / "session.json").read_text()
+        self.assertNotIn(token, session_text)
+        self.assertIn("[redacted]", session_text)
+        # Redaction must not corrupt the retained structured export.
+        json.loads(session_text)
+        self.assertNotIn(token, (run_dir / "stdout.ndjson").read_text())
+
     def test_isolated_package_install_exposes_cli_help_without_a_backend(self) -> None:
         backend = subprocess.run(
             [sys.executable, "-c", "import setuptools"],
@@ -1402,8 +1577,8 @@ class RalphCliTest(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("{run,clean}", help_result.stdout)
-        for command in ("run", "clean"):
+        self.assertIn("{run,clean,resume}", help_result.stdout)
+        for command in ("run", "clean", "resume"):
             command_help = subprocess.run(
                 [str(executable), command, "--help"],
                 env={**os.environ, "PYTHONPATH": str(target)},
