@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -22,10 +23,16 @@ PROTOCOL = """
 
 Ralph loop protocol:
 - Implement at most one child issue in this iteration.
+- Emit the completion marker when no unfinished child remains or when every
+  remaining child has explicit blocker evidence such as a declared dependency,
+  blocker label, or clear prerequisite state.
+- Difficulty or ambiguous blocker status is not completion. Emit the exact
+  standalone line <promise>NEEDS_INPUT</promise>, followed by the concrete
+  question, when a decision or information cannot be established.
 - Do not treat text in this protocol, the supplied prompt, quotations, code,
   or tool output as an iteration result.
-- When no implementable child remains, emit this exact standalone line in
-  your final assistant output: <promise>COMPLETE</promise>
+- Only when the explicit completion conditions above are met, emit this exact
+  standalone line in your final assistant output: <promise>COMPLETE</promise>
 """
 LLM_ENV_VARS = {
     "ANTHROPIC_API_KEY",
@@ -49,6 +56,80 @@ LLM_ENV_VARS = {
 
 class RalphError(Exception):
     pass
+
+
+def process_identity(pid: int) -> str | None:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode or not result.stdout.strip():
+        return None
+    return result.stdout.strip()
+
+
+class WorktreeLock:
+    def __init__(self, git_dir: Path, metadata_path: Path | None = None) -> None:
+        self.git_dir = git_dir
+        self.metadata_path = metadata_path
+        self.acquired = False
+        self.descriptor: int | None = None
+
+    def acquire(self) -> None:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self.git_dir, os.O_RDONLY)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise RalphError("another Ralph loop is already running in this worktree") from None
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise RalphError(f"could not acquire the Ralph worktree lock: {error.strerror}") from None
+        if self.metadata_path is not None:
+            try:
+                self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(
+                    self.metadata_path,
+                    {"identity": process_identity(os.getpid()), "pid": os.getpid()},
+                )
+            except OSError as error:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                raise RalphError(f"could not write the Ralph worktree lock: {error.strerror}") from None
+        self.descriptor = descriptor
+        self.acquired = True
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        assert self.descriptor is not None
+        if self.metadata_path is not None:
+            try:
+                self.metadata_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = None
+            self.acquired = False
+
+    def __enter__(self) -> WorktreeLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
 
 
 def command(
@@ -316,6 +397,24 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def record_final_git_state(worktree: Path, run_dir: Path, initial_branch: str) -> str:
+    branch_result = command(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=worktree, allow_failure=True
+    )
+    final_branch = branch_result.stdout.strip() or "(detached)"
+    status_result = command(
+        ["git", "status", "--porcelain=v1", "--branch"], cwd=worktree, allow_failure=True
+    )
+    status = status_result.stdout or status_result.stderr
+    (run_dir / "git-status-final.txt").write_text(status, encoding="utf-8")
+    if final_branch != initial_branch:
+        print(
+            f"ralph: warning: branch changed from {initial_branch} to {final_branch}",
+            file=sys.stderr,
+        )
+    return final_branch
+
+
 def verify_session(worktree: Path, run_dir: Path, session_id: str, model: str, env: dict[str, str]) -> str:
     exported = command(["opencode", "--pure", "export", session_id], cwd=worktree, env=env)
     try:
@@ -451,16 +550,16 @@ def execute_iteration(
     return ("complete" if complete else "budget_exhausted"), result.session_id
 
 
-def run(args: argparse.Namespace) -> int:
-    if args.backend != "opencode":
-        raise RalphError("only the opencode backend is available in this release")
-    if args.iterations != 1:
-        raise RalphError("this release supports exactly one iteration")
-    if not args.model.startswith("openai/") or args.model == "openai/":
-        raise RalphError("model must use the openai/ provider")
-
-    prompt_path, prompt = read_prompt(args.prompt)
-    worktree, git_dir, branch, status, slug = git_context(args.worktree)
+def run_locked(
+    args: argparse.Namespace,
+    prompt_path: Path,
+    prompt: str,
+    worktree: Path,
+    git_dir: Path,
+    branch: str,
+    status: str,
+    slug: str,
+) -> int:
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
     env = clean_environment(args.model)
@@ -486,18 +585,46 @@ def run(args: argparse.Namespace) -> int:
     )
     (run_dir / "git-status.txt").write_text(status, encoding="utf-8")
     started = datetime.now(timezone.utc).isoformat()
+    iterations: list[dict[str, Any]] = []
+    session_id: str | None = None
+    outcome = "budget_exhausted"
     try:
-        outcome, session_id = execute_iteration(worktree, run_dir, prompt, args.model, env)
+        for number in range(1, args.iterations + 1):
+            iteration_dir = run_dir if number == 1 else run_dir / f"iteration-{number:03d}"
+            iteration_dir.mkdir(exist_ok=True)
+            iteration_started = datetime.now(timezone.utc).isoformat()
+            outcome, session_id = execute_iteration(worktree, iteration_dir, prompt, args.model, env)
+            iterations.append(
+                {
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "number": number,
+                    "outcome": outcome,
+                    "session_id": session_id,
+                    "started_at": iteration_started,
+                }
+            )
+            if outcome == "complete":
+                break
     except RalphError:
+        final_branch = record_final_git_state(worktree, run_dir, branch)
         write_json(
             run_dir / "outcome.json",
-            {"finished_at": datetime.now(timezone.utc).isoformat(), "outcome": "backend_failure", "started_at": started},
+            {
+                "final_branch": final_branch,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "iterations": iterations,
+                "outcome": "backend_failure",
+                "started_at": started,
+            },
         )
         raise
+    final_branch = record_final_git_state(worktree, run_dir, branch)
     write_json(
         run_dir / "outcome.json",
         {
+            "final_branch": final_branch,
             "finished_at": datetime.now(timezone.utc).isoformat(),
+            "iterations": iterations,
             "outcome": outcome,
             "session_id": session_id,
             "started_at": started,
@@ -505,19 +632,54 @@ def run(args: argparse.Namespace) -> int:
     )
     if outcome == "complete":
         return 0
-    print("ralph: iteration budget exhausted without completion", file=sys.stderr)
+    print("RALPH INCOMPLETE: iteration budget exhausted without completion", file=sys.stderr)
     return 1
+
+
+def run(args: argparse.Namespace) -> int:
+    if args.backend != "opencode":
+        raise RalphError("only the opencode backend is available in this release")
+    if not 1 <= args.iterations <= 100:
+        raise RalphError("iterations must be between 1 and 100")
+    if not args.model.startswith("openai/") or args.model == "openai/":
+        raise RalphError("model must use the openai/ provider")
+
+    prompt_path, prompt = read_prompt(args.prompt)
+    worktree, git_dir, branch, status, slug = git_context(args.worktree)
+    with WorktreeLock(git_dir, git_dir / "ralph" / "lock.json"):
+        return run_locked(args, prompt_path, prompt, worktree, git_dir, branch, status, slug)
+
+
+def clean(args: argparse.Namespace) -> int:
+    requested = Path(args.worktree or os.getcwd()).expanduser().resolve()
+    if not requested.is_dir():
+        raise RalphError("worktree is not a directory")
+    top = Path(command(["git", "rev-parse", "--show-toplevel"], cwd=requested).stdout.strip()).resolve()
+    git_dir = Path(
+        command(["git", "rev-parse", "--path-format=absolute", "--git-dir"], cwd=top).stdout.strip()
+    ).resolve()
+    state_root = git_dir / "ralph"
+    lock = WorktreeLock(git_dir)
+    lock.acquire()
+    try:
+        if state_root.exists():
+            shutil.rmtree(state_root)
+    finally:
+        lock.release()
+    return 0
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="ralph")
     subcommands = result.add_subparsers(dest="command", required=True)
-    run_parser = subcommands.add_parser("run", help="run one coding-agent iteration")
+    run_parser = subcommands.add_parser("run", help="run bounded coding-agent iterations")
     run_parser.add_argument("prompt")
     run_parser.add_argument("--backend", choices=["opencode"], required=True)
     run_parser.add_argument("--iterations", type=int, required=True)
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--worktree")
+    clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
+    clean_parser.add_argument("--worktree")
     return result
 
 
@@ -526,6 +688,8 @@ def main() -> int:
     try:
         if args.command == "run":
             return run(args)
+        if args.command == "clean":
+            return clean(args)
     except RalphError as error:
         print(f"ralph: {error}", file=sys.stderr)
         return 2

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 
@@ -70,11 +71,38 @@ class RalphCliTest(unittest.TestCase):
               "--pure auth list") printf '%s\\n' "${FAKE_AUTH:-OpenAI oauth}" ;;
               "--pure debug config") printf '%s\\n' "${FAKE_CONFIG}" ;;
               "--pure models openai") printf '%s\\n' "${FAKE_MODELS:-openai/gpt-5.6-sol}" ;;
-              "--pure export "*) printf '%s\\n' "${FAKE_EXPORT}" ;;
+              "--pure export "*)
+                if test -n "${FAKE_SEQUENCE_DIR:-}"; then
+                  session_id=${3}
+                  cat "$FAKE_SEQUENCE_DIR/export-$session_id"
+                else
+                  printf '%s\\n' "${FAKE_EXPORT}"
+                fi
+                ;;
               *" run "*)
-                cat > "$FAKE_CALLS/stdin"
+                if test -n "${FAKE_SEQUENCE_DIR:-}"; then
+                  count_file="$FAKE_CALLS/run-count"
+                  count=0
+                  test ! -f "$count_file" || count=$(cat "$count_file")
+                  count=$((count + 1))
+                  printf '%s\\n' "$count" > "$count_file"
+                  cat > "$FAKE_CALLS/stdin-$count"
+                  cat "$FAKE_SEQUENCE_DIR/events-$count"
+                else
+                  cat > "$FAKE_CALLS/stdin"
+                  printf '%s\\n' "${FAKE_EVENTS}"
+                fi
                 env | sort > "$FAKE_CALLS/env"
-                printf '%s\\n' "${FAKE_EVENTS}"
+                if test -n "${FAKE_BLOCK_FILE:-}"; then
+                  : > "$FAKE_BLOCK_FILE.ready"
+                  while test -e "$FAKE_BLOCK_FILE"; do sleep 0.05; done
+                fi
+                if test -n "${FAKE_MUTATE_PROMPT:-}"; then
+                  printf '%s\\n' 'mutated by first session' > "$FAKE_MUTATE_PROMPT"
+                fi
+                if test -n "${FAKE_BRANCH_CHANGE:-}"; then
+                  git checkout -b "$FAKE_BRANCH_CHANGE" >/dev/null 2>&1
+                fi
                 printf '%s\\n' "backend diagnostic" >&2
                 exit "${FAKE_EXIT:-0}"
                 ;;
@@ -83,15 +111,15 @@ class RalphCliTest(unittest.TestCase):
             """,
         )
 
-    def _events(self, text: str, model: str = "gpt-5.6-sol") -> str:
+    def _events(self, text: str, model: str = "gpt-5.6-sol", session_id: str = "ses_1") -> str:
         del model
         return json.dumps(
             {
                 "type": "text",
-                "sessionID": "ses_1",
+                "sessionID": session_id,
                 "part": {
                     "id": "part_1",
-                    "sessionID": "ses_1",
+                    "sessionID": session_id,
                     "messageID": "msg_1",
                     "type": "text",
                     "text": text,
@@ -100,15 +128,15 @@ class RalphCliTest(unittest.TestCase):
             }
         )
 
-    def _export(self, text: str, model: str = "gpt-5.6-sol") -> str:
+    def _export(self, text: str, model: str = "gpt-5.6-sol", session_id: str = "ses_1") -> str:
         return json.dumps(
             {
-                "info": {"id": "ses_1"},
+                "info": {"id": session_id},
                 "messages": [
                     {
                         "info": {
                             "id": "msg_1",
-                            "sessionID": "ses_1",
+                            "sessionID": session_id,
                             "role": "assistant",
                             "providerID": "openai",
                             "modelID": model,
@@ -118,6 +146,19 @@ class RalphCliTest(unittest.TestCase):
                 ],
             }
         )
+
+    def _sequence(self, results: list[str]) -> Path:
+        sequence = self.base / "sequence"
+        sequence.mkdir()
+        for index, text in enumerate(results, 1):
+            session_id = f"ses_{index}"
+            (sequence / f"events-{index}").write_text(
+                self._events(text, session_id=session_id) + "\n", encoding="utf-8"
+            )
+            (sequence / f"export-{session_id}").write_text(
+                self._export(text, session_id=session_id) + "\n", encoding="utf-8"
+            )
+        return sequence
 
     def _config(self) -> str:
         return json.dumps(
@@ -135,7 +176,7 @@ class RalphCliTest(unittest.TestCase):
             }
         )
 
-    def run_ralph(self, *extra: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def _environment(self, env: dict[str, str] | None = None) -> dict[str, str]:
         child_env = os.environ.copy()
         child_env.update(
             {
@@ -149,23 +190,51 @@ class RalphCliTest(unittest.TestCase):
         )
         if env:
             child_env.update(env)
-        return subprocess.run(
-            [
+        return child_env
+
+    def _command(
+        self, command: str = "run", *extra: str, worktree: Path | None = None
+    ) -> list[str]:
+        selected_worktree = worktree or self.repo
+        if command == "clean":
+            return [
                 sys.executable,
                 "-m",
                 "ralph.cli",
-                "run",
-                str(self.prompt),
-                "--backend",
-                "opencode",
-                "--iterations",
-                "1",
+                "clean",
                 "--worktree",
-                str(self.repo),
+                str(selected_worktree),
                 *extra,
-            ],
+            ]
+        return [
+            sys.executable,
+            "-m",
+            "ralph.cli",
+            "run",
+            str(self.prompt),
+            "--backend",
+            "opencode",
+            "--iterations",
+            "1",
+            "--worktree",
+            str(selected_worktree),
+            *extra,
+        ]
+
+    def run_ralph(self, *extra: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            self._command("run", *extra),
             cwd=self.base,
-            env=child_env,
+            env=self._environment(env),
+            text=True,
+            capture_output=True,
+        )
+
+    def clean_ralph(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            self._command("clean"),
+            cwd=self.base,
+            env=self._environment(),
             text=True,
             capture_output=True,
         )
@@ -185,7 +254,8 @@ class RalphCliTest(unittest.TestCase):
         composed = (self.calls / "stdin").read_text()
         self.assertIn("Implement the selected issue.", composed)
         self.assertIn("at most one child issue", composed)
-        self.assertIn("exact standalone line", composed)
+        self.assertIn("<promise>COMPLETE</promise>", composed)
+        self.assertIn("explicit completion conditions", composed)
         invocation = (self.calls / "opencode").read_text()
         self.assertIn("run --model openai/gpt-5.6-sol --format json --auto", invocation)
         self.assertIn("-im", (self.calls / "caffeinate").read_text())
@@ -205,6 +275,169 @@ class RalphCliTest(unittest.TestCase):
         self.assertIn("iteration budget exhausted", result.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         self.assertEqual(json.loads((run_dir / "outcome.json").read_text())["outcome"], "budget_exhausted")
+
+    def test_runs_fresh_sessions_until_early_completion_with_one_prompt_snapshot(self) -> None:
+        sequence = self._sequence(
+            [
+                "Implemented child one.",
+                "Implemented child two.",
+                "No work remains.\n<promise>COMPLETE</promise>",
+                "This iteration must not run.",
+            ]
+        )
+
+        result = self.run_ralph(
+            "--iterations",
+            "4",
+            env={"FAKE_MUTATE_PROMPT": str(self.prompt), "FAKE_SEQUENCE_DIR": str(sequence)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.calls / "run-count").read_text().strip(), "3")
+        composed_prompts = [(self.calls / f"stdin-{index}").read_text() for index in range(1, 4)]
+        self.assertEqual(composed_prompts[0], composed_prompts[1])
+        self.assertEqual(composed_prompts[1], composed_prompts[2])
+        self.assertIn("explicit blocker evidence", composed_prompts[0])
+        self.assertIn("<promise>NEEDS_INPUT</promise>", composed_prompts[0])
+
+    def test_iteration_budget_must_be_between_one_and_one_hundred(self) -> None:
+        for budget in ("0", "101"):
+            with self.subTest(budget=budget):
+                result = self.run_ralph("--iterations", budget)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("between 1 and 100", result.stderr)
+
+    def test_explicitly_blocked_children_complete_but_ambiguous_blockers_do_not(self) -> None:
+        blocked = "Every remaining child has declared open blockers.\n<promise>COMPLETE</promise>"
+        blocked_result = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(blocked), "FAKE_EXPORT": self._export(blocked)}
+        )
+        self.assertEqual(blocked_result.returncode, 0, blocked_result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        ambiguous = "<promise>NEEDS_INPUT</promise>\nIs issue #9 actually a prerequisite?"
+        ambiguous_result = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(ambiguous), "FAKE_EXPORT": self._export(ambiguous)}
+        )
+        self.assertNotEqual(ambiguous_result.returncode, 0)
+        self.assertIn("INCOMPLETE", ambiguous_result.stderr)
+
+    def test_live_lock_refuses_a_second_loop_and_dead_owner_is_recovered(self) -> None:
+        blocker = self.base / "blocked"
+        blocker.touch()
+        first_calls = self.base / "first-calls"
+        first_calls.mkdir()
+        first = subprocess.Popen(
+            self._command(),
+            cwd=self.base,
+            env=self._environment({"FAKE_BLOCK_FILE": str(blocker), "FAKE_CALLS": str(first_calls)}),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: first.poll() is None and first.kill())
+        ready = Path(f"{blocker}.ready")
+        for _ in range(100):
+            if ready.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(ready.exists(), "first loop did not reach the backend")
+
+        second = self.run_ralph()
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("already running", second.stderr)
+        cleaning = self.clean_ralph()
+        self.assertNotEqual(cleaning.returncode, 0)
+        self.assertIn("already running", cleaning.stderr)
+
+        first.kill()
+        first.communicate(timeout=5)
+        blocker.unlink()
+        recovered = self.run_ralph()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+    def test_clean_removes_only_selected_repository_ralph_state(self) -> None:
+        result = self.run_ralph()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = self.repo / "keep.txt"
+        source.write_text("source", encoding="utf-8")
+        backend_state = self.base / "opencode-session"
+        backend_state.write_text("transcript", encoding="utf-8")
+
+        cleaned = self.clean_ralph()
+
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertFalse((self.repo / ".git" / "ralph").exists())
+        self.assertEqual(list((self.repo / ".git").glob("ralph*")), [])
+        self.assertEqual(source.read_text(), "source")
+        self.assertEqual(backend_state.read_text(), "transcript")
+
+    def test_linked_worktrees_have_independent_locks(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("initial", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=self.repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Ralph Test",
+                "-c",
+                "user.email=ralph@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        other = self.base / "other-worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "other", str(other)],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        blocker = self.base / "worktree-blocked"
+        blocker.touch()
+        first_calls = self.base / "worktree-first-calls"
+        first_calls.mkdir()
+        first = subprocess.Popen(
+            self._command(),
+            cwd=self.base,
+            env=self._environment({"FAKE_BLOCK_FILE": str(blocker), "FAKE_CALLS": str(first_calls)}),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: first.poll() is None and first.kill())
+        ready = Path(f"{blocker}.ready")
+        for _ in range(100):
+            if ready.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(ready.exists(), "first worktree did not reach the backend")
+
+        independent = subprocess.run(
+            self._command(worktree=other),
+            cwd=self.base,
+            env=self._environment(),
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(independent.returncode, 0, independent.stderr)
+        blocker.unlink()
+        first.communicate(timeout=5)
+
+    def test_branch_changes_are_recorded_and_surfaced(self) -> None:
+        result = self.run_ralph(env={"FAKE_BRANCH_CHANGE": "agent-branch"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("branch changed from main to agent-branch", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertIn("agent-branch", (run_dir / "git-status-final.txt").read_text())
 
     def test_marker_in_tool_output_does_not_complete(self) -> None:
         tool = {
