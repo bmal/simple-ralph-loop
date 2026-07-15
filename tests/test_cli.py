@@ -110,6 +110,27 @@ class RalphCliTest(unittest.TestCase):
             esac
             """,
         )
+        self._script(
+            "claude",
+            """
+            printf '%s\n' "$*" >> "$FAKE_CALLS/claude"
+            case "$*" in
+              "--version") printf '%s\n' "${FAKE_CLAUDE_VERSION:-2.1.208 (Claude Code)}" ;;
+              "auth status")
+                env | sort > "$FAKE_CALLS/claude-auth-env"
+                printf '%s\n' "${FAKE_CLAUDE_AUTH}"
+                ;;
+              "-p "*)
+                cat > "$FAKE_CALLS/claude-stdin"
+                env | sort > "$FAKE_CALLS/claude-env"
+                printf '%s\n' "${FAKE_CLAUDE_EVENTS}"
+                printf '%s\n' "claude diagnostic" >&2
+                exit "${FAKE_CLAUDE_EXIT:-0}"
+                ;;
+              *) exit 2 ;;
+            esac
+            """,
+        )
 
     def _events(self, text: str, model: str = "gpt-5.6-sol", session_id: str = "ses_1") -> str:
         del model
@@ -176,6 +197,46 @@ class RalphCliTest(unittest.TestCase):
             }
         )
 
+    def _claude_events(
+        self,
+        text: str,
+        model: str = "claude-opus-4-8",
+        session_id: str = "claude-session-1",
+    ) -> str:
+        events = [
+            {
+                "type": "system",
+                "subtype": "init",
+                "session_id": session_id,
+                "apiKeySource": "oauth",
+                "model": model,
+                "permissionMode": "bypassPermissions",
+                "tools": ["Bash", "Read", "Edit"],
+                "mcp_servers": [],
+                "skills": ["implement"],
+                "plugins": [],
+            },
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "id": "msg_claude_1",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{"type": "text", "text": text}],
+                },
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": session_id,
+                "result": text,
+                "modelUsage": {model: {"inputTokens": 1, "outputTokens": 1}},
+            },
+        ]
+        return "\n".join(json.dumps(event) for event in events)
+
     def _environment(self, env: dict[str, str] | None = None) -> dict[str, str]:
         child_env = os.environ.copy()
         child_env.update(
@@ -186,6 +247,17 @@ class RalphCliTest(unittest.TestCase):
                 "FAKE_CONFIG": self._config(),
                 "FAKE_EVENTS": self._events("Work complete.\n<promise>COMPLETE</promise>"),
                 "FAKE_EXPORT": self._export("Work complete.\n<promise>COMPLETE</promise>"),
+                "FAKE_CLAUDE_AUTH": json.dumps(
+                    {
+                        "loggedIn": True,
+                        "authMethod": "claude.ai",
+                        "apiProvider": "firstParty",
+                        "subscriptionType": "max",
+                    }
+                ),
+                "FAKE_CLAUDE_EVENTS": self._claude_events(
+                    "Work complete.\n<promise>COMPLETE</promise>"
+                ),
             }
         )
         if env:
@@ -193,7 +265,11 @@ class RalphCliTest(unittest.TestCase):
         return child_env
 
     def _command(
-        self, command: str = "run", *extra: str, worktree: Path | None = None
+        self,
+        command: str = "run",
+        *extra: str,
+        worktree: Path | None = None,
+        backend: str = "opencode",
     ) -> list[str]:
         selected_worktree = worktree or self.repo
         if command == "clean":
@@ -213,7 +289,7 @@ class RalphCliTest(unittest.TestCase):
             "run",
             str(self.prompt),
             "--backend",
-            "opencode",
+            backend,
             "--iterations",
             "1",
             "--worktree",
@@ -221,9 +297,14 @@ class RalphCliTest(unittest.TestCase):
             *extra,
         ]
 
-    def run_ralph(self, *extra: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_ralph(
+        self,
+        *extra: str,
+        env: dict[str, str] | None = None,
+        backend: str = "opencode",
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            self._command("run", *extra),
+            self._command("run", *extra, backend=backend),
             cwd=self.base,
             env=self._environment(env),
             text=True,
@@ -542,6 +623,186 @@ class RalphCliTest(unittest.TestCase):
                 self.assertIn(message, result.stderr)
                 for path in self.calls.iterdir():
                     path.unlink()
+
+    def test_claude_completion_uses_subscription_safe_headless_mode(self) -> None:
+        result = self.run_ralph(backend="claude")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Work complete.", result.stdout)
+        invocation = (self.calls / "claude").read_text()
+        self.assertIn("-p --input-format stream-json --output-format stream-json", invocation)
+        self.assertIn("--dangerously-skip-permissions", invocation)
+        self.assertIn("--model claude-opus-4-8", invocation)
+        self.assertIn("--setting-sources project --strict-mcp-config", invocation)
+        self.assertNotIn("--bare", invocation)
+        child_env = (self.calls / "claude-env").read_text()
+        self.assertIn("DISABLE_AUTOUPDATER=1", child_env)
+        self.assertIn("BASH_MAX_TIMEOUT_MS=2147483647", child_env)
+        auth_env = (self.calls / "claude-auth-env").read_text()
+        self.assertNotIn("ANTHROPIC_API_KEY=", auth_env)
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS=", auth_env)
+        composed = json.loads((self.calls / "claude-stdin").read_text())
+        self.assertIn("Implement the selected issue.", composed["message"]["content"])
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["session_id"], "claude-session-1")
+        self.assertEqual(session["initial_model"], "claude-opus-4-8")
+        self.assertEqual(session["fallback_models"], [])
+        self.assertIn("claude diagnostic", (run_dir / "stderr.log").read_text())
+
+    def test_claude_accepts_explicit_model_and_records_transient_fallback(self) -> None:
+        requested = "claude-sonnet-4-6"
+        events = self._claude_events("Implemented.", model=requested)
+        assistant = json.loads(events.splitlines()[1])
+        assistant["message"]["model"] = "claude-sonnet-4-5"
+        event_lines = events.splitlines()
+        event_lines[1] = json.dumps(assistant)
+
+        result = self.run_ralph(
+            "--model",
+            requested,
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("iteration budget exhausted", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["fallback_models"], ["claude-sonnet-4-5"])
+
+    def test_claude_rejects_unsafe_auth_version_and_initial_model(self) -> None:
+        cases = [
+            ({"FAKE_CLAUDE_VERSION": "2.1.207"}, "2.1.208"),
+            (
+                {
+                    "FAKE_CLAUDE_AUTH": json.dumps(
+                        {"loggedIn": True, "authMethod": "console", "apiProvider": "firstParty"}
+                    )
+                },
+                "subscription OAuth",
+            ),
+            (
+                {
+                    "CLAUDE_CODE_OAUTH_TOKEN": "team-token",
+                    "FAKE_CLAUDE_AUTH": json.dumps(
+                        {
+                            "loggedIn": True,
+                            "authMethod": "claude.ai",
+                            "apiProvider": "firstParty",
+                            "subscriptionType": "team",
+                        }
+                    )
+                },
+                "subscription OAuth",
+            ),
+            (
+                {"FAKE_CLAUDE_EVENTS": self._claude_events("Done", model="claude-sonnet-4-6")},
+                "initial model",
+            ),
+        ]
+        for environment, message in cases:
+            with self.subTest(environment=environment):
+                result = self.run_ralph(backend="claude", env=environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_claude_rejects_customizations_and_malformed_streams(self) -> None:
+        agents = self.repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "unsafe.md").write_text("custom agent", encoding="utf-8")
+        customized = self.run_ralph(backend="claude")
+        self.assertNotEqual(customized.returncode, 0)
+        self.assertIn("Claude customizations", customized.stderr)
+        self.assertFalse((self.calls / "claude").exists())
+
+        (agents / "unsafe.md").unlink()
+        agents.rmdir()
+        settings = self.repo / ".claude" / "settings.json"
+        settings.write_text(json.dumps({"apiKeyHelper": "paid-key-command"}), encoding="utf-8")
+        helper = self.run_ralph(backend="claude")
+        self.assertNotEqual(helper.returncode, 0)
+        self.assertIn("Claude customizations", helper.stderr)
+
+        settings.unlink()
+        (self.repo / ".claude").rmdir()
+        malformed = self.run_ralph(backend="claude", env={"FAKE_CLAUDE_EVENTS": "not-json"})
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertIn("malformed structured output", malformed.stderr)
+
+    def test_claude_oauth_token_is_preserved_but_api_credentials_are_rejected(self) -> None:
+        token_result = self.run_ralph(
+            backend="claude",
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "subscription-token"},
+        )
+        self.assertEqual(token_result.returncode, 0, token_result.stderr)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN=subscription-token", (self.calls / "claude-env").read_text())
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        api_result = self.run_ralph(backend="claude", env={"ANTHROPIC_AUTH_TOKEN": "paid-token"})
+        self.assertNotEqual(api_result.returncode, 0)
+        self.assertIn("API credential", api_result.stderr)
+        self.assertNotIn("paid-token", api_result.stdout + api_result.stderr)
+
+        for name in (
+            "ANTHROPIC_AWS_BASE_URL",
+            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_FOUNDRY_API_KEY",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_MANTLE",
+        ):
+            with self.subTest(name=name):
+                unsafe = self.run_ralph(backend="claude", env={name: "unsafe-routing"})
+                self.assertNotEqual(unsafe.returncode, 0)
+                self.assertIn("API credential", unsafe.stderr)
+
+    def test_claude_rejects_cached_server_managed_settings(self) -> None:
+        managed = self.base / ".claude" / "remote-settings.json"
+        managed.parent.mkdir()
+        managed.write_text(json.dumps({"hooks": {}}), encoding="utf-8")
+
+        result = self.run_ralph(backend="claude", env={"HOME": str(self.base)})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server-managed Claude settings", result.stderr)
+
+    def test_claude_fails_closed_on_runtime_customization_and_backend_contract_errors(self) -> None:
+        event_lines = self._claude_events("Done").splitlines()
+        init = json.loads(event_lines[0])
+        init["plugins"] = [{"name": "external-plugin"}]
+        event_lines[0] = json.dumps(init)
+        customized = self.run_ralph(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+        )
+        self.assertNotEqual(customized.returncode, 0)
+        self.assertIn("external MCP servers or plugins", customized.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertEqual(
+            json.loads((run_dir / "session.json").read_text())["session_id"],
+            "claude-session-1",
+        )
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        missing_result = self.run_ralph(
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": "\n".join(self._claude_events("Done").splitlines()[:-1])},
+        )
+        self.assertNotEqual(missing_result.returncode, 0)
+        self.assertIn("omitted required session metadata or final result", missing_result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        failed = self.run_ralph(backend="claude", env={"FAKE_CLAUDE_EXIT": "1"})
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Claude session failed", failed.stderr)
 
 
 if __name__ == "__main__":

@@ -16,8 +16,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 
-DEFAULT_MODEL = "openai/gpt-5.6-sol"
+DEFAULT_MODELS = {
+    "claude": "claude-opus-4-8",
+    "opencode": "openai/gpt-5.6-sol",
+}
 MIN_OPENCODE_VERSION = (1, 17, 20)
+MIN_CLAUDE_VERSION = (2, 1, 208)
 MAX_PROMPT_BYTES = 10 * 1024 * 1024
 PROTOCOL = """
 
@@ -36,13 +40,29 @@ Ralph loop protocol:
 """
 LLM_ENV_VARS = {
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    "AWS_BEARER_TOKEN_BEDROCK",
     "AZURE_OPENAI_API_KEY",
     "AZURE_OPENAI_ENDPOINT",
     "COHERE_API_KEY",
     "DEEPSEEK_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
     "GROQ_API_KEY",
     "MISTRAL_API_KEY",
     "OPENAI_API_KEY",
@@ -51,6 +71,38 @@ LLM_ENV_VARS = {
     "OPENCODE_MODELS_URL",
     "OPENROUTER_API_KEY",
     "XAI_API_KEY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+}
+CLAUDE_BUILTIN_TOOLS = {
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "Glob",
+    "Grep",
+    "LSP",
+    "NotebookEdit",
+    "Read",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TaskStop",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
 }
 
 
@@ -197,10 +249,10 @@ def git_context(worktree_text: str | None) -> tuple[Path, Path, str, str, str]:
     return top, git_dir, branch, status, github_slug(remote)
 
 
-def version_tuple(value: str) -> tuple[int, int, int]:
+def version_tuple(value: str, program: str = "OpenCode") -> tuple[int, int, int]:
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
     if not match:
-        raise RalphError("could not determine OpenCode version")
+        raise RalphError(f"could not determine {program} version")
     return tuple(int(item) for item in match.groups())  # type: ignore[return-value]
 
 
@@ -219,23 +271,33 @@ def isolated_config(model: str) -> dict[str, Any]:
     }
 
 
-def clean_environment(model: str) -> dict[str, str]:
+def clean_environment(model: str, backend: str) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in LLM_ENV_VARS}
-    env.update(
-        {
-            "OPENCODE_CONFIG_CONTENT": json.dumps(isolated_config(model), separators=(",", ":")),
-            "OPENCODE_DISABLE_AUTOUPDATE": "true",
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
-            "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": "2147483647",
-        }
-    )
+    if backend == "opencode":
+        env.update(
+            {
+                "OPENCODE_CONFIG_CONTENT": json.dumps(isolated_config(model), separators=(",", ":")),
+                "OPENCODE_DISABLE_AUTOUPDATE": "true",
+                "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
+                "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": "2147483647",
+            }
+        )
+    else:
+        env.update(
+            {
+                "API_TIMEOUT_MS": "2147483647",
+                "BASH_DEFAULT_TIMEOUT_MS": "2147483647",
+                "BASH_MAX_TIMEOUT_MS": "2147483647",
+                "DISABLE_AUTOUPDATER": "1",
+            }
+        )
     return env
 
 
 def reject_unsafe_environment() -> None:
     if any(os.environ.get(name) for name in LLM_ENV_VARS):
         raise RalphError("LLM API credential or custom endpoint environment is not allowed")
-    for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"):
+    for name in ("CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"):
         if os.environ.get(name):
             raise RalphError(f"{name} is not allowed because routing would be ambiguous")
 
@@ -263,17 +325,16 @@ def reject_custom_tools(worktree: Path) -> None:
             raise RalphError("external plugins or custom tools must be disabled before running Ralph")
 
 
-def preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> None:
+def common_preflight(worktree: Path, slug: str, executable: str, env: dict[str, str]) -> None:
     if sys.platform != "darwin":
         raise RalphError("Ralph supports macOS only")
     if not Path("/usr/bin/caffeinate").is_file() or shutil.which("caffeinate") is None:
         raise RalphError("/usr/bin/caffeinate is required")
-    for executable in ("gh", "opencode"):
-        if shutil.which(executable) is None:
-            raise RalphError(f"{executable} is required")
+    for required in ("gh", executable):
+        if shutil.which(required) is None:
+            raise RalphError(f"{required} is required")
 
     reject_unsafe_environment()
-    reject_custom_tools(worktree)
     command(["gh", "auth", "status"], cwd=worktree, env=env)
     repo = command(["gh", "repo", "view", slug, "--json", "url"], cwd=worktree, env=env)
     try:
@@ -282,6 +343,11 @@ def preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> Non
         raise RalphError("gh returned malformed repository information") from None
     if github_slug(url) != slug:
         raise RalphError("origin does not match the accessible GitHub repository")
+
+
+def opencode_preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> None:
+    common_preflight(worktree, slug, "opencode", env)
+    reject_custom_tools(worktree)
 
     version = command(["opencode", "--version"], cwd=worktree, env=env).stdout
     if version_tuple(version) < MIN_OPENCODE_VERSION:
@@ -303,6 +369,84 @@ def preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> Non
     models = command(["opencode", "--pure", "models", "openai"], cwd=worktree, env=env).stdout.splitlines()
     if model not in {item.strip() for item in models}:
         raise RalphError(f"selected model is unavailable: {model}")
+
+
+def reject_claude_customizations(worktree: Path) -> None:
+    claude_dir = worktree / ".claude"
+    for name in ("agents", "hooks", "plugins"):
+        if (claude_dir / name).exists():
+            raise RalphError("Claude customizations must be disabled before running Ralph")
+    managed_root = Path("/Library/Application Support/ClaudeCode")
+    if any(
+        path.exists()
+        for path in (
+            managed_root / "managed-settings.json",
+            managed_root / "managed-settings.d",
+            managed_root / "managed-mcp.json",
+        )
+    ):
+        raise RalphError("managed Claude configuration prevents proving safe isolation")
+    managed_preferences = command(
+        ["/usr/bin/profiles", "show", "-type", "configuration"], allow_failure=True
+    )
+    if managed_preferences.returncode:
+        raise RalphError("could not inspect managed Claude preferences")
+    if "com.anthropic.claudecode" in managed_preferences.stdout:
+        raise RalphError("managed Claude preferences prevent proving safe isolation")
+    if (Path.home() / ".claude" / "remote-settings.json").exists():
+        raise RalphError("server-managed Claude settings prevent proving safe isolation")
+    settings_path = claude_dir / "settings.json"
+    if not settings_path.exists():
+        return
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise RalphError("Claude project settings are malformed") from None
+    if not isinstance(settings, dict):
+        raise RalphError("Claude project settings are malformed")
+    unsafe = {
+        "agent",
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "enabledPlugins",
+        "env",
+        "extraKnownMarketplaces",
+        "hooks",
+    }
+    if unsafe.intersection(settings):
+        raise RalphError("Claude customizations must be disabled before running Ralph")
+
+
+def claude_preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> None:
+    common_preflight(worktree, slug, "claude", env)
+    reject_claude_customizations(worktree)
+    version = command(["claude", "--version"], cwd=worktree, env=env).stdout
+    if version_tuple(version, "Claude Code") < MIN_CLAUDE_VERSION:
+        raise RalphError("Claude Code 2.1.208 or newer is required")
+    status_text = command(["claude", "auth", "status"], cwd=worktree, env=env).stdout
+    try:
+        status = json.loads(status_text)
+    except json.JSONDecodeError:
+        raise RalphError("Claude authentication status is malformed") from None
+    subscription_types = {"pro", "max"}
+    stored_subscription = (
+        isinstance(status, dict)
+        and status.get("loggedIn") is True
+        and status.get("authMethod") == "claude.ai"
+        and status.get("apiProvider") == "firstParty"
+        and status.get("subscriptionType") in subscription_types
+    )
+    setup_token = (
+        bool(env.get("CLAUDE_CODE_OAUTH_TOKEN"))
+        and isinstance(status, dict)
+        and status.get("loggedIn") is True
+        and status.get("apiProvider") == "firstParty"
+        and status.get("authMethod") in {"claude.ai", "oauth"}
+        and status.get("subscriptionType") in subscription_types
+    )
+    if not stored_subscription and not setup_token:
+        raise RalphError("Claude must use first-party subscription OAuth authentication")
 
 
 class EventResult:
@@ -393,6 +537,102 @@ class EventResult:
         return "".join(text for owner, text in self.parts.values() if owner == message_id)
 
 
+class ClaudeEventResult:
+    def __init__(self, model: str) -> None:
+        self.expected_model = model
+        self.session_id: str | None = None
+        self.initial_model: str | None = None
+        self.assistant_models: list[str] = []
+        self.assistant_results: list[str] = []
+        self.final_text: str | None = None
+        self.model_usage: list[str] = []
+
+    def accept(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        if event_type == "system" and event.get("subtype") == "init":
+            self._accept_init(event)
+            return
+        if event_type == "assistant":
+            self._accept_assistant(event)
+            return
+        if event_type == "result":
+            self._accept_result(event)
+
+    def _accept_init(self, event: dict[str, Any]) -> None:
+        session_id = event.get("session_id")
+        model = event.get("model")
+        if not isinstance(session_id, str) or not isinstance(model, str):
+            raise RalphError("Claude initialization omitted required metadata")
+        if self.initial_model is not None:
+            raise RalphError("Claude emitted duplicate initialization metadata")
+        self.session_id = session_id
+        self.initial_model = model
+        if model != self.expected_model:
+            raise RalphError("Claude initial model did not match the selected model")
+        if event.get("apiKeySource") != "oauth":
+            raise RalphError("Claude session did not use subscription OAuth")
+        if event.get("permissionMode") != "bypassPermissions":
+            raise RalphError("Claude session did not enter full-auto permission mode")
+        if event.get("mcp_servers") != [] or event.get("plugins") != []:
+            raise RalphError("Claude loaded external MCP servers or plugins")
+        tools = event.get("tools")
+        if (
+            not isinstance(tools, list)
+            or any(not isinstance(tool, str) for tool in tools)
+            or not set(tools).issubset(CLAUDE_BUILTIN_TOOLS)
+        ):
+            raise RalphError("Claude loaded an unknown or external tool")
+
+    def _accept_assistant(self, event: dict[str, Any]) -> None:
+        self._require_session(event.get("session_id"))
+        message = event.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("model"), str):
+            raise RalphError("Claude assistant event omitted required metadata")
+        model = message["model"]
+        if not model.startswith("claude-"):
+            raise RalphError("Claude used a non-subscription model fallback")
+        self.assistant_models.append(model)
+        content = message.get("content")
+        if not isinstance(content, list):
+            raise RalphError("Claude assistant event omitted content")
+        text = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+        if text:
+            self.assistant_results.append(text)
+            print(text, end="", flush=True)
+
+    def _accept_result(self, event: dict[str, Any]) -> None:
+        self._require_session(event.get("session_id"))
+        if event.get("subtype") != "success" or event.get("is_error") is not False:
+            raise RalphError("Claude session reported an unsuccessful result")
+        result = event.get("result")
+        if not isinstance(result, str) or not result:
+            raise RalphError("Claude result omitted the final assistant response")
+        usage = event.get("modelUsage")
+        if not isinstance(usage, dict) or any(
+            not isinstance(model, str) or not model.startswith("claude-") for model in usage
+        ):
+            raise RalphError("Claude result omitted valid model usage")
+        self.model_usage = list(usage)
+        self.final_text = result
+
+    def _require_session(self, value: Any) -> None:
+        if self.session_id is None or value != self.session_id:
+            raise RalphError("Claude stream contained inconsistent session metadata")
+
+    @property
+    def fallback_models(self) -> list[str]:
+        models = self.assistant_models + self.model_usage
+        return list(dict.fromkeys(model for model in models if model != self.expected_model))
+
+
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -472,7 +712,7 @@ def has_completion_marker(text: str) -> bool:
     return False
 
 
-def execute_iteration(
+def execute_opencode_iteration(
     worktree: Path,
     run_dir: Path,
     prompt: str,
@@ -550,6 +790,143 @@ def execute_iteration(
     return ("complete" if complete else "budget_exhausted"), result.session_id
 
 
+def execute_claude_iteration(
+    worktree: Path,
+    run_dir: Path,
+    prompt: str,
+    model: str,
+    env: dict[str, str],
+) -> tuple[str, str | None]:
+    stdout_path = run_dir / "stdout.ndjson"
+    stderr_path = run_dir / "stderr.log"
+    settings = json.dumps(
+        {
+            "autoMemoryEnabled": False,
+            "disableAllHooks": True,
+            "disableClaudeAiConnectors": True,
+        },
+        separators=(",", ":"),
+    )
+    args = [
+        "caffeinate",
+        "-im",
+        "claude",
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--model",
+        model,
+        "--setting-sources",
+        "project",
+        "--strict-mcp-config",
+        "--settings",
+        settings,
+    ]
+    result = ClaudeEventResult(model)
+    try:
+        process = subprocess.Popen(
+            args,
+            cwd=worktree,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as error:
+        raise RalphError(f"could not start Claude: {error.strerror}") from None
+
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+
+    def drain_stderr() -> None:
+        with stderr_path.open("w", encoding="utf-8") as retained:
+            for chunk in process.stderr:
+                retained.write(chunk)
+
+    thread = threading.Thread(target=drain_stderr, daemon=True)
+    thread.start()
+    message = {
+        "type": "user",
+        "message": {"role": "user", "content": prompt + PROTOCOL},
+        "parent_tool_use_id": None,
+    }
+    try:
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.close()
+    except BrokenPipeError:
+        process.stdout.close()
+        process.wait()
+        thread.join()
+        raise RalphError("Claude exited before accepting the prompt") from None
+    with stdout_path.open("w", encoding="utf-8") as retained:
+        for line in process.stdout:
+            retained.write(line)
+            retained.flush()
+            try:
+                event = json.loads(line)
+                result.accept(event)
+            except json.JSONDecodeError:
+                process.kill()
+                process.wait()
+                thread.join()
+                write_claude_session(run_dir, result)
+                raise RalphError("Claude emitted malformed structured output") from None
+            except RalphError:
+                process.kill()
+                process.wait()
+                thread.join()
+                write_claude_session(run_dir, result)
+                raise
+    returncode = process.wait()
+    thread.join()
+    write_claude_session(run_dir, result)
+    if result.assistant_results:
+        print()
+    if returncode:
+        raise RalphError("Claude session failed; see retained stderr")
+    if (
+        result.session_id is None
+        or result.initial_model is None
+        or not result.assistant_results
+        or result.final_text is None
+    ):
+        raise RalphError("Claude output omitted required session metadata or final result")
+    complete = has_completion_marker(result.final_text)
+    return ("complete" if complete else "budget_exhausted"), result.session_id
+
+
+def write_claude_session(run_dir: Path, result: ClaudeEventResult) -> None:
+    write_json(
+        run_dir / "session.json",
+        {
+            "assistant_models": result.assistant_models,
+            "fallback_models": result.fallback_models,
+            "final_result_received": result.final_text is not None,
+            "initial_model": result.initial_model,
+            "model_usage": result.model_usage,
+            "session_id": result.session_id,
+        },
+    )
+
+
+def execute_iteration(
+    backend: str,
+    worktree: Path,
+    run_dir: Path,
+    prompt: str,
+    model: str,
+    env: dict[str, str],
+) -> tuple[str, str | None]:
+    if backend == "claude":
+        return execute_claude_iteration(worktree, run_dir, prompt, model, env)
+    return execute_opencode_iteration(worktree, run_dir, prompt, model, env)
+
+
 def run_locked(
     args: argparse.Namespace,
     prompt_path: Path,
@@ -562,8 +939,11 @@ def run_locked(
 ) -> int:
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
-    env = clean_environment(args.model)
-    preflight(worktree, slug, args.model, env)
+    env = clean_environment(args.model, args.backend)
+    if args.backend == "claude":
+        claude_preflight(worktree, slug, args.model, env)
+    else:
+        opencode_preflight(worktree, slug, args.model, env)
     print("WARNING: full-auto mode may edit files and run commands without confirmation.", file=sys.stderr)
 
     run_dir = git_dir / "ralph" / "runs" / (
@@ -593,7 +973,9 @@ def run_locked(
             iteration_dir = run_dir if number == 1 else run_dir / f"iteration-{number:03d}"
             iteration_dir.mkdir(exist_ok=True)
             iteration_started = datetime.now(timezone.utc).isoformat()
-            outcome, session_id = execute_iteration(worktree, iteration_dir, prompt, args.model, env)
+            outcome, session_id = execute_iteration(
+                args.backend, worktree, iteration_dir, prompt, args.model, env
+            )
             iterations.append(
                 {
                     "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -637,12 +1019,15 @@ def run_locked(
 
 
 def run(args: argparse.Namespace) -> int:
-    if args.backend != "opencode":
-        raise RalphError("only the opencode backend is available in this release")
     if not 1 <= args.iterations <= 100:
         raise RalphError("iterations must be between 1 and 100")
-    if not args.model.startswith("openai/") or args.model == "openai/":
+    args.model = args.model or DEFAULT_MODELS[args.backend]
+    if args.backend == "opencode" and (
+        not args.model.startswith("openai/") or args.model == "openai/"
+    ):
         raise RalphError("model must use the openai/ provider")
+    if args.backend == "claude" and not args.model.startswith("claude-"):
+        raise RalphError("model must be a Claude subscription model")
 
     prompt_path, prompt = read_prompt(args.prompt)
     worktree, git_dir, branch, status, slug = git_context(args.worktree)
@@ -674,9 +1059,9 @@ def parser() -> argparse.ArgumentParser:
     subcommands = result.add_subparsers(dest="command", required=True)
     run_parser = subcommands.add_parser("run", help="run bounded coding-agent iterations")
     run_parser.add_argument("prompt")
-    run_parser.add_argument("--backend", choices=["opencode"], required=True)
+    run_parser.add_argument("--backend", choices=["claude", "opencode"], required=True)
     run_parser.add_argument("--iterations", type=int, required=True)
-    run_parser.add_argument("--model", default=DEFAULT_MODEL)
+    run_parser.add_argument("--model")
     run_parser.add_argument("--worktree")
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")
