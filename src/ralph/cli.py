@@ -4,14 +4,17 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from typing import Any
 from urllib.parse import urlparse
@@ -24,6 +27,8 @@ DEFAULT_MODELS = {
 MIN_OPENCODE_VERSION = (1, 17, 20)
 MIN_CLAUDE_VERSION = (2, 1, 208)
 MAX_PROMPT_BYTES = 10 * 1024 * 1024
+GRACEFUL_SHUTDOWN_SECONDS = 2
+TERMINATE_SHUTDOWN_SECONDS = 1
 PROTOCOL = """
 
 Ralph loop protocol:
@@ -132,6 +137,96 @@ class HandoffError(RalphError):
         self.session_id = session_id
         self.detail = detail
         self.outcome = outcome
+
+
+class StartedIterationError(RalphError):
+    def __init__(self, reason: str, outcome: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.outcome = outcome
+
+
+class ProcessController:
+    def __init__(self, process: subprocess.Popen[str], timeout: float) -> None:
+        self.process = process
+        self.timed_out = False
+        self.interrupted = False
+        self.deadline = time.monotonic() + timeout if timeout else None
+        self._timer = threading.Timer(timeout, self._on_timeout) if timeout else None
+        if self._timer is not None:
+            self._timer.daemon = True
+        self._lock = threading.Lock()
+        self._interrupt_count = 0
+        self._previous_interrupt_handler: Any = None
+
+    def start(self) -> None:
+        self._previous_interrupt_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handle_interrupt)
+        if self._timer is not None:
+            self._timer.start()
+
+    def finish(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            if self._timer is not threading.current_thread():
+                self._timer.join()
+        if self._previous_interrupt_handler is not None:
+            signal.signal(signal.SIGINT, self._previous_interrupt_handler)
+            self._previous_interrupt_handler = None
+
+    def _handle_interrupt(self, _signum: int, _frame: Any) -> None:
+        self._interrupt_count += 1
+        self.interrupted = True
+        if self._interrupt_count == 1:
+            threading.Thread(target=self.stop_gracefully, daemon=True).start()
+        else:
+            self.force_kill()
+
+    def _on_timeout(self) -> None:
+        if self.process.poll() is not None:
+            return
+        self.timed_out = True
+        self.stop_gracefully()
+
+    def remaining(self) -> float | None:
+        if self.deadline is None:
+            return None
+        return max(0, self.deadline - time.monotonic())
+
+    def stop_gracefully(self) -> None:
+        with self._lock:
+            if self.process.poll() is not None:
+                return
+            self._signal_group(signal.SIGINT)
+            try:
+                self.process.wait(timeout=GRACEFUL_SHUTDOWN_SECONDS)
+            except subprocess.TimeoutExpired:
+                self._signal_group(signal.SIGTERM)
+                try:
+                    self.process.wait(timeout=TERMINATE_SHUTDOWN_SECONDS)
+                except subprocess.TimeoutExpired:
+                    self.force_kill()
+                    return
+            # The group can outlive its leader and retain Ralph's pipes.
+            self._signal_group(signal.SIGTERM)
+            time.sleep(0.05)
+            self._signal_group(signal.SIGKILL)
+
+    def force_kill(self) -> None:
+        if self.process.poll() is None:
+            self._signal_group(signal.SIGKILL)
+            self.process.wait()
+
+    def _signal_group(self, requested_signal: signal.Signals) -> None:
+        try:
+            os.killpg(self.process.pid, requested_signal)
+        except PermissionError:
+            try:
+                self.process.send_signal(requested_signal)
+            except ProcessLookupError:
+                pass
+        except ProcessLookupError:
+            pass
 
 
 def process_identity(pid: int) -> str | None:
@@ -699,8 +794,59 @@ def record_final_git_state(worktree: Path, run_dir: Path, initial_branch: str) -
     return final_branch
 
 
-def verify_session(worktree: Path, run_dir: Path, session_id: str, model: str, env: dict[str, str]) -> str:
-    exported = command(["opencode", "--pure", "export", session_id], cwd=worktree, env=env)
+def verify_session(
+    worktree: Path,
+    run_dir: Path,
+    session_id: str,
+    model: str,
+    env: dict[str, str],
+    timeout: float | None,
+) -> str:
+    if timeout is not None and timeout <= 0:
+        raise TimeoutError
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    args = ["opencode", "--pure", "export", session_id]
+    try:
+        process = subprocess.Popen(
+            args,
+            cwd=worktree,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RalphError(f"cannot run opencode: {error.strerror}") from None
+    controller = ProcessController(process, timeout or 0)
+    controller.start()
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=controller.remaining())
+        except subprocess.TimeoutExpired:
+            controller.timed_out = True
+            controller.stop_gracefully()
+            stdout, stderr = process.communicate()
+        if controller.timed_out:
+            raise TimeoutError
+        if controller.interrupted:
+            raise HandoffError(
+                "OpenCode iteration interrupted by user",
+                session_id,
+                outcome="interrupted",
+            )
+    finally:
+        if process.poll() is None:
+            controller.stop_gracefully()
+        controller.finish()
+    exported = subprocess.CompletedProcess(
+        args=args,
+        returncode=process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    if exported.returncode:
+        raise RalphError("opencode session export failed")
     try:
         data = json.loads(exported.stdout)
         messages = data["messages"]
@@ -725,6 +871,8 @@ def verify_session(worktree: Path, run_dir: Path, session_id: str, model: str, e
         )
     except (json.JSONDecodeError, KeyError, IndexError, TypeError):
         raise RalphError("OpenCode session export omitted required metadata") from None
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError
     if active_model != model:
         raise RalphError("OpenCode initial model did not match the selected model")
     if not final_text:
@@ -822,15 +970,22 @@ def needs_input_question(text: str) -> str | None:
     return None
 
 
-def stop_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
+def raise_if_controlled_stop(
+    controller: ProcessController,
+    backend: str,
+    session_id: str | None,
+) -> None:
+    if not controller.timed_out and not controller.interrupted:
         return
-    process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+    if controller.timed_out:
+        reason = f"{backend} iteration timed out"
+        outcome = "timeout"
+    else:
+        reason = f"{backend} iteration interrupted by user"
+        outcome = "interrupted"
+    if session_id:
+        raise HandoffError(reason, session_id, outcome=outcome)
+    raise StartedIterationError(f"{reason} before session metadata was received", outcome)
 
 
 def execute_opencode_iteration(
@@ -839,6 +994,7 @@ def execute_opencode_iteration(
     prompt: str,
     model: str,
     env: dict[str, str],
+    timeout: float,
 ) -> tuple[str, str | None]:
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
@@ -867,10 +1023,44 @@ def execute_opencode_iteration(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
     except OSError as error:
         raise RalphError(f"could not start OpenCode: {error.strerror}") from None
 
+    controller = ProcessController(process, timeout)
+    controller.start()
+    try:
+        return _consume_opencode_iteration(
+            process,
+            controller,
+            result,
+            worktree,
+            run_dir,
+            prompt,
+            model,
+            env,
+            stdout_path,
+            stderr_path,
+        )
+    finally:
+        if process.poll() is None:
+            controller.stop_gracefully()
+        controller.finish()
+
+
+def _consume_opencode_iteration(
+    process: subprocess.Popen[str],
+    controller: ProcessController,
+    result: EventResult,
+    worktree: Path,
+    run_dir: Path,
+    prompt: str,
+    model: str,
+    env: dict[str, str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> tuple[str, str | None]:
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
     def drain_stderr() -> None:
         with stderr_path.open("w", encoding="utf-8") as retained:
@@ -886,6 +1076,7 @@ def execute_opencode_iteration(
         process.stdout.close()
         process.wait()
         thread.join()
+        raise_if_controlled_stop(controller, "OpenCode", result.session_id)
         raise RalphError("OpenCode exited before accepting the prompt") from None
     with stdout_path.open("w", encoding="utf-8") as retained:
         for line in process.stdout:
@@ -894,8 +1085,7 @@ def execute_opencode_iteration(
             try:
                 result.accept(json.loads(line))
             except json.JSONDecodeError:
-                process.kill()
-                process.wait()
+                controller.force_kill()
                 thread.join()
                 if result.session_id:
                     raise HandoffError(
@@ -905,13 +1095,19 @@ def execute_opencode_iteration(
                     ) from None
                 raise RalphError("OpenCode emitted malformed structured output") from None
             if result.question:
-                stop_process(process)
+                controller.stop_gracefully()
                 thread.join()
                 if not result.session_id:
                     raise RalphError("OpenCode attempted a question before session creation")
                 raise HandoffError("OpenCode attempted a native question tool", result.session_id, result.question)
     returncode = process.wait()
     thread.join()
+    if controller.timed_out or controller.interrupted:
+        write_json(
+            run_dir / "session.json",
+            {"final_result_received": False, "session_id": result.session_id},
+        )
+    raise_if_controlled_stop(controller, "OpenCode", result.session_id)
     if result.printed:
         print()
     if returncode:
@@ -924,8 +1120,20 @@ def execute_opencode_iteration(
         raise RalphError("OpenCode session failed; see retained stderr")
     if not result.session_id:
         raise RalphError("OpenCode output omitted required session metadata or final result")
+    controller.finish()
     try:
-        final_text = verify_session(worktree, run_dir, result.session_id, model, env)
+        final_text = verify_session(
+            worktree, run_dir, result.session_id, model, env, controller.remaining()
+        )
+    except TimeoutError:
+        controller.timed_out = True
+        raise HandoffError(
+            "OpenCode iteration timed out",
+            result.session_id,
+            outcome="timeout",
+        ) from None
+    except HandoffError:
+        raise
     except RalphError as error:
         raise HandoffError(
             str(error),
@@ -945,6 +1153,7 @@ def execute_claude_iteration(
     prompt: str,
     model: str,
     env: dict[str, str],
+    timeout: float,
 ) -> tuple[str, str | None]:
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
@@ -978,10 +1187,38 @@ def execute_claude_iteration(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
     except OSError as error:
         raise RalphError(f"could not start Claude: {error.strerror}") from None
 
+    controller = ProcessController(process, timeout)
+    controller.start()
+    try:
+        return _consume_claude_iteration(
+            process,
+            controller,
+            result,
+            run_dir,
+            prompt,
+            stdout_path,
+            stderr_path,
+        )
+    finally:
+        if process.poll() is None:
+            controller.stop_gracefully()
+        controller.finish()
+
+
+def _consume_claude_iteration(
+    process: subprocess.Popen[str],
+    controller: ProcessController,
+    result: ClaudeEventResult,
+    run_dir: Path,
+    prompt: str,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> tuple[str, str | None]:
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
 
     def drain_stderr() -> None:
@@ -1003,6 +1240,7 @@ def execute_claude_iteration(
         process.stdout.close()
         process.wait()
         thread.join()
+        raise_if_controlled_stop(controller, "Claude", result.session_id)
         raise RalphError("Claude exited before accepting the prompt") from None
     with stdout_path.open("w", encoding="utf-8") as retained:
         for line in process.stdout:
@@ -1012,8 +1250,7 @@ def execute_claude_iteration(
                 event = json.loads(line)
                 result.accept(event)
             except json.JSONDecodeError:
-                process.kill()
-                process.wait()
+                controller.force_kill()
                 thread.join()
                 write_claude_session(run_dir, result)
                 if result.session_id:
@@ -1024,7 +1261,7 @@ def execute_claude_iteration(
                     ) from None
                 raise RalphError("Claude emitted malformed structured output") from None
             except RalphError as error:
-                stop_process(process)
+                controller.stop_gracefully()
                 thread.join()
                 write_claude_session(run_dir, result)
                 if isinstance(error, HandoffError):
@@ -1037,7 +1274,7 @@ def execute_claude_iteration(
                     ) from None
                 raise
             if result.question:
-                stop_process(process)
+                controller.stop_gracefully()
                 thread.join()
                 write_claude_session(run_dir, result)
                 if not result.session_id:
@@ -1050,6 +1287,7 @@ def execute_claude_iteration(
     returncode = process.wait()
     thread.join()
     write_claude_session(run_dir, result)
+    raise_if_controlled_stop(controller, "Claude", result.session_id)
     if result.assistant_results:
         print()
     if returncode:
@@ -1101,10 +1339,11 @@ def execute_iteration(
     prompt: str,
     model: str,
     env: dict[str, str],
+    timeout: float,
 ) -> tuple[str, str | None]:
     if backend == "claude":
-        return execute_claude_iteration(worktree, run_dir, prompt, model, env)
-    return execute_opencode_iteration(worktree, run_dir, prompt, model, env)
+        return execute_claude_iteration(worktree, run_dir, prompt, model, env, timeout)
+    return execute_opencode_iteration(worktree, run_dir, prompt, model, env, timeout)
 
 
 def shell_command(args: list[str], worktree: Path) -> str:
@@ -1149,6 +1388,7 @@ def restart_command(
     worktree: Path,
     prompt_path: Path,
     remaining: int,
+    timeout: float,
 ) -> str:
     return shell_command(
         [
@@ -1163,6 +1403,8 @@ def restart_command(
             model,
             "--worktree",
             str(worktree),
+            "--timeout",
+            str(timeout),
         ],
         worktree,
     )
@@ -1177,6 +1419,7 @@ def print_handoff(
     prompt_path: Path,
     remaining: int,
     run_id: str,
+    timeout: float,
 ) -> None:
     terminal = sys.stderr.isatty()
     if terminal:
@@ -1194,7 +1437,7 @@ def print_handoff(
     print(f"iterations remaining: {remaining}", file=sys.stderr)
     if remaining:
         print(
-            f"continue Ralph: {restart_command(backend, model, worktree, prompt_path, remaining)}",
+            f"continue Ralph: {restart_command(backend, model, worktree, prompt_path, remaining, timeout)}",
             file=sys.stderr,
         )
     else:
@@ -1203,7 +1446,56 @@ def print_handoff(
     print("\033[0m" if terminal else "", file=sys.stderr)
 
 
+class CaffeinateAssertion:
+    def __init__(self, worktree: Path) -> None:
+        self.worktree = worktree
+        self.process: subprocess.Popen[str] | None = None
+
+    def __enter__(self) -> CaffeinateAssertion:
+        try:
+            self.process = subprocess.Popen(
+                ["caffeinate", "-im", "-w", str(os.getpid())],
+                cwd=self.worktree,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as error:
+            raise RalphError(f"could not start caffeinate: {error.strerror}") from None
+        try:
+            returncode = self.process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            return self
+        raise RalphError(f"caffeinate exited during startup with status {returncode}")
+
+    def __exit__(self, *_: object) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+
+
 def run_locked(
+    args: argparse.Namespace,
+    prompt_path: Path,
+    prompt: str,
+    worktree: Path,
+    git_dir: Path,
+    branch: str,
+    status: str,
+    slug: str,
+) -> int:
+    with CaffeinateAssertion(worktree):
+        return run_protected(
+            args, prompt_path, prompt, worktree, git_dir, branch, status, slug
+        )
+
+
+def run_protected(
     args: argparse.Namespace,
     prompt_path: Path,
     prompt: str,
@@ -1220,7 +1512,16 @@ def run_locked(
         claude_preflight(worktree, slug, args.model, env)
     else:
         opencode_preflight(worktree, slug, args.model, env)
-    print("WARNING: full-auto mode may edit files and run commands without confirmation.", file=sys.stderr)
+    print(
+        "WARNING: Ralph always uses dangerous full-auto mode permissions; the backend may edit files "
+        "and run commands without confirmation.",
+        file=sys.stderr,
+    )
+    print(
+        "WARNING: caffeinate cannot prevent lid-close or explicit sleep, power loss, or external "
+        "network and service outages.",
+        file=sys.stderr,
+    )
 
     run_dir = git_dir / "ralph" / "runs" / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
@@ -1236,6 +1537,7 @@ def run_locked(
             "model": args.model,
             "prompt": str(prompt_path),
             "repository": slug,
+            "timeout": args.timeout,
             "worktree": str(worktree),
         },
     )
@@ -1250,7 +1552,7 @@ def run_locked(
             iteration_dir.mkdir(exist_ok=True)
             iteration_started = datetime.now(timezone.utc).isoformat()
             outcome, session_id = execute_iteration(
-                args.backend, worktree, iteration_dir, prompt, args.model, env
+                args.backend, worktree, iteration_dir, prompt, args.model, env, args.timeout
             )
             iterations.append(
                 {
@@ -1295,9 +1597,21 @@ def run_locked(
             prompt_path=prompt_path,
             remaining=args.iterations - number,
             run_id=run_dir.name,
+            timeout=args.timeout,
         )
         return 2
-    except RalphError:
+    except RalphError as error:
+        if isinstance(error, StartedIterationError):
+            iterations.append(
+                {
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "number": number,
+                    "outcome": error.outcome,
+                    "reason": error.reason,
+                    "session_id": None,
+                    "started_at": iteration_started,
+                }
+            )
         final_branch = record_final_git_state(worktree, run_dir, branch)
         write_json(
             run_dir / "outcome.json",
@@ -1305,7 +1619,7 @@ def run_locked(
                 "final_branch": final_branch,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "iterations": iterations,
-                "outcome": "backend_failure",
+                "outcome": error.outcome if isinstance(error, StartedIterationError) else "backend_failure",
                 "started_at": started,
             },
         )
@@ -1331,6 +1645,8 @@ def run_locked(
 def run(args: argparse.Namespace) -> int:
     if not 1 <= args.iterations <= 100:
         raise RalphError("iterations must be between 1 and 100")
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        raise RalphError("timeout must be zero or positive and finite")
     args.model = args.model or DEFAULT_MODELS[args.backend]
     if args.backend == "opencode" and (
         not args.model.startswith("openai/") or args.model == "openai/"
@@ -1372,6 +1688,12 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--backend", choices=["claude", "opencode"], required=True)
     run_parser.add_argument("--iterations", type=int, required=True)
     run_parser.add_argument("--model")
+    run_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=2700,
+        help="seconds allowed per iteration; zero disables the limit (default: 2700)",
+    )
     run_parser.add_argument("--worktree")
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")

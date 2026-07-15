@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,11 @@ class RalphCliTest(unittest.TestCase):
             printf '%s\\n' "$*" >> "$FAKE_CALLS/caffeinate"
             test "$1" = "-im"
             shift
+            if test "${1:-}" = "-w"; then
+              test "${FAKE_CAFFEINATE_FAIL:-0}" = "0" || exit 9
+              while kill -0 "$2" 2>/dev/null; do sleep 0.02; done
+              exit 0
+            fi
             exec "$@"
             """,
         )
@@ -73,6 +79,9 @@ class RalphCliTest(unittest.TestCase):
               "--pure debug config") printf '%s\\n' "${FAKE_CONFIG}" ;;
               "--pure models openai") printf '%s\\n' "${FAKE_MODELS:-openai/gpt-5.6-sol}" ;;
               "--pure export "*)
+                if test -n "${FAKE_EXPORT_SLEEP:-}"; then
+                  sleep "$FAKE_EXPORT_SLEEP"
+                fi
                 if test -n "${FAKE_SEQUENCE_DIR:-}"; then
                   session_id=${3}
                   cat "$FAKE_SEQUENCE_DIR/export-$session_id"
@@ -94,6 +103,17 @@ class RalphCliTest(unittest.TestCase):
                   printf '%s\\n' "${FAKE_EVENTS}"
                 fi
                 env | sort > "$FAKE_CALLS/env"
+                if test "${FAKE_IGNORE_SIGNALS:-0}" = "1"; then
+                  trap 'printf INT >> "$FAKE_CALLS/signals"' INT
+                  trap 'printf TERM >> "$FAKE_CALLS/signals"' TERM
+                fi
+                if test -n "${FAKE_SLEEP:-}"; then
+                  if test "${FAKE_IGNORE_SIGNALS:-0}" = "1"; then
+                    while :; do sleep "$FAKE_SLEEP" || true; done
+                  else
+                    sleep "$FAKE_SLEEP"
+                  fi
+                fi
                 if test -n "${FAKE_BLOCK_FILE:-}"; then
                   : > "$FAKE_BLOCK_FILE.ready"
                   while test -e "$FAKE_BLOCK_FILE"; do sleep 0.05; done
@@ -125,6 +145,17 @@ class RalphCliTest(unittest.TestCase):
                 cat > "$FAKE_CALLS/claude-stdin"
                 env | sort > "$FAKE_CALLS/claude-env"
                 printf '%s\n' "${FAKE_CLAUDE_EVENTS}"
+                if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
+                  trap 'printf INT >> "$FAKE_CALLS/claude-signals"' INT
+                  trap 'printf TERM >> "$FAKE_CALLS/claude-signals"' TERM
+                fi
+                if test -n "${FAKE_CLAUDE_SLEEP:-}"; then
+                  if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
+                    while :; do sleep "$FAKE_CLAUDE_SLEEP" || true; done
+                  else
+                    sleep "$FAKE_CLAUDE_SLEEP"
+                  fi
+                fi
                 printf '%s\n' "claude diagnostic" >&2
                 exit "${FAKE_CLAUDE_EXIT:-0}"
                 ;;
@@ -388,6 +419,143 @@ class RalphCliTest(unittest.TestCase):
                 result = self.run_ralph("--iterations", budget)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("between 1 and 100", result.stderr)
+
+    def test_timeout_defaults_to_45_minutes_and_accepts_positive_or_zero_seconds(self) -> None:
+        default = self.run_ralph()
+        self.assertEqual(default.returncode, 0, default.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertEqual(json.loads((run_dir / "options.json").read_text())["timeout"], 2700)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        disabled = self.run_ralph("--timeout", "0")
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        run_dirs = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertEqual(json.loads((run_dirs[-1] / "options.json").read_text())["timeout"], 0)
+
+        for value in ("-1", "nan", "inf"):
+            with self.subTest(value=value):
+                invalid = self.run_ralph("--timeout", value)
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertIn("timeout must be zero or positive", invalid.stderr)
+
+    def test_timeout_gracefully_escalates_and_hands_off_a_started_session(self) -> None:
+        result = self.run_ralph(
+            "--iterations",
+            "2",
+            "--timeout",
+            "0.1",
+            env={
+                "FAKE_EVENTS": self._events("Partial work"),
+                "FAKE_SLEEP": "30",
+                "FAKE_IGNORE_SIGNALS": "1",
+            },
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("iteration timed out", result.stderr)
+        self.assertIn("--session ses_1", result.stderr)
+        self.assertIn("iterations remaining: 1", result.stderr)
+        self.assertIn("--timeout 0.1", result.stderr)
+        self.assertEqual((self.calls / "signals").read_text(), "INTTERM")
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "timeout")
+        self.assertEqual(outcome["iterations"][0]["session_id"], "ses_1")
+
+    def test_claude_timeout_uses_the_same_resumable_handoff(self) -> None:
+        result = self.run_ralph(
+            "--timeout",
+            "0.1",
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events("unused").splitlines()[0],
+                "FAKE_CLAUDE_IGNORE_SIGNALS": "1",
+                "FAKE_CLAUDE_SLEEP": "30",
+            },
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Claude iteration timed out", result.stderr)
+        self.assertIn("--resume claude-session-1", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["session_id"], "claude-session-1")
+        self.assertFalse(session["final_result_received"])
+        self.assertEqual((self.calls / "claude-signals").read_text(), "INTTERM")
+
+    def test_timeout_before_session_metadata_still_consumes_the_started_iteration(self) -> None:
+        result = self.run_ralph(
+            "--timeout",
+            "0.1",
+            env={"FAKE_EVENTS": json.dumps({"type": "status"}), "FAKE_SLEEP": "30"},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("before session metadata was received", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "timeout")
+        self.assertEqual(len(outcome["iterations"]), 1)
+        self.assertIsNone(outcome["iterations"][0]["session_id"])
+
+    def test_opencode_session_verification_obeys_the_iteration_deadline(self) -> None:
+        result = self.run_ralph(
+            "--timeout",
+            "0.1",
+            env={"FAKE_EXPORT_SLEEP": "30"},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("OpenCode iteration timed out", result.stderr)
+        self.assertIn("--session ses_1", result.stderr)
+
+    def test_caffeinate_assertion_covers_the_complete_loop(self) -> None:
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.calls / "caffeinate").read_text().splitlines()
+        self.assertTrue(any(line.startswith("-im -w ") for line in calls), calls)
+
+    def test_failed_loop_caffeinate_assertion_stops_before_backend_preflight(self) -> None:
+        result = self.run_ralph(env={"FAKE_CAFFEINATE_FAIL": "1"})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("caffeinate exited during startup", result.stderr)
+        self.assertFalse((self.calls / "opencode").exists())
+
+    def test_second_interrupt_force_kills_and_hands_off_promptly(self) -> None:
+        process = subprocess.Popen(
+            self._command("run", "--timeout", "0"),
+            cwd=self.base,
+            env=self._environment(
+                {
+                    "FAKE_EVENTS": self._events("Partial work"),
+                    "FAKE_SLEEP": "30",
+                    "FAKE_IGNORE_SIGNALS": "1",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        for _ in range(100):
+            if (self.calls / "env").exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue((self.calls / "env").exists(), "backend did not start")
+
+        started = time.monotonic()
+        process.send_signal(signal.SIGINT)
+        time.sleep(0.1)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=5)
+
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIn("interrupted by user", stderr)
+        self.assertIn("--session ses_1", stderr)
 
     def test_explicitly_blocked_children_complete_but_ambiguous_blockers_do_not(self) -> None:
         blocked = "Every remaining child has declared open blockers.\n<promise>COMPLETE</promise>"
@@ -998,6 +1166,50 @@ class RalphCliTest(unittest.TestCase):
         failed = self.run_ralph(backend="claude", env={"FAKE_CLAUDE_EXIT": "1"})
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("Claude session failed", failed.stderr)
+
+    def test_isolated_package_install_exposes_cli_help_without_a_backend(self) -> None:
+        backend = subprocess.run(
+            [sys.executable, "-c", "import setuptools"],
+            text=True,
+            capture_output=True,
+        )
+        if backend.returncode:
+            self.skipTest("setuptools build backend is not installed")
+        target = self.base / "installed"
+        installed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-build-isolation",
+                "--no-deps",
+                "--target",
+                str(target),
+                str(ROOT),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        executable = target / "bin" / "ralph"
+        help_result = subprocess.run(
+            [str(executable), "--help"],
+            env={**os.environ, "PYTHONPATH": str(target)},
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("{run,clean}", help_result.stdout)
+        for command in ("run", "clean"):
+            command_help = subprocess.run(
+                [str(executable), command, "--help"],
+                env={**os.environ, "PYTHONPATH": str(target)},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(command_help.returncode, 0, command_help.stderr)
 
 
 if __name__ == "__main__":
