@@ -90,6 +90,10 @@ class RalphCliTest(unittest.TestCase):
               "--pure debug config") printf '%s\\n' "${FAKE_CONFIG}" ;;
               "--pure models openai") printf '%s\\n' "${FAKE_MODELS:-openai/gpt-5.6-sol}" ;;
               "--pure export "*)
+                if test -n "${FAKE_RAW_EXPORT_FILE:-}"; then
+                  cat "$FAKE_RAW_EXPORT_FILE"
+                  exit 0
+                fi
                 if test -n "${FAKE_EXPORT_SLEEP:-}"; then
                   sleep "$FAKE_EXPORT_SLEEP"
                 fi
@@ -114,6 +118,16 @@ class RalphCliTest(unittest.TestCase):
                   printf '%s\\n' "${FAKE_EVENTS}"
                 fi
                 env | sort > "$FAKE_CALLS/env"
+                if test -n "${FAKE_RAW_STDOUT_FILE:-}"; then
+                  cat "$FAKE_RAW_STDOUT_FILE"
+                  exit 0
+                fi
+                if test -n "${FAKE_ORPHAN_SLEEP:-}"; then
+                  # A descendant keeps the stdout/stderr pipes open after the
+                  # group leader exits, modelling a departed leader.
+                  (sleep "$FAKE_ORPHAN_SLEEP") &
+                  exit 0
+                fi
                 if test "${FAKE_IGNORE_SIGNALS:-0}" = "1"; then
                   trap 'printf INT >> "$FAKE_CALLS/signals"' INT
                   trap 'printf TERM >> "$FAKE_CALLS/signals"' TERM
@@ -137,6 +151,9 @@ class RalphCliTest(unittest.TestCase):
                 fi
                 if test -n "${FAKE_BRANCH_CHANGE:-}"; then
                   git checkout -b "$FAKE_BRANCH_CHANGE" >/dev/null 2>&1
+                fi
+                if test -n "${FAKE_RAW_STDERR_FILE:-}"; then
+                  cat "$FAKE_RAW_STDERR_FILE" >&2
                 fi
                 printf '%s\\n' "backend diagnostic" >&2
                 exit "${FAKE_EXIT:-0}"
@@ -168,6 +185,14 @@ class RalphCliTest(unittest.TestCase):
                 cat > "$FAKE_CALLS/claude-stdin"
                 env | sort > "$FAKE_CALLS/claude-env"
                 printf '%s\n' "${FAKE_CLAUDE_EVENTS}"
+                if test -n "${FAKE_CLAUDE_RAW_STDOUT_FILE:-}"; then
+                  cat "$FAKE_CLAUDE_RAW_STDOUT_FILE"
+                  exit 0
+                fi
+                if test -n "${FAKE_CLAUDE_ORPHAN_SLEEP:-}"; then
+                  (sleep "$FAKE_CLAUDE_ORPHAN_SLEEP") &
+                  exit 0
+                fi
                 if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
                   trap 'printf INT >> "$FAKE_CALLS/claude-signals"' INT
                   trap 'printf TERM >> "$FAKE_CALLS/claude-signals"' TERM
@@ -181,6 +206,9 @@ class RalphCliTest(unittest.TestCase):
                 fi
                 if test -n "${FAKE_CLAUDE_MUTATE_CUSTOMIZATION:-}"; then
                   mkdir -p "$FAKE_CLAUDE_MUTATE_CUSTOMIZATION"
+                fi
+                if test -n "${FAKE_CLAUDE_RAW_STDERR_FILE:-}"; then
+                  cat "$FAKE_CLAUDE_RAW_STDERR_FILE" >&2
                 fi
                 if test -n "${FAKE_CLAUDE_LEAK_STDERR:-}"; then
                   printf 'diagnostic token %s here\n' "${CLAUDE_CODE_OAUTH_TOKEN:-}" >&2
@@ -707,6 +735,164 @@ class RalphCliTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2)
         self.assertIn("interrupted by user", stderr)
         self.assertIn("--session ses_1", stderr)
+
+    def _invalid_utf8_file(self, name: str, prefix: bytes = b"") -> Path:
+        path = self.base / name
+        # 0xFF is never valid in a UTF-8 stream, so a strict decoder must fail.
+        path.write_bytes(prefix + b"\xff\xfe not utf-8\n")
+        return path
+
+    def _run_guarded(
+        self,
+        *extra: str,
+        env: dict[str, str] | None = None,
+        backend: str = "opencode",
+        timeout: float = 20,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                self._command("run", *extra, backend=backend),
+                cwd=self.base,
+                env=self._environment(env),
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as expired:
+            self.fail(
+                "ralph blocked instead of terminating the backend process group: "
+                f"{expired}"
+            )
+
+    def test_timeout_kills_departed_leader_with_pipe_holding_descendant(self) -> None:
+        # The fake leader exits immediately but a descendant keeps the stdout and
+        # stderr pipes open. Ralph must terminate the whole group on timeout
+        # rather than block forever waiting on the inherited pipes.
+        result = self._run_guarded(
+            "--timeout",
+            "0.3",
+            env={"FAKE_EVENTS": self._events("Partial work"), "FAKE_ORPHAN_SLEEP": "30"},
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("iteration timed out", result.stderr)
+        self.assertIn("--session ses_1", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "timeout")
+
+    def test_claude_timeout_kills_departed_leader_with_pipe_holding_descendant(self) -> None:
+        result = self._run_guarded(
+            "--timeout",
+            "0.3",
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events("unused").splitlines()[0],
+                "FAKE_CLAUDE_ORPHAN_SLEEP": "30",
+            },
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Claude iteration timed out", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
+
+    def test_pre_metadata_timeout_shows_operator_banner_with_remaining_budget(self) -> None:
+        result = self._run_guarded(
+            "--iterations",
+            "2",
+            "--timeout",
+            "0.3",
+            env={"FAKE_EVENTS": json.dumps({"type": "status"}), "FAKE_SLEEP": "30"},
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("before session metadata was received", result.stderr)
+        # No session id exists, so the manual resume line is omitted entirely...
+        self.assertNotIn("manual resume:", result.stderr)
+        # ...but the exact remaining-budget command still appears.
+        self.assertIn("iterations remaining: 1", result.stderr)
+        self.assertIn("continue Ralph:", result.stderr)
+        self.assertIn("--iterations 1", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "timeout")
+        self.assertEqual(len(outcome["iterations"]), 1)
+        self.assertIsNone(outcome["iterations"][0]["session_id"])
+
+    def test_opencode_invalid_utf8_streams_fail_closed_without_traceback(self) -> None:
+        raw = self._invalid_utf8_file("bad-stdout.bin")
+        stdout_result = self._run_guarded(
+            env={"FAKE_EVENTS": self._events("Partial"), "FAKE_RAW_STDOUT_FILE": str(raw)}
+        )
+        self.assertEqual(stdout_result.returncode, 2, stdout_result.stderr)
+        self.assertIn("invalid UTF-8", stdout_result.stderr)
+        self.assertIn("--session ses_1", stdout_result.stderr)
+        self.assertNotIn("Traceback", stdout_result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertEqual(
+            json.loads((run_dir / "outcome.json").read_text())["outcome"],
+            "backend_contract_failure",
+        )
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        stderr_result = self._run_guarded(env={"FAKE_RAW_STDERR_FILE": str(raw)})
+        self.assertEqual(stderr_result.returncode, 2, stderr_result.stderr)
+        self.assertIn("invalid UTF-8", stderr_result.stderr)
+        self.assertNotIn("Traceback", stderr_result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        export_result = self._run_guarded(env={"FAKE_RAW_EXPORT_FILE": str(raw)})
+        self.assertEqual(export_result.returncode, 2, export_result.stderr)
+        self.assertIn("invalid UTF-8", export_result.stderr)
+        self.assertNotIn("Traceback", export_result.stderr)
+
+    def test_claude_invalid_utf8_streams_fail_closed_without_traceback(self) -> None:
+        raw = self._invalid_utf8_file("bad-claude.bin")
+        stdout_result = self._run_guarded(
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events("unused").splitlines()[0],
+                "FAKE_CLAUDE_RAW_STDOUT_FILE": str(raw),
+            },
+        )
+        self.assertEqual(stdout_result.returncode, 2, stdout_result.stderr)
+        self.assertIn("invalid UTF-8", stdout_result.stderr)
+        self.assertIn("--session claude-session-1", stdout_result.stderr)
+        self.assertNotIn("Traceback", stdout_result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        stderr_result = self._run_guarded(
+            backend="claude", env={"FAKE_CLAUDE_RAW_STDERR_FILE": str(raw)}
+        )
+        self.assertEqual(stderr_result.returncode, 2, stderr_result.stderr)
+        self.assertIn("invalid UTF-8", stderr_result.stderr)
+        self.assertNotIn("Traceback", stderr_result.stderr)
+
+    def test_claude_partial_init_preserves_session_for_resumable_handoff(self) -> None:
+        # A valid session id arrives in an init event whose other required fields
+        # are malformed. The session must be checkpointed so the contract failure
+        # becomes a consuming, resumable handoff.
+        init = json.loads(self._claude_events("unused").splitlines()[0])
+        del init["model"]
+        result = self._run_guarded(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": json.dumps(init)}
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("ralph resume --backend claude", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertEqual(outcome["session_id"], "claude-session-1")
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["session_id"], "claude-session-1")
+        self.assertFalse(session["final_result_received"])
 
     def test_explicitly_blocked_children_complete_but_ambiguous_blockers_do_not(self) -> None:
         blocked = "Every remaining child has declared open blockers.\n<promise>COMPLETE</promise>"
