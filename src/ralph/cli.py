@@ -425,6 +425,19 @@ def strip_ansi(value: str) -> str:
     return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
 
 
+def validate_opencode_auth_output(value: str) -> None:
+    lines = [line.strip() for line in strip_ansi(value).splitlines() if line.strip()]
+    error = "OpenCode must have exactly one understood OpenAI OAuth credential; output is unfamiliar or ambiguous"
+    if len(lines) != 5:
+        raise RalphError(error)
+    if not re.fullmatch(r"┌\s+Credentials\s+.+", lines[0]) or lines[1] != "│" or lines[3] != "│":
+        raise RalphError(error)
+    if not re.fullmatch(r"[●•]\s+OpenAI\s+oauth", lines[2]):
+        raise RalphError(error)
+    if not re.fullmatch(r"└\s+1\s+credential(?:s)?", lines[4]):
+        raise RalphError(error)
+
+
 def validate_effective_config(config: Any, model: str) -> None:
     if not isinstance(config, dict):
         raise RalphError("effective OpenCode configuration is not an object")
@@ -471,14 +484,8 @@ def opencode_preflight(worktree: Path, slug: str, model: str, env: dict[str, str
     version = command(["opencode", "--version"], cwd=worktree, env=env).stdout
     if version_tuple(version) < MIN_OPENCODE_VERSION:
         raise RalphError("OpenCode 1.17.20 or newer is required")
-    auth = strip_ansi(command(["opencode", "--pure", "auth", "list"], cwd=worktree, env=env).stdout)
-    credential_lines = [
-        line.strip().lower()
-        for line in auth.splitlines()
-        if re.search(r"\b(?:oauth|api|key)\s*$", line.strip(), re.IGNORECASE)
-    ]
-    if len(credential_lines) != 1 or "openai" not in credential_lines[0] or not credential_lines[0].endswith("oauth"):
-        raise RalphError("OpenCode must have OpenAI OAuth and no API-key authentication")
+    auth = command(["opencode", "--pure", "auth", "list"], cwd=worktree, env=env).stdout
+    validate_opencode_auth_output(auth)
 
     resolved = command(["opencode", "--pure", "debug", "config"], cwd=worktree, env=env).stdout
     try:
@@ -598,13 +605,20 @@ class EventResult:
         info = props.get("info")
         if event.get("type") == "message.updated" and isinstance(info, dict) and info.get("role") == "assistant":
             message_id = info.get("id")
-            if isinstance(message_id, str) and message_id not in self.assistant_messages:
-                self.assistant_messages.append(message_id)
-            self._session(info.get("sessionID"))
+            message_session = info.get("sessionID")
             provider = info.get("providerID")
             model = info.get("modelID")
-            if isinstance(provider, str) and isinstance(model, str):
-                self.assistant_models.append(f"{provider}/{model}")
+            if (
+                not isinstance(message_id, str)
+                or not isinstance(message_session, str)
+                or not isinstance(provider, str)
+                or not isinstance(model, str)
+            ):
+                raise RalphError("OpenCode assistant event omitted routing metadata")
+            self._session(message_session)
+            self._accept_assistant_route(provider, model)
+            if message_id not in self.assistant_messages:
+                self.assistant_messages.append(message_id)
             return
         part = props.get("part")
         if event.get("type") == "message.part.updated" and isinstance(part, dict):
@@ -657,8 +671,24 @@ class EventResult:
         self.question = extract_question(part.get("state")) or "The backend attempted to ask a question."
 
     def _session(self, value: Any) -> None:
-        if isinstance(value, str) and not self.session_id:
+        if not isinstance(value, str):
+            return
+        if self.session_id is None:
             self.session_id = value
+        elif value != self.session_id:
+            raise RalphError("OpenCode stream contained inconsistent session metadata")
+
+    def _accept_assistant_route(self, provider: str, model: str) -> None:
+        route = f"{provider}/{model}"
+        if provider != "openai" or not model:
+            raise RalphError("OpenCode used an alternate or malformed provider route")
+        if not self.assistant_models and route != self.expected_model:
+            raise RalphError("OpenCode initial model did not match the selected model")
+        self.assistant_models.append(route)
+
+    @property
+    def fallback_models(self) -> list[str]:
+        return list(dict.fromkeys(model for model in self.assistant_models if model != self.expected_model))
 
     @property
     def final_text(self) -> str:
@@ -801,6 +831,7 @@ def verify_session(
     model: str,
     env: dict[str, str],
     timeout: float | None,
+    runtime_result: EventResult,
 ) -> str:
     if timeout is not None and timeout <= 0:
         raise TimeoutError
@@ -859,8 +890,17 @@ def verify_session(
             and isinstance(item.get("info"), dict)
             and item["info"].get("role") == "assistant"
         ]
-        first = assistants[0]["info"]
-        active_model = f"{first['providerID']}/{first['modelID']}"
+        routes: list[str] = []
+        for item in assistants:
+            info = item["info"]
+            if info.get("sessionID") != session_id:
+                raise TypeError
+            provider = info.get("providerID")
+            message_model = info.get("modelID")
+            if provider != "openai" or not isinstance(message_model, str) or not message_model:
+                raise TypeError
+            routes.append(f"{provider}/{message_model}")
+        active_model = routes[0]
         parts = assistants[-1]["parts"]
         if not isinstance(parts, list):
             raise TypeError
@@ -877,7 +917,19 @@ def verify_session(
         raise RalphError("OpenCode initial model did not match the selected model")
     if not final_text:
         raise RalphError("OpenCode session export omitted the final assistant result")
-    (run_dir / "session.json").write_text(exported.stdout, encoding="utf-8")
+    data["ralph_verification"] = {
+        "assistant_models": routes,
+        "fallback_models": list(
+            dict.fromkeys(
+                route
+                for route in runtime_result.assistant_models + routes
+                if route != model
+            )
+        ),
+        "initial_model": active_model,
+        "session_id": session_id,
+    }
+    write_json(run_dir / "session.json", data)
     return final_text
 
 
@@ -1087,6 +1139,7 @@ def _consume_opencode_iteration(
             except json.JSONDecodeError:
                 controller.force_kill()
                 thread.join()
+                write_opencode_session(run_dir, result)
                 if result.session_id:
                     raise HandoffError(
                         "OpenCode emitted malformed structured output",
@@ -1094,6 +1147,17 @@ def _consume_opencode_iteration(
                         outcome="backend_contract_failure",
                     ) from None
                 raise RalphError("OpenCode emitted malformed structured output") from None
+            except RalphError as error:
+                controller.stop_gracefully()
+                thread.join()
+                write_opencode_session(run_dir, result)
+                if result.session_id:
+                    raise HandoffError(
+                        str(error),
+                        result.session_id,
+                        outcome="backend_contract_failure",
+                    ) from None
+                raise StartedIterationError(str(error), "backend_contract_failure") from None
             if result.question:
                 controller.stop_gracefully()
                 thread.join()
@@ -1123,7 +1187,13 @@ def _consume_opencode_iteration(
     controller.finish()
     try:
         final_text = verify_session(
-            worktree, run_dir, result.session_id, model, env, controller.remaining()
+            worktree,
+            run_dir,
+            result.session_id,
+            model,
+            env,
+            controller.remaining(),
+            result,
         )
     except TimeoutError:
         controller.timed_out = True
@@ -1145,6 +1215,18 @@ def _consume_opencode_iteration(
         raise HandoffError("OpenCode requested operator input", result.session_id, question)
     complete = has_completion_marker(final_text)
     return ("complete" if complete else "budget_exhausted"), result.session_id
+
+
+def write_opencode_session(run_dir: Path, result: EventResult) -> None:
+    write_json(
+        run_dir / "session.json",
+        {
+            "assistant_models": result.assistant_models,
+            "fallback_models": result.fallback_models,
+            "final_result_received": False,
+            "session_id": result.session_id,
+        },
+    )
 
 
 def execute_claude_iteration(
@@ -1508,10 +1590,6 @@ def run_protected(
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
     env = clean_environment(args.model, args.backend)
-    if args.backend == "claude":
-        claude_preflight(worktree, slug, args.model, env)
-    else:
-        opencode_preflight(worktree, slug, args.model, env)
     print(
         "WARNING: Ralph always uses dangerous full-auto mode permissions; the backend may edit files "
         "and run commands without confirmation.",
@@ -1550,6 +1628,10 @@ def run_protected(
         for number in range(1, args.iterations + 1):
             iteration_dir = run_dir if number == 1 else run_dir / f"iteration-{number:03d}"
             iteration_dir.mkdir(exist_ok=True)
+            if args.backend == "claude":
+                claude_preflight(worktree, slug, args.model, env)
+            else:
+                opencode_preflight(worktree, slug, args.model, env)
             iteration_started = datetime.now(timezone.utc).isoformat()
             outcome, session_id = execute_iteration(
                 args.backend, worktree, iteration_dir, prompt, args.model, env, args.timeout

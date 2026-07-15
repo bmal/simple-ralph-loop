@@ -75,7 +75,18 @@ class RalphCliTest(unittest.TestCase):
             printf '%s\\n' "$*" >> "$FAKE_CALLS/opencode"
             case "$*" in
               "--version") printf '%s\\n' "${FAKE_VERSION:-1.17.20}" ;;
-              "--pure auth list") printf '%s\\n' "${FAKE_AUTH:-OpenAI oauth}" ;;
+              "--pure auth list")
+                auth_count_file="$FAKE_CALLS/auth-count"
+                auth_count=0
+                test ! -f "$auth_count_file" || auth_count=$(cat "$auth_count_file")
+                auth_count=$((auth_count + 1))
+                printf '%s\\n' "$auth_count" > "$auth_count_file"
+                if test -n "${FAKE_AUTH_MUTATED_FILE:-}" && test -e "$FAKE_AUTH_MUTATED_FILE"; then
+                  printf '%s\\n' '┌ Credentials ~/.local/share/opencode/auth.json' '│' '● OpenAI oauth' '● Anthropic api' '│' '└ 2 credentials'
+                else
+                  printf '%s\\n' "${FAKE_AUTH}"
+                fi
+                ;;
               "--pure debug config") printf '%s\\n' "${FAKE_CONFIG}" ;;
               "--pure models openai") printf '%s\\n' "${FAKE_MODELS:-openai/gpt-5.6-sol}" ;;
               "--pure export "*)
@@ -121,6 +132,9 @@ class RalphCliTest(unittest.TestCase):
                 if test -n "${FAKE_MUTATE_PROMPT:-}"; then
                   printf '%s\\n' 'mutated by first session' > "$FAKE_MUTATE_PROMPT"
                 fi
+                if test -n "${FAKE_AUTH_MUTATED_FILE:-}"; then
+                  : > "$FAKE_AUTH_MUTATED_FILE"
+                fi
                 if test -n "${FAKE_BRANCH_CHANGE:-}"; then
                   git checkout -b "$FAKE_BRANCH_CHANGE" >/dev/null 2>&1
                 fi
@@ -138,6 +152,11 @@ class RalphCliTest(unittest.TestCase):
             case "$*" in
               "--version") printf '%s\n' "${FAKE_CLAUDE_VERSION:-2.1.208 (Claude Code)}" ;;
               "auth status")
+                auth_count_file="$FAKE_CALLS/claude-auth-count"
+                auth_count=0
+                test ! -f "$auth_count_file" || auth_count=$(cat "$auth_count_file")
+                auth_count=$((auth_count + 1))
+                printf '%s\n' "$auth_count" > "$auth_count_file"
                 env | sort > "$FAKE_CALLS/claude-auth-env"
                 printf '%s\n' "${FAKE_CLAUDE_AUTH}"
                 ;;
@@ -155,6 +174,9 @@ class RalphCliTest(unittest.TestCase):
                   else
                     sleep "$FAKE_CLAUDE_SLEEP"
                   fi
+                fi
+                if test -n "${FAKE_CLAUDE_MUTATE_CUSTOMIZATION:-}"; then
+                  mkdir -p "$FAKE_CLAUDE_MUTATE_CUSTOMIZATION"
                 fi
                 printf '%s\n' "claude diagnostic" >&2
                 exit "${FAKE_CLAUDE_EXIT:-0}"
@@ -199,6 +221,28 @@ class RalphCliTest(unittest.TestCase):
                 ],
             }
         )
+
+    def _export_messages(
+        self,
+        text: str,
+        models: list[tuple[str, str]],
+        session_id: str = "ses_1",
+    ) -> str:
+        messages = []
+        for index, (provider, model) in enumerate(models, 1):
+            messages.append(
+                {
+                    "info": {
+                        "id": f"msg_{index}",
+                        "sessionID": session_id,
+                        "role": "assistant",
+                        "providerID": provider,
+                        "modelID": model,
+                    },
+                    "parts": [{"id": f"part_{index}", "type": "text", "text": text}],
+                }
+            )
+        return json.dumps({"info": {"id": session_id}, "messages": messages})
 
     def _sequence(self, results: list[str]) -> Path:
         sequence = self.base / "sequence"
@@ -277,6 +321,7 @@ class RalphCliTest(unittest.TestCase):
                 "PYTHONPATH": str(ROOT / "src"),
                 "FAKE_CALLS": str(self.calls),
                 "FAKE_CONFIG": self._config(),
+                "FAKE_AUTH": "┌  Credentials ~/.local/share/opencode/auth.json\n│\n●  OpenAI oauth\n│\n└  1 credentials",
                 "FAKE_EVENTS": self._events("Work complete.\n<promise>COMPLETE</promise>"),
                 "FAKE_EXPORT": self._export("Work complete.\n<promise>COMPLETE</promise>"),
                 "FAKE_CLAUDE_AUTH": json.dumps(
@@ -412,6 +457,69 @@ class RalphCliTest(unittest.TestCase):
         self.assertEqual(composed_prompts[1], composed_prompts[2])
         self.assertIn("explicit blocker evidence", composed_prompts[0])
         self.assertIn("<promise>NEEDS_INPUT</promise>", composed_prompts[0])
+        self.assertEqual((self.calls / "auth-count").read_text().strip(), "3")
+
+    def test_each_fresh_session_reproves_backend_trust(self) -> None:
+        sequence = self._sequence(["First child complete.", "Second child complete."])
+        opencode = self.run_ralph(
+            "--iterations",
+            "2",
+            env={"FAKE_SEQUENCE_DIR": str(sequence)},
+        )
+        self.assertEqual(opencode.returncode, 1, opencode.stderr)
+        self.assertEqual((self.calls / "auth-count").read_text().strip(), "2")
+        opencode_calls = (self.calls / "opencode").read_text().splitlines()
+        for command in ("--version", "--pure auth list", "--pure debug config", "--pure models openai"):
+            self.assertEqual(opencode_calls.count(command), 2)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        claude = self.run_ralph(
+            "--iterations",
+            "2",
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": self._claude_events("Child complete.")},
+        )
+        self.assertEqual(claude.returncode, 1, claude.stderr)
+        self.assertEqual((self.calls / "claude-auth-count").read_text().strip(), "2")
+        claude_calls = (self.calls / "claude").read_text().splitlines()
+        self.assertEqual(claude_calls.count("--version"), 2)
+        self.assertEqual(claude_calls.count("auth status"), 2)
+
+    def test_between_iteration_auth_and_customization_mutation_stops_before_next_session(self) -> None:
+        sequence = self._sequence(["First child complete.", "must not run"])
+        mutation = self.base / "credentials-mutated"
+        opencode = self.run_ralph(
+            "--iterations",
+            "2",
+            env={
+                "FAKE_AUTH_MUTATED_FILE": str(mutation),
+                "FAKE_SEQUENCE_DIR": str(sequence),
+            },
+        )
+        self.assertEqual(opencode.returncode, 2)
+        self.assertIn("OpenAI OAuth credential", opencode.stderr)
+        self.assertEqual((self.calls / "run-count").read_text().strip(), "1")
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(len(outcome["iterations"]), 1)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        hooks = self.repo / ".claude" / "hooks"
+        claude = self.run_ralph(
+            "--iterations",
+            "2",
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events("First child complete."),
+                "FAKE_CLAUDE_MUTATE_CUSTOMIZATION": str(hooks),
+            },
+        )
+        self.assertEqual(claude.returncode, 2)
+        self.assertIn("Claude customizations", claude.stderr)
+        claude_calls = (self.calls / "claude").read_text().splitlines()
+        self.assertEqual(sum(line.startswith("-p ") for line in claude_calls), 1)
 
     def test_iteration_budget_must_be_between_one_and_one_hundred(self) -> None:
         for budget in ("0", "101"):
@@ -960,6 +1068,99 @@ class RalphCliTest(unittest.TestCase):
         )
         self.assertNotEqual(mismatch_result.returncode, 0)
         self.assertIn("initial model", mismatch_result.stderr)
+
+    def test_opencode_auth_output_contract_is_strict(self) -> None:
+        supported = "┌  Credentials ~/.local/share/opencode/auth.json\n│\n●  OpenAI oauth\n│\n└  1 credentials"
+        accepted = self.run_ralph(env={"FAKE_AUTH": supported})
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for auth in (
+            "OpenAI OAuth token",
+            "┌ Credentials path\n│\n● OpenAI oauth\n● Unknown credential\n│\n└ 2 credentials",
+            "┌ Credentials ~/.local/share/opencode/auth.json\n│\n● OpenAI oauth\n│\n└ 2 credentials",
+        ):
+            with self.subTest(auth=auth):
+                for path in self.calls.iterdir():
+                    path.unlink()
+                rejected = self.run_ralph(env={"FAKE_AUTH": auth})
+                self.assertEqual(rejected.returncode, 2)
+                self.assertIn("unfamiliar or ambiguous", rejected.stderr)
+                calls = (self.calls / "opencode").read_text()
+                self.assertNotIn(" run ", calls)
+
+    def test_opencode_validates_every_exported_assistant_route_and_records_fallback(self) -> None:
+        alternate = self._export_messages(
+            "Done",
+            [("openai", "gpt-5.6-sol"), ("anthropic", "claude-opus-4-8")],
+        )
+        rejected = self.run_ralph(env={"FAKE_EXPORT": alternate})
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("session export omitted required metadata", rejected.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        fallback_export = self._export_messages(
+            "Implemented.",
+            [("openai", "gpt-5.6-sol"), ("openai", "gpt-5.5-codex")],
+        )
+        fallback = self.run_ralph(
+            env={
+                "FAKE_EVENTS": self._events("Implemented."),
+                "FAKE_EXPORT": fallback_export,
+            }
+        )
+        self.assertEqual(fallback.returncode, 1, fallback.stderr)
+        runs = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())
+        session = json.loads((runs[-1] / "session.json").read_text())
+        self.assertEqual(
+            session["ralph_verification"]["fallback_models"],
+            ["openai/gpt-5.5-codex"],
+        )
+
+    def test_opencode_rejects_later_streamed_provider_substitution(self) -> None:
+        events = [
+            {
+                "type": "message.updated",
+                "properties": {
+                    "info": {
+                        "id": "msg_1",
+                        "sessionID": "ses_1",
+                        "role": "assistant",
+                        "providerID": "openai",
+                        "modelID": "gpt-5.6-sol",
+                    }
+                },
+            },
+            {
+                "type": "message.updated",
+                "properties": {
+                    "info": {
+                        "id": "msg_2",
+                        "sessionID": "ses_1",
+                        "role": "assistant",
+                        "providerID": "anthropic",
+                        "modelID": "claude-opus-4-8",
+                    }
+                },
+            },
+        ]
+        result = self.run_ralph(env={"FAKE_EVENTS": "\n".join(map(json.dumps, events))})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("alternate or malformed provider route", result.stderr)
+        self.assertIn("--session ses_1", result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        missing_session = events[0].copy()
+        missing_session["properties"] = {"info": dict(events[0]["properties"]["info"])}
+        del missing_session["properties"]["info"]["sessionID"]
+        missing = self.run_ralph(env={"FAKE_EVENTS": json.dumps(missing_session)})
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("omitted routing metadata", missing.stderr)
+        run_dirs = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dirs[-1] / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertEqual(len(outcome["iterations"]), 1)
 
     def test_prompt_and_model_validation_happen_before_session(self) -> None:
         self.prompt.write_bytes(b"\xff")
