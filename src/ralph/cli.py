@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -104,10 +105,33 @@ CLAUDE_BUILTIN_TOOLS = {
     "WebSearch",
     "Write",
 }
+CLAUDE_SETTINGS = json.dumps(
+    {
+        "autoMemoryEnabled": False,
+        "disableAllHooks": True,
+        "disableClaudeAiConnectors": True,
+    },
+    separators=(",", ":"),
+)
 
 
 class RalphError(Exception):
     pass
+
+
+class HandoffError(RalphError):
+    def __init__(
+        self,
+        reason: str,
+        session_id: str,
+        detail: str | None = None,
+        outcome: str = "needs_input",
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.session_id = session_id
+        self.detail = detail
+        self.outcome = outcome
 
 
 def process_identity(pid: int) -> str | None:
@@ -457,6 +481,7 @@ class EventResult:
         self.assistant_models: list[str] = []
         self.parts: dict[str, tuple[str, str]] = {}
         self.printed: dict[str, str] = {}
+        self.question: str | None = None
 
     def accept(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -469,6 +494,8 @@ class EventResult:
             return
         if event.get("type") in {"tool_use", "step_start", "step_finish"} and isinstance(direct_part, dict):
             self._print_progress(event["type"], direct_part)
+            if event.get("type") == "tool_use":
+                self._accept_tool(direct_part)
             return
         props = event.get("properties")
         if not isinstance(props, dict):
@@ -487,6 +514,9 @@ class EventResult:
         part = props.get("part")
         if event.get("type") == "message.part.updated" and isinstance(part, dict):
             self._session(part.get("sessionID"))
+            if part.get("type") == "tool":
+                self._accept_tool(part)
+                return
             if part.get("type") != "text" or not isinstance(part.get("text"), str):
                 return
             self._accept_text_part(part, trusted=False)
@@ -525,6 +555,12 @@ class EventResult:
             return
         print("[step started]" if event_type == "step_start" else "[step finished]", flush=True)
 
+    def _accept_tool(self, part: dict[str, Any]) -> None:
+        tool = part.get("tool")
+        if not isinstance(tool, str) or tool.lower() not in {"question", "askuserquestion"}:
+            return
+        self.question = extract_question(part.get("state")) or "The backend attempted to ask a question."
+
     def _session(self, value: Any) -> None:
         if isinstance(value, str) and not self.session_id:
             self.session_id = value
@@ -546,6 +582,7 @@ class ClaudeEventResult:
         self.assistant_results: list[str] = []
         self.final_text: str | None = None
         self.model_usage: list[str] = []
+        self.question: str | None = None
 
     def accept(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -597,6 +634,13 @@ class ClaudeEventResult:
         content = message.get("content")
         if not isinstance(content, list):
             raise RalphError("Claude assistant event omitted content")
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "tool_use"
+                and part.get("name") == "AskUserQuestion"
+            ):
+                self.question = extract_question(part.get("input")) or "Claude attempted to ask a question."
         text = "".join(
             part.get("text", "")
             for part in content
@@ -689,10 +733,11 @@ def verify_session(worktree: Path, run_dir: Path, session_id: str, model: str, e
     return final_text
 
 
-def has_completion_marker(text: str) -> bool:
+def visible_markdown_lines(text: str) -> list[tuple[int, str]]:
+    visible: list[tuple[int, str]] = []
     fence_char: str | None = None
     fence_length = 0
-    for line in text.splitlines():
+    for index, line in enumerate(text.splitlines()):
         if fence_char is not None:
             pattern = r" {0,3}(`+)\s*" if fence_char == "`" else r" {0,3}(~+)\s*"
             closing = re.fullmatch(pattern, line)
@@ -705,11 +750,87 @@ def has_completion_marker(text: str) -> bool:
             fence_char = opening.group(1)[0]
             fence_length = len(opening.group(1))
             continue
-        if line.startswith(("    ", "\t", ">")):
+        if line.startswith(("    ", "\t")) or re.match(r"^ {0,3}>", line):
             continue
-        if line == "<promise>COMPLETE</promise>":
-            return True
-    return False
+        visible.append((index, line))
+    return visible
+
+
+def has_completion_marker(text: str) -> bool:
+    return any(line == "<promise>COMPLETE</promise>" for _, line in visible_markdown_lines(text))
+
+
+def extract_question(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip().endswith("?"):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("question", "questions", "input"):
+            found = extract_question(value.get(key))
+            if found:
+                return found
+        for item in value.values():
+            found = extract_question(item)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = extract_question(item)
+            if found:
+                return found
+    return None
+
+
+def visible_prose_lines(text: str) -> list[tuple[int, str]]:
+    visible: list[tuple[int, str]] = []
+    for index, line in visible_markdown_lines(text):
+        stripped = line.strip()
+        if stripped.lower().startswith(("tool output:", "tool result:", "[tool")):
+            continue
+        without_literals = re.sub(r"`[^`]*`", "", stripped)
+        without_literals = re.sub(r"https?://\S+", "", without_literals)
+        visible.append((index, without_literals.strip()))
+    return visible
+
+
+def needs_input_question(text: str) -> str | None:
+    visible = visible_prose_lines(text)
+    marker_indexes = [
+        index
+        for index, line in visible_markdown_lines(text)
+        if line == "<promise>NEEDS_INPUT</promise>"
+    ]
+    if marker_indexes:
+        marker_index = marker_indexes[-1]
+        following = [line for index, line in visible if index > marker_index and line]
+        return "\n".join(following) or "The assistant requested operator input."
+
+    paragraphs: list[list[str]] = []
+    current: list[str] = []
+    for _, line in visible:
+        if line:
+            current.append(line)
+        elif current:
+            paragraphs.append(current)
+            current = []
+    if current:
+        paragraphs.append(current)
+    if not paragraphs:
+        return None
+    conclusion = " ".join(paragraphs[-1])
+    if re.search(r"\?\s*$", conclusion):
+        return conclusion
+    return None
+
+
+def stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def execute_opencode_iteration(
@@ -776,16 +897,44 @@ def execute_opencode_iteration(
                 process.kill()
                 process.wait()
                 thread.join()
+                if result.session_id:
+                    raise HandoffError(
+                        "OpenCode emitted malformed structured output",
+                        result.session_id,
+                        outcome="backend_contract_failure",
+                    ) from None
                 raise RalphError("OpenCode emitted malformed structured output") from None
+            if result.question:
+                stop_process(process)
+                thread.join()
+                if not result.session_id:
+                    raise RalphError("OpenCode attempted a question before session creation")
+                raise HandoffError("OpenCode attempted a native question tool", result.session_id, result.question)
     returncode = process.wait()
     thread.join()
     if result.printed:
         print()
     if returncode:
+        if result.session_id:
+            raise HandoffError(
+                "OpenCode session failed; see retained stderr",
+                result.session_id,
+                outcome="backend_failure",
+            )
         raise RalphError("OpenCode session failed; see retained stderr")
     if not result.session_id:
         raise RalphError("OpenCode output omitted required session metadata or final result")
-    final_text = verify_session(worktree, run_dir, result.session_id, model, env)
+    try:
+        final_text = verify_session(worktree, run_dir, result.session_id, model, env)
+    except RalphError as error:
+        raise HandoffError(
+            str(error),
+            result.session_id,
+            outcome="backend_contract_failure",
+        ) from None
+    question = needs_input_question(final_text)
+    if question:
+        raise HandoffError("OpenCode requested operator input", result.session_id, question)
     complete = has_completion_marker(final_text)
     return ("complete" if complete else "budget_exhausted"), result.session_id
 
@@ -799,14 +948,6 @@ def execute_claude_iteration(
 ) -> tuple[str, str | None]:
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
-    settings = json.dumps(
-        {
-            "autoMemoryEnabled": False,
-            "disableAllHooks": True,
-            "disableClaudeAiConnectors": True,
-        },
-        separators=(",", ":"),
-    )
     args = [
         "caffeinate",
         "-im",
@@ -824,7 +965,7 @@ def execute_claude_iteration(
         "project",
         "--strict-mcp-config",
         "--settings",
-        settings,
+        CLAUDE_SETTINGS,
     ]
     result = ClaudeEventResult(model)
     try:
@@ -875,19 +1016,49 @@ def execute_claude_iteration(
                 process.wait()
                 thread.join()
                 write_claude_session(run_dir, result)
+                if result.session_id:
+                    raise HandoffError(
+                        "Claude emitted malformed structured output",
+                        result.session_id,
+                        outcome="backend_contract_failure",
+                    ) from None
                 raise RalphError("Claude emitted malformed structured output") from None
-            except RalphError:
-                process.kill()
-                process.wait()
+            except RalphError as error:
+                stop_process(process)
                 thread.join()
                 write_claude_session(run_dir, result)
+                if isinstance(error, HandoffError):
+                    raise
+                if result.session_id:
+                    raise HandoffError(
+                        str(error),
+                        result.session_id,
+                        outcome="backend_contract_failure",
+                    ) from None
                 raise
+            if result.question:
+                stop_process(process)
+                thread.join()
+                write_claude_session(run_dir, result)
+                if not result.session_id:
+                    raise RalphError("Claude attempted a question before session creation")
+                raise HandoffError(
+                    "Claude attempted a native question tool",
+                    result.session_id,
+                    result.question,
+                )
     returncode = process.wait()
     thread.join()
     write_claude_session(run_dir, result)
     if result.assistant_results:
         print()
     if returncode:
+        if result.session_id:
+            raise HandoffError(
+                "Claude session failed; see retained stderr",
+                result.session_id,
+                outcome="backend_failure",
+            )
         raise RalphError("Claude session failed; see retained stderr")
     if (
         result.session_id is None
@@ -895,7 +1066,16 @@ def execute_claude_iteration(
         or not result.assistant_results
         or result.final_text is None
     ):
+        if result.session_id:
+            raise HandoffError(
+                "Claude output omitted required session metadata or final result",
+                result.session_id,
+                outcome="backend_contract_failure",
+            )
         raise RalphError("Claude output omitted required session metadata or final result")
+    question = needs_input_question(result.final_text)
+    if question:
+        raise HandoffError("Claude requested operator input", result.session_id, question)
     complete = has_completion_marker(result.final_text)
     return ("complete" if complete else "budget_exhausted"), result.session_id
 
@@ -925,6 +1105,102 @@ def execute_iteration(
     if backend == "claude":
         return execute_claude_iteration(worktree, run_dir, prompt, model, env)
     return execute_opencode_iteration(worktree, run_dir, prompt, model, env)
+
+
+def shell_command(args: list[str], worktree: Path) -> str:
+    return f"cd {shlex.quote(str(worktree))} && {shlex.join(args)}"
+
+
+def resume_command(backend: str, model: str, worktree: Path, session_id: str) -> str:
+    if backend == "claude":
+        backend_args = [
+            "/usr/bin/caffeinate",
+            "-im",
+            "claude",
+            "--resume",
+            session_id,
+            "--model",
+            model,
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "project",
+            "--strict-mcp-config",
+            "--settings",
+            CLAUDE_SETTINGS,
+        ]
+    else:
+        backend_args = [
+            "/usr/bin/caffeinate",
+            "-im",
+            "opencode",
+            "--pure",
+            "--model",
+            model,
+            "--auto",
+            "--session",
+            session_id,
+        ]
+    return shell_command(backend_args, worktree)
+
+
+def restart_command(
+    backend: str,
+    model: str,
+    worktree: Path,
+    prompt_path: Path,
+    remaining: int,
+) -> str:
+    return shell_command(
+        [
+            "ralph",
+            "run",
+            str(prompt_path),
+            "--backend",
+            backend,
+            "--iterations",
+            str(remaining),
+            "--model",
+            model,
+            "--worktree",
+            str(worktree),
+        ],
+        worktree,
+    )
+
+
+def print_handoff(
+    error: HandoffError,
+    *,
+    backend: str,
+    model: str,
+    worktree: Path,
+    prompt_path: Path,
+    remaining: int,
+    run_id: str,
+) -> None:
+    terminal = sys.stderr.isatty()
+    if terminal:
+        print("\a\033[1;31m", end="", file=sys.stderr)
+    print("========== RALPH NEEDS OPERATOR ==========", file=sys.stderr)
+    print(f"reason: {error.reason}", file=sys.stderr)
+    print(f"ralph run: {run_id}", file=sys.stderr)
+    print(f"{backend} session: {error.session_id}", file=sys.stderr)
+    if error.detail:
+        print(f"question/error: {error.detail}", file=sys.stderr)
+    print(
+        f"manual resume: {resume_command(backend, model, worktree, error.session_id)}",
+        file=sys.stderr,
+    )
+    print(f"iterations remaining: {remaining}", file=sys.stderr)
+    if remaining:
+        print(
+            f"continue Ralph: {restart_command(backend, model, worktree, prompt_path, remaining)}",
+            file=sys.stderr,
+        )
+    else:
+        print("No automatic replacement iteration remains.", file=sys.stderr)
+    print("==========================================", end="", file=sys.stderr)
+    print("\033[0m" if terminal else "", file=sys.stderr)
 
 
 def run_locked(
@@ -987,6 +1263,40 @@ def run_locked(
             )
             if outcome == "complete":
                 break
+    except HandoffError as error:
+        iterations.append(
+            {
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "number": number,
+                "outcome": error.outcome,
+                "reason": error.reason,
+                "session_id": error.session_id,
+                "started_at": iteration_started,
+            }
+        )
+        outcome = error.outcome
+        final_branch = record_final_git_state(worktree, run_dir, branch)
+        write_json(
+            run_dir / "outcome.json",
+            {
+                "final_branch": final_branch,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "iterations": iterations,
+                "outcome": outcome,
+                "session_id": error.session_id,
+                "started_at": started,
+            },
+        )
+        print_handoff(
+            error,
+            backend=args.backend,
+            model=args.model,
+            worktree=worktree,
+            prompt_path=prompt_path,
+            remaining=args.iterations - number,
+            run_id=run_dir.name,
+        )
+        return 2
     except RalphError:
         final_branch = record_final_git_state(worktree, run_dir, branch)
         write_json(
