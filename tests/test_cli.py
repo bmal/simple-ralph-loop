@@ -964,6 +964,103 @@ class RalphCliTest(unittest.TestCase):
         self.assertEqual(question_result.returncode, 2)
         self.assertIn("Should I remove the compatibility shim?", question_result.stderr)
 
+    def _run_backend_question(self, backend: str, text: str) -> subprocess.CompletedProcess[str]:
+        if backend == "claude":
+            return self.run_ralph(
+                backend="claude", env={"FAKE_CLAUDE_EVENTS": self._claude_events(text)}
+            )
+        return self.run_ralph(
+            env={"FAKE_EVENTS": self._events(text), "FAKE_EXPORT": self._export(text)}
+        )
+
+    def test_concluding_question_survives_trailing_closing_prose(self) -> None:
+        # A genuine user-directed question is detected even when a courtesy
+        # sign-off follows it, on one line or on a following line.
+        cases = [
+            "Implementation is staged.\n\nShould I proceed? Please advise.",
+            "The migration is ready.\n\nShould I open the PR now?\nThanks!",
+            "Work is done.\n\nWhich option should I use? Let me know when you can.",
+        ]
+        for backend in ("opencode", "claude"):
+            for text in cases:
+                with self.subTest(backend=backend, text=text):
+                    result = self._run_backend_question(backend, text)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+                    for path in self.calls.iterdir():
+                        path.unlink()
+
+    def test_quoted_titles_fences_urls_and_tool_logs_do_not_hand_off(self) -> None:
+        # Quoted issue titles, nested code fences, URLs, and multi-line tool
+        # logs all carry question marks but must never trigger a false handoff.
+        ignored = (
+            "Completed the work described in the parent issue.\n\n"
+            "> Should the loop retry on failure?\n\n"
+            "Resolved the ticket titled `Can we drop Python 3.10?` cleanly.\n\n"
+            "````markdown\n```\nShould this nested fence trigger?\n```\n````\n\n"
+            "[tool: bash]\n$ pytest -q\ncollected 5 items\nDid every case pass?\n.....\n\n"
+            "Reference: https://example.invalid/issues?q=retry\n\n"
+            "All acceptance criteria are satisfied."
+        )
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self._run_backend_question(backend, ignored)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("NEEDS OPERATOR", result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_claude_terminal_result_state_machine_fails_closed(self) -> None:
+        base = self._claude_events("Implemented the change.").splitlines()
+        init, assistant, terminal = base[0], base[1], base[2]
+
+        contradictory = json.loads(terminal)
+        contradictory["result"] = "A different final answer entirely."
+        duplicated = "\n".join([init, assistant, terminal, terminal])
+        after_result = "\n".join([init, assistant, terminal, assistant])
+        result_before_init = "\n".join([terminal, init, assistant])
+
+        cases = [
+            ("\n".join([init, assistant, json.dumps(contradictory)]),
+             "disagreed with the final assistant response"),
+            (duplicated, "event after the terminal result"),
+            (after_result, "event after the terminal result"),
+            (result_before_init, "inconsistent session metadata"),
+        ]
+        for events, message in cases:
+            with self.subTest(message=message):
+                result = self.run_ralph(
+                    backend="claude", env={"FAKE_CLAUDE_EVENTS": events}
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_opencode_stream_rejects_inconsistent_metadata_but_ignores_unknown_events(self) -> None:
+        second_session = json.loads(self._events("Later text", session_id="ses_other"))
+        inconsistent = self._events("First text") + "\n" + json.dumps(second_session)
+        inconsistent_result = self.run_ralph(
+            env={"FAKE_EVENTS": inconsistent, "FAKE_EXPORT": self._export("First text")}
+        )
+        self.assertEqual(inconsistent_result.returncode, 2, inconsistent_result.stderr)
+        self.assertIn("inconsistent session metadata", inconsistent_result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        forward = (
+            json.dumps({"type": "server.heartbeat", "sessionID": "ses_1", "extra": {"n": 1}})
+            + "\n"
+            + self._events("Work complete.\n<promise>COMPLETE</promise>")
+        )
+        forward_result = self.run_ralph(
+            env={
+                "FAKE_EVENTS": forward,
+                "FAKE_EXPORT": self._export("Work complete.\n<promise>COMPLETE</promise>"),
+            }
+        )
+        self.assertEqual(forward_result.returncode, 0, forward_result.stderr)
+
     def test_opencode_native_question_stops_and_hands_off_immediately(self) -> None:
         question_event = {
             "type": "tool_use",

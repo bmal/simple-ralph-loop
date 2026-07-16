@@ -792,6 +792,12 @@ class ClaudeEventResult:
         self.question: str | None = None
 
     def accept(self, event: Any) -> None:
+        if self.final_text is not None:
+            # The terminal result must be the final event in the stream. A
+            # duplicate result, a late assistant message, trailing init, or any
+            # other event after it means the ordered contract was violated, so
+            # fail closed rather than assess a stream we no longer trust.
+            raise RalphError("Claude emitted an event after the terminal result")
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
@@ -872,6 +878,11 @@ class ClaudeEventResult:
         result = event.get("result")
         if not isinstance(result, str) or not result:
             raise RalphError("Claude result omitted the final assistant response")
+        # The terminal result text must agree with the assembled final assistant
+        # response so a contradictory result (a different final answer than the
+        # one that was streamed) fails closed rather than being trusted.
+        if self.assistant_results and result.strip() != self.assistant_results[-1].strip():
+            raise RalphError("Claude terminal result disagreed with the final assistant response")
         usage = event.get("modelUsage")
         if not isinstance(usage, dict) or any(
             not isinstance(model, str) or not model.startswith("claude-") for model in usage
@@ -1073,16 +1084,78 @@ def extract_question(value: Any) -> str | None:
     return None
 
 
+TOOL_LOG_PREFIXES = ("tool output:", "tool result:", "[tool")
+# A trailing courtesy sentence (a sign-off or acknowledgement) that may follow a
+# genuine user-directed question in concluding prose. These are stripped before
+# deciding whether the conclusion ends on a question so that
+# "Should I proceed? Please advise." is still recognized as a handoff.
+CLOSING_SENTENCE = re.compile(
+    r"(?i)^(?:"
+    r"please\b.*"
+    r"|thanks?\b.*"
+    r"|thank you\b.*"
+    r"|(?:kind |best |warm )?regards\b.*"
+    r"|cheers\b.*"
+    r"|let me know\b.*"
+    r"|awaiting\b.*"
+    r"|standing by\b.*"
+    r"|i(?:'ll| will) wait\b.*"
+    r"|i await\b.*"
+    r"|your call\b.*"
+    r"|up to you\b.*"
+    r"|otherwise\b.*"
+    r")[.!]*$"
+)
+# A concluding question is only treated as user-directed when it addresses the
+# operator or opens with an interrogative that asks for a decision. This keeps
+# the heuristic conservative instead of matching every trailing question mark.
+DIRECTED_PRONOUN = re.compile(r"(?i)\b(you|your|yours|i|we|us|me|my|our|ralph)\b")
+DIRECTED_OPENER = re.compile(
+    r"(?i)^(which|what|whether|should|shall|would|could|can|may|do|does|did|is|are|"
+    r"how|when|where|who)\b"
+)
+
+
 def visible_prose_lines(text: str) -> list[tuple[int, str]]:
     visible: list[tuple[int, str]] = []
+    in_tool_log = False
     for index, line in visible_markdown_lines(text):
         stripped = line.strip()
-        if stripped.lower().startswith(("tool output:", "tool result:", "[tool")):
+        if in_tool_log:
+            # A multi-line tool log continues until a blank line separates it
+            # from resumed prose, so its inner lines never contribute question
+            # text even when they contain question marks.
+            if not stripped:
+                in_tool_log = False
+            visible.append((index, ""))
+            continue
+        if stripped.lower().startswith(TOOL_LOG_PREFIXES):
+            in_tool_log = True
+            visible.append((index, ""))
             continue
         without_literals = re.sub(r"`[^`]*`", "", stripped)
         without_literals = re.sub(r"https?://\S+", "", without_literals)
         visible.append((index, without_literals.strip()))
     return visible
+
+
+def split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.?!])\s+", text.strip())
+    return [part for part in (segment.strip() for segment in parts) if part]
+
+
+def concluding_question(conclusion: str) -> str | None:
+    sentences = split_sentences(conclusion)
+    # Drop trailing sign-off sentences so a question followed by a closing line
+    # ("Should I proceed? Please advise.") is still detected.
+    while sentences and not sentences[-1].endswith("?") and CLOSING_SENTENCE.match(sentences[-1]):
+        sentences.pop()
+    if not sentences or not sentences[-1].endswith("?"):
+        return None
+    final = sentences[-1]
+    if not DIRECTED_PRONOUN.search(final) and not DIRECTED_OPENER.match(final):
+        return None
+    return conclusion.strip()
 
 
 def needs_input_question(text: str) -> str | None:
@@ -1109,10 +1182,7 @@ def needs_input_question(text: str) -> str | None:
         paragraphs.append(current)
     if not paragraphs:
         return None
-    conclusion = " ".join(paragraphs[-1])
-    if re.search(r"\?\s*$", conclusion):
-        return conclusion
-    return None
+    return concluding_question(" ".join(paragraphs[-1]))
 
 
 def raise_backend_contract_failure(session_id: str | None, message: str) -> None:
