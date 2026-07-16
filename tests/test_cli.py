@@ -14,6 +14,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from ralph import cli  # noqa: E402  (import after sys.path is extended)
 
 
 class RalphCliTest(unittest.TestCase):
@@ -63,6 +66,12 @@ class RalphCliTest(unittest.TestCase):
             shift
             if test "${1:-}" = "-w"; then
               test "${FAKE_CAFFEINATE_FAIL:-0}" = "0" || exit 9
+              if test -n "${FAKE_CAFFEINATE_DIE:-}"; then
+                # Survive the startup probe, then exit unexpectedly to model a
+                # loop-wide assertion that is lost mid-run.
+                sleep "$FAKE_CAFFEINATE_DIE"
+                exit 0
+              fi
               while kill -0 "$2" 2>/dev/null; do sleep 0.02; done
               exit 0
             fi
@@ -359,6 +368,9 @@ class RalphCliTest(unittest.TestCase):
             {
                 "PATH": f"{self.bin}:{child_env['PATH']}",
                 "PYTHONPATH": str(ROOT / "src"),
+                # Absolute path to the fake caffeinate: production uses
+                # /usr/bin/caffeinate, and this test-only seam substitutes it.
+                "RALPH_CAFFEINATE": str(self.bin / "caffeinate"),
                 "FAKE_CALLS": str(self.calls),
                 "FAKE_CONFIG": self._config(),
                 "FAKE_AUTH": "┌  Credentials ~/.local/share/opencode/auth.json\n│\n●  OpenAI oauth\n│\n└  1 credentials",
@@ -1309,6 +1321,196 @@ class RalphCliTest(unittest.TestCase):
         blocker.unlink()
         first.communicate(timeout=5)
 
+    def _add_linked_worktree(self, name: str) -> Path:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("initial", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=self.repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Ralph Test",
+                "-c",
+                "user.email=ralph@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        other = self.base / name
+        subprocess.run(
+            ["git", "worktree", "add", "-b", name, str(other)],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        return other
+
+    def test_linked_worktrees_keep_independent_state(self) -> None:
+        other = self._add_linked_worktree("second")
+        main_run = self.run_ralph()
+        self.assertEqual(main_run.returncode, 0, main_run.stderr)
+        for path in self.calls.iterdir():
+            path.unlink()
+        other_run = subprocess.run(
+            self._command(worktree=other),
+            cwd=self.base,
+            env=self._environment(),
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(other_run.returncode, 0, other_run.stderr)
+
+        main_runs = self.repo / ".git" / "ralph" / "runs"
+        linked_runs = self.repo / ".git" / "worktrees" / "second" / "ralph" / "runs"
+        self.assertTrue(any(main_runs.iterdir()))
+        self.assertTrue(linked_runs.is_dir() and any(linked_runs.iterdir()))
+
+    def test_run_refuses_symlinked_ralph_state_directory(self) -> None:
+        outside = self.base / "outside-state"
+        outside.mkdir()
+        os.symlink(outside, self.repo / ".git" / "ralph")
+
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("symlink", result.stderr)
+        # Nothing was redirected outside the resolved Git directory.
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.calls / "opencode").exists())
+
+    def test_run_refuses_non_directory_ralph_state(self) -> None:
+        (self.repo / ".git" / "ralph").write_text("not a directory", encoding="utf-8")
+
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("not a directory", result.stderr)
+
+    def test_run_refuses_symlinked_runs_subdirectory(self) -> None:
+        (self.repo / ".git" / "ralph").mkdir()
+        outside = self.base / "outside-runs"
+        outside.mkdir()
+        os.symlink(outside, self.repo / ".git" / "ralph" / "runs")
+
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("symlink", result.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_clean_refuses_symlinked_state_and_preserves_target(self) -> None:
+        outside = self.base / "outside-clean"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep", encoding="utf-8")
+        os.symlink(outside, self.repo / ".git" / "ralph")
+
+        result = self.clean_ralph()
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("symlink", result.stderr)
+        self.assertTrue((outside / "keep.txt").exists())
+
+    def test_clean_removes_state_without_following_symlinked_children(self) -> None:
+        self.assertEqual(self.run_ralph().returncode, 0)
+        outside = self.base / "outside-child"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep", encoding="utf-8")
+        os.symlink(outside, self.repo / ".git" / "ralph" / "link-to-outside")
+
+        cleaned = self.clean_ralph()
+
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertFalse((self.repo / ".git" / "ralph").exists())
+        # The symlink target and its contents were never followed or deleted.
+        self.assertTrue((outside / "keep.txt").exists())
+
+    def test_absolute_caffeinate_is_not_path_shadowed(self) -> None:
+        system = self.base / "system"
+        system.mkdir()
+        good = system / "caffeinate"
+        good.write_text((self.bin / "caffeinate").read_text(), encoding="utf-8")
+        good.chmod(0o755)
+        # A hostile caffeinate earlier on PATH would break the run if consulted.
+        self._script(
+            "caffeinate",
+            """
+            printf 'shadow\\n' >> "$FAKE_CALLS/caffeinate-shadow"
+            exit 13
+            """,
+        )
+
+        result = self.run_ralph(env={"RALPH_CAFFEINATE": str(good)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.calls / "caffeinate-shadow").exists())
+        self.assertIn("-im", (self.calls / "caffeinate").read_text())
+
+    def test_caffeinate_runs_by_absolute_path_when_absent_from_path(self) -> None:
+        system = self.base / "system"
+        system.mkdir()
+        good = system / "caffeinate"
+        good.write_text((self.bin / "caffeinate").read_text(), encoding="utf-8")
+        good.chmod(0o755)
+        (self.bin / "caffeinate").unlink()
+
+        result = self.run_ralph(env={"RALPH_CAFFEINATE": str(good)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-im", (self.calls / "caffeinate").read_text())
+
+    def test_lost_loop_caffeinate_assertion_stops_safely(self) -> None:
+        result = self._run_guarded(
+            "--iterations",
+            "2",
+            env={
+                "FAKE_CAFFEINATE_DIE": "0.3",
+                "FAKE_EVENTS": self._events("Partial work"),
+                "FAKE_EXPORT": self._export("Partial work"),
+                "FAKE_SLEEP": "0.6",
+            },
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("caffeinate", result.stderr)
+        self.assertIn("exited unexpectedly", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        # The first iteration ran and its evidence is retained before stopping.
+        self.assertEqual(len(outcome["iterations"]), 1)
+
+    def test_timeout_upper_bound_keeps_backend_limits_subordinate(self) -> None:
+        over = self.run_ralph("--timeout", str(cli.MAX_ITERATION_TIMEOUT_SECONDS + 1))
+        self.assertNotEqual(over.returncode, 0)
+        self.assertIn("must not exceed", over.stderr)
+        self.assertFalse((self.calls / "opencode").exists())
+
+        at_max = self.run_ralph("--timeout", str(cli.MAX_ITERATION_TIMEOUT_SECONDS))
+        self.assertEqual(at_max.returncode, 0, at_max.stderr)
+        self.assertIn(
+            "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=2147483647",
+            (self.calls / "env").read_text(),
+        )
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        disabled = self.run_ralph("--timeout", "0")
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        # Backend limits stay pinned at their maximum even with Ralph's timer off.
+        self.assertIn(
+            "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=2147483647",
+            (self.calls / "env").read_text(),
+        )
+
+    def test_claude_backend_limits_stay_subordinate_when_timeout_disabled(self) -> None:
+        result = self.run_ralph("--timeout", "0", backend="claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BASH_MAX_TIMEOUT_MS=2147483647", (self.calls / "claude-env").read_text())
+
     def test_branch_changes_are_recorded_and_surfaced(self) -> None:
         result = self.run_ralph(env={"FAKE_BRANCH_CHANGE": "agent-branch"})
 
@@ -1869,6 +2071,97 @@ class RalphCliTest(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(command_help.returncode, 0, command_help.stderr)
+
+
+class WorktreeLockMetadataTest(unittest.TestCase):
+    """Deterministic ownership-verification coverage for stale lock recovery."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.git_dir = self.base / "gitdir"
+        self.git_dir.mkdir()
+        self.meta = self.git_dir / "ralph" / "lock.json"
+
+    def _write_meta(self, value: object) -> None:
+        self.meta.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(value, str):
+            self.meta.write_text(value, encoding="utf-8")
+        else:
+            self.meta.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_absent_metadata_acquires_and_records_owner(self) -> None:
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        self.assertTrue(lock.acquired)
+        self.assertEqual(json.loads(self.meta.read_text())["pid"], os.getpid())
+
+    def test_malformed_metadata_is_treated_as_stale_and_recovered(self) -> None:
+        self._write_meta("{ not valid json")
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        self.assertTrue(lock.acquired)
+        self.assertEqual(json.loads(self.meta.read_text())["pid"], os.getpid())
+
+    def test_reused_pid_with_mismatched_identity_is_recovered(self) -> None:
+        # The recorded PID is live (our own) but its identity does not match, as
+        # happens when the OS reuses a dead owner's PID for an unrelated process.
+        self._write_meta({"pid": os.getpid(), "identity": "not-the-real-identity"})
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        self.assertTrue(lock.acquired)
+
+    def test_inconsistent_pid_type_is_recovered(self) -> None:
+        self._write_meta({"pid": "not-an-int", "identity": "whatever"})
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        self.assertTrue(lock.acquired)
+
+    def test_live_matching_owner_refuses_recovery(self) -> None:
+        self._write_meta({"pid": os.getpid(), "identity": cli.process_identity(os.getpid())})
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(cli.RalphError) as caught:
+            lock.acquire()
+        self.assertIn("live matching owner", str(caught.exception))
+        self.assertFalse(lock.acquired)
+
+    def test_symlinked_metadata_file_is_refused(self) -> None:
+        self.meta.parent.mkdir(parents=True)
+        target = self.base / "outside.json"
+        target.write_text("{}", encoding="utf-8")
+        os.symlink(target, self.meta)
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(cli.RalphError) as caught:
+            lock.acquire()
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertFalse(lock.acquired)
+
+    def test_symlinked_state_root_is_refused(self) -> None:
+        outside = self.base / "outside-root"
+        outside.mkdir()
+        os.symlink(outside, self.git_dir / "ralph")
+        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(cli.RalphError) as caught:
+            lock.acquire()
+        self.assertIn("symlink", str(caught.exception))
+        self.assertFalse(lock.acquired)
+
+    def test_release_after_refused_recovery_leaves_lock_free(self) -> None:
+        self._write_meta({"pid": os.getpid(), "identity": cli.process_identity(os.getpid())})
+        first = cli.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(cli.RalphError):
+            first.acquire()
+        # The exclusive flock was released, so a clean record can be recovered.
+        self.meta.unlink()
+        second = cli.WorktreeLock(self.git_dir, self.meta)
+        second.acquire()
+        self.addCleanup(second.release)
+        self.assertTrue(second.acquired)
 
 
 if __name__ == "__main__":

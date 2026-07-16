@@ -44,7 +44,13 @@ OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
 `claude-opus-4-8`. Use `--model` for another model in the selected
 subscription-backed provider and `--worktree PATH` to target another GitHub
 worktree. Each iteration defaults to 2,700 seconds (45 minutes). A positive
-`--timeout` changes the limit; `--timeout 0` deliberately disables it.
+`--timeout` changes the limit up to a maximum of 2,000,000 seconds; `--timeout 0`
+deliberately disables it. Ralph raises the backend request and Bash-tool
+timeouts to their maximum so they always outlast an accepted Ralph timeout and
+never expire underneath legitimate work. Those backend limits are bounded
+integers and cannot be made truly infinite, which is why a positive Ralph
+timeout is capped below their ceiling; with `--timeout 0` they stay pinned at
+maximum and Ralph's timer no longer applies.
 
 Ralph snapshots the prompt once, starts a fresh session per iteration, and
 stops early only when the final assistant output contains the exact standalone
@@ -83,8 +89,17 @@ Ralph always grants dangerous full-auto permissions. The backend can edit
 files and run commands without confirmation. Review the prompt, repository,
 and effective authentication before starting an unattended run.
 
-Ralph holds `caffeinate -im` assertions for automated and generated manual
-sessions, preventing idle system and disk sleep while allowing display sleep.
-This cannot prevent sleep caused by closing the laptop lid or an explicit sleep
-command, and it cannot protect against power loss or external network and
-service outages. Keep the lid open and provide adequate power.
+Ralph holds `/usr/bin/caffeinate -im` assertions for automated and generated
+manual sessions, preventing idle system and disk sleep while allowing display
+sleep. It invokes the assertion tool by absolute path so a shadowed
+`caffeinate` on `PATH` cannot replace it, and it stops the loop safely if the
+loop-wide assertion exits unexpectedly. This cannot prevent sleep caused by
+closing the laptop lid or an explicit sleep command, and it cannot protect
+against power loss or external network and service outages. Keep the lid open
+and provide adequate power.
+
+Ralph keeps all runtime state beneath the selected worktree's resolved private
+Git directory. It refuses a symlinked or unexpected file type anywhere in that
+`.git/ralph` path, verifies recorded lock ownership before recovering a stale
+lock, and `ralph clean` removes only that real state directory without
+following symlinks or touching backend transcripts or source files.

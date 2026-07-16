@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -27,6 +28,23 @@ DEFAULT_MODELS = {
 MIN_OPENCODE_VERSION = (1, 17, 20)
 MIN_CLAUDE_VERSION = (2, 1, 208)
 MAX_PROMPT_BYTES = 10 * 1024 * 1024
+# Absolute path to the macOS sleep-assertion tool. It is invoked by absolute
+# path (never resolved through PATH) so a repository-local or otherwise
+# shadowed `caffeinate` cannot silently replace the real one. RALPH_CAFFEINATE
+# is an internal test seam that lets the suite substitute a fake; production
+# runs never set it and always use the system binary.
+DEFAULT_CAFFEINATE = "/usr/bin/caffeinate"
+# Backend request and Bash-tool timeouts are configured in integer
+# milliseconds and are bounded by a signed 32-bit value, so they can never be
+# made truly infinite. Ralph pins them to this ceiling and caps its own
+# accepted iteration timeout well below it (see MAX_ITERATION_TIMEOUT_SECONDS)
+# so a positive Ralph timeout is always authoritative and the backend limit
+# only becomes relevant when Ralph's own timer is explicitly disabled.
+BACKEND_TIMEOUT_MS = 2147483647
+# Largest iteration timeout Ralph accepts. Kept far below BACKEND_TIMEOUT_MS
+# expressed in seconds (2147483.647) so the backend request/Bash limit always
+# outlasts any accepted positive Ralph timeout by a wide margin.
+MAX_ITERATION_TIMEOUT_SECONDS = 2_000_000
 GRACEFUL_SHUTDOWN_SECONDS = 2
 TERMINATE_SHUTDOWN_SECONDS = 1
 # Brief pause between escalating a process group to SIGTERM and SIGKILL so a
@@ -179,6 +197,12 @@ def set_active_redactor(secrets: list[str]) -> None:
     _ACTIVE_REDACTOR = Redactor(secrets)
 
 
+def caffeinate_executable() -> str:
+    # Always an absolute path so the sleep assertion cannot be satisfied by a
+    # PATH-shadowed executable. RALPH_CAFFEINATE is honored only as a test seam.
+    return os.environ.get("RALPH_CAFFEINATE") or DEFAULT_CAFFEINATE
+
+
 class RalphError(Exception):
     pass
 
@@ -322,6 +346,50 @@ def process_identity(pid: int) -> str | None:
     return result.stdout.strip()
 
 
+def _reject_non_directory(path: Path, info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode):
+        raise RalphError(f"Ralph state path is a symlink and will not be used: {path}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise RalphError(f"Ralph state path is not a directory: {path}")
+
+
+def secure_state_directory(base: Path, *parts: str) -> Path:
+    # Walk each component beneath an already-resolved base directory, creating
+    # missing levels and verifying existing ones with lstat so a symlink or
+    # unexpected file type anywhere in the chain is refused rather than silently
+    # redirecting Ralph state outside the worktree's private Git directory.
+    path = base
+    for part in parts:
+        path = path / part
+        try:
+            os.mkdir(path)
+            continue
+        except FileExistsError:
+            pass
+        except FileNotFoundError:
+            raise RalphError(f"Ralph state parent path is missing: {path.parent}") from None
+        _reject_non_directory(path, os.lstat(path))
+    return path
+
+
+def read_lock_metadata(path: Path) -> dict[str, Any] | None:
+    # Refuse a symlinked or non-regular lock file (it could redirect a write or
+    # leak a read). A missing or malformed file is reported as absent metadata:
+    # the exclusive flock is the source of truth for mutual exclusion, so a lock
+    # file we cannot parse simply carries no ownership claim.
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RalphError("Ralph lock metadata is not a regular file")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 class WorktreeLock:
     def __init__(self, git_dir: Path, metadata_path: Path | None = None) -> None:
         self.git_dir = git_dir
@@ -337,24 +405,66 @@ class WorktreeLock:
         except BlockingIOError:
             if descriptor is not None:
                 os.close(descriptor)
-            raise RalphError("another Ralph loop is already running in this worktree") from None
+            raise RalphError(
+                "another Ralph loop is already running in this worktree"
+                + self._describe_owner()
+            ) from None
         except OSError as error:
             if descriptor is not None:
                 os.close(descriptor)
             raise RalphError(f"could not acquire the Ralph worktree lock: {error.strerror}") from None
         if self.metadata_path is not None:
             try:
-                self.metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                # Verify the state root and any pre-existing ownership record
+                # before overwriting it. Rejecting a symlinked state root here
+                # also keeps the later metadata lstat from being redirected.
+                secure_state_directory(self.git_dir, "ralph")
+                self._verify_recoverable()
                 write_json(
                     self.metadata_path,
                     {"identity": process_identity(os.getpid()), "pid": os.getpid()},
                 )
+            except RalphError:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                raise
             except OSError as error:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
                 raise RalphError(f"could not write the Ralph worktree lock: {error.strerror}") from None
         self.descriptor = descriptor
         self.acquired = True
+
+    def _describe_owner(self) -> str:
+        if self.metadata_path is None:
+            return ""
+        try:
+            data = read_lock_metadata(self.metadata_path)
+        except RalphError:
+            return ""
+        if isinstance(data, dict) and isinstance(data.get("pid"), int):
+            return f" (pid {data['pid']})"
+        return ""
+
+    def _verify_recoverable(self) -> None:
+        # Called while holding the exclusive flock, so no live process holds the
+        # lock. A stale, malformed, or reused-PID record is therefore safe to
+        # overwrite. The one contradictory case -- a recorded owner that is still
+        # alive with a matching process identity -- means the flock guarantee was
+        # somehow bypassed, so fail closed rather than clobber a possible loop.
+        assert self.metadata_path is not None
+        data = read_lock_metadata(self.metadata_path)
+        if data is None:
+            return
+        pid = data.get("pid")
+        identity = data.get("identity")
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        current = process_identity(pid)
+        if current is not None and isinstance(identity, str) and current == identity:
+            raise RalphError(
+                "Ralph lock metadata names a live matching owner; refusing to recover it"
+            )
 
     def release(self) -> None:
         if not self.acquired:
@@ -474,21 +584,22 @@ def isolated_config(model: str) -> dict[str, Any]:
 
 def clean_environment(model: str, backend: str) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in LLM_ENV_VARS}
+    ceiling = str(BACKEND_TIMEOUT_MS)
     if backend == "opencode":
         env.update(
             {
                 "OPENCODE_CONFIG_CONTENT": json.dumps(isolated_config(model), separators=(",", ":")),
                 "OPENCODE_DISABLE_AUTOUPDATE": "true",
                 "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
-                "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": "2147483647",
+                "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": ceiling,
             }
         )
     else:
         env.update(
             {
-                "API_TIMEOUT_MS": "2147483647",
-                "BASH_DEFAULT_TIMEOUT_MS": "2147483647",
-                "BASH_MAX_TIMEOUT_MS": "2147483647",
+                "API_TIMEOUT_MS": ceiling,
+                "BASH_DEFAULT_TIMEOUT_MS": ceiling,
+                "BASH_MAX_TIMEOUT_MS": ceiling,
                 "DISABLE_AUTOUPDATER": "1",
             }
         )
@@ -542,7 +653,7 @@ def reject_custom_tools(worktree: Path) -> None:
 def common_preflight(worktree: Path, slug: str, executable: str, env: dict[str, str]) -> None:
     if sys.platform != "darwin":
         raise RalphError("Ralph supports macOS only")
-    if not Path("/usr/bin/caffeinate").is_file() or shutil.which("caffeinate") is None:
+    if not Path(caffeinate_executable()).is_file():
         raise RalphError("/usr/bin/caffeinate is required")
     for required in ("gh", executable):
         if shutil.which(required) is None:
@@ -1222,7 +1333,7 @@ def execute_opencode_iteration(
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = [
-        "caffeinate",
+        caffeinate_executable(),
         "-im",
         "opencode",
         "--pure",
@@ -1435,7 +1546,7 @@ def execute_claude_iteration(
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = [
-        "caffeinate",
+        caffeinate_executable(),
         "-im",
         "claude",
         "-p",
@@ -1751,7 +1862,7 @@ class CaffeinateAssertion:
     def __enter__(self) -> CaffeinateAssertion:
         try:
             self.process = subprocess.Popen(
-                ["caffeinate", "-im", "-w", str(os.getpid())],
+                [caffeinate_executable(), "-im", "-w", str(os.getpid())],
                 cwd=self.worktree,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1764,6 +1875,18 @@ class CaffeinateAssertion:
         except subprocess.TimeoutExpired:
             return self
         raise RalphError(f"caffeinate exited during startup with status {returncode}")
+
+    def ensure_alive(self) -> None:
+        # The loop-wide assertion must cover the entire invocation. If it exits
+        # unexpectedly (killed, crashed) the sleep guarantee is gone, so the loop
+        # stops safely at the next boundary rather than continuing unprotected.
+        if self.process is None:
+            return
+        code = self.process.poll()
+        if code is not None:
+            raise RalphError(
+                f"the loop-wide caffeinate power assertion exited unexpectedly with status {code}"
+            )
 
     def __exit__(self, *_: object) -> None:
         if self.process is None or self.process.poll() is not None:
@@ -1786,9 +1909,9 @@ def run_locked(
     status: str,
     slug: str,
 ) -> int:
-    with CaffeinateAssertion(worktree):
+    with CaffeinateAssertion(worktree) as assertion:
         return run_protected(
-            args, prompt_path, prompt, worktree, git_dir, branch, status, slug
+            args, prompt_path, prompt, worktree, git_dir, branch, status, slug, assertion
         )
 
 
@@ -1801,6 +1924,7 @@ def run_protected(
     branch: str,
     status: str,
     slug: str,
+    assertion: CaffeinateAssertion,
 ) -> int:
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
@@ -1819,10 +1943,14 @@ def run_protected(
         file=sys.stderr,
     )
 
-    run_dir = git_dir / "ralph" / "runs" / (
+    runs_root = secure_state_directory(git_dir, "ralph", "runs")
+    run_dir = runs_root / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
     )
-    run_dir.mkdir(parents=True)
+    try:
+        os.mkdir(run_dir)
+    except FileExistsError:
+        raise RalphError("Ralph run directory already exists") from None
     (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
     write_json(
         run_dir / "options.json",
@@ -1844,8 +1972,14 @@ def run_protected(
     outcome = "budget_exhausted"
     try:
         for number in range(1, args.iterations + 1):
-            iteration_dir = run_dir if number == 1 else run_dir / f"iteration-{number:03d}"
-            iteration_dir.mkdir(exist_ok=True)
+            # The loop-wide sleep assertion must still be held before each fresh
+            # session; a lost assertion stops the loop with retained evidence.
+            assertion.ensure_alive()
+            iteration_dir = (
+                run_dir
+                if number == 1
+                else secure_state_directory(run_dir, f"iteration-{number:03d}")
+            )
             if args.backend == "claude":
                 claude_preflight(worktree, slug, args.model, env)
             else:
@@ -1985,6 +2119,11 @@ def run(args: argparse.Namespace) -> int:
         raise RalphError("iterations must be between 1 and 100")
     if not math.isfinite(args.timeout) or args.timeout < 0:
         raise RalphError("timeout must be zero or positive and finite")
+    if args.timeout > MAX_ITERATION_TIMEOUT_SECONDS:
+        raise RalphError(
+            f"timeout must not exceed {MAX_ITERATION_TIMEOUT_SECONDS} seconds so backend "
+            "request and Bash limits stay subordinate to Ralph's timer"
+        )
     args.model = args.model or DEFAULT_MODELS[args.backend]
     validate_model(args.backend, args.model)
 
@@ -2003,11 +2142,24 @@ def clean(args: argparse.Namespace) -> int:
         command(["git", "rev-parse", "--path-format=absolute", "--git-dir"], cwd=top).stdout.strip()
     ).resolve()
     state_root = git_dir / "ralph"
+    # Refuse while a live loop holds the worktree lock so active logs and locks
+    # cannot disappear underneath the process.
     lock = WorktreeLock(git_dir)
     lock.acquire()
     try:
-        if state_root.exists():
-            shutil.rmtree(state_root)
+        try:
+            info = os.lstat(state_root)
+        except FileNotFoundError:
+            return 0
+        # Never follow a symlink or delete an unexpected file type: only a real
+        # Ralph state directory is removed, and shutil.rmtree does not follow
+        # symlinked children, so backend transcripts and source files outside
+        # .git/ralph are never touched.
+        if stat.S_ISLNK(info.st_mode):
+            raise RalphError("refusing to remove a symlinked Ralph state path")
+        if not stat.S_ISDIR(info.st_mode):
+            raise RalphError("Ralph state path is not a directory")
+        shutil.rmtree(state_root)
     finally:
         lock.release()
     return 0
@@ -2051,11 +2203,11 @@ def resume(args: argparse.Namespace) -> int:
             "--dir",
             str(worktree),
         ]
-    # caffeinate is resolved through PATH, exactly as automated iterations launch
-    # it; preflight has already proved /usr/bin/caffeinate exists. Holding the
-    # -im assertion for the interactive session's whole lifetime replaces Ralph's
-    # own loop-level assertion once control passes to the operator.
-    argv = ["caffeinate", "-im", *backend_args]
+    # caffeinate is launched by absolute path, exactly as automated iterations
+    # do; preflight has already proved it exists. Holding the -im assertion for
+    # the interactive session's whole lifetime replaces Ralph's own loop-level
+    # assertion once control passes to the operator.
+    argv = [caffeinate_executable(), "-im", *backend_args]
     print(
         "WARNING: Ralph is relaunching the backend session in dangerous full-auto mode; "
         "it may edit files and run commands without confirmation.",
@@ -2081,7 +2233,10 @@ def parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=2700,
-        help="seconds allowed per iteration; zero disables the limit (default: 2700)",
+        help=(
+            "seconds allowed per iteration; zero disables the limit "
+            f"(default: 2700, maximum: {MAX_ITERATION_TIMEOUT_SECONDS})"
+        ),
     )
     run_parser.add_argument("--worktree")
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
