@@ -508,7 +508,7 @@ class RalphCliTest(unittest.TestCase):
         backend: str,
         model: str,
         session: str,
-        *,
+        *extra: str,
         env: dict[str, str] | None = None,
         worktree: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -526,6 +526,7 @@ class RalphCliTest(unittest.TestCase):
                 str(worktree or self.repo),
                 "--session",
                 session,
+                *extra,
             ],
             cwd=self.base,
             env=self._environment(env),
@@ -1932,6 +1933,163 @@ class RalphCliTest(unittest.TestCase):
         mixed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
         self.assertNotEqual(mixed.returncode, 0)
         self.assertIn("Claude customizations", mixed.stderr)
+
+    def test_agent_only_refusal_advertises_the_opt_out(self) -> None:
+        claude_dir = self.repo / ".claude"
+        claude_dir.mkdir()
+        settings = claude_dir / "settings.json"
+
+        # An agents-directory-only refusal names the opt-out.
+        agents = claude_dir / "agents"
+        agents.mkdir()
+        (agents / "custom.md").write_text("agent", encoding="utf-8")
+        dir_only = self.run_ralph(backend="claude")
+        self.assertNotEqual(dir_only.returncode, 0)
+        self.assertIn("Claude customizations", dir_only.stderr)
+        self.assertIn("--unsafe-allow-claude-agents", dir_only.stderr)
+        self.assertFalse((self.calls / "claude").exists())
+        (agents / "custom.md").unlink()
+        agents.rmdir()
+
+        # An `agent`-key-only refusal names the opt-out too.
+        settings.write_text(json.dumps({"agent": {"reviewer": {}}}), encoding="utf-8")
+        key_only = self.run_ralph(backend="claude")
+        self.assertNotEqual(key_only.returncode, 0)
+        self.assertIn("Claude customizations", key_only.stderr)
+        self.assertIn("--unsafe-allow-claude-agents", key_only.stderr)
+        settings.unlink()
+
+    def test_non_agent_refusals_never_advertise_the_opt_out(self) -> None:
+        claude_dir = self.repo / ".claude"
+        claude_dir.mkdir()
+        settings = claude_dir / "settings.json"
+        agents = claude_dir / "agents"
+
+        def _refusal(*, agents_present: bool, dir_name: str | None, keys: dict) -> str:
+            if agents_present:
+                agents.mkdir()
+            other_dir = claude_dir / dir_name if dir_name else None
+            if other_dir is not None:
+                other_dir.mkdir()
+            if keys:
+                settings.write_text(json.dumps(keys), encoding="utf-8")
+            result = self.run_ralph(backend="claude")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Claude customizations", result.stderr)
+            # The opt-out must never be dangled when the flag cannot relax the
+            # blocker; setting it would be a false remedy.
+            self.assertNotIn("--unsafe-allow-claude-agents", result.stderr)
+            self.assertFalse((self.calls / "claude").exists())
+            if agents_present:
+                agents.rmdir()
+            if other_dir is not None:
+                other_dir.rmdir()
+            if settings.exists():
+                settings.unlink()
+            return result.stderr
+
+        # A hooks directory and a plugins directory each stay plain.
+        _refusal(agents_present=False, dir_name="hooks", keys={})
+        _refusal(agents_present=False, dir_name="plugins", keys={})
+        # A mixed agents+hooks layout stays plain (agents is not the sole blocker).
+        _refusal(agents_present=True, dir_name="hooks", keys={})
+        _refusal(agents_present=True, dir_name="plugins", keys={})
+        # Another unsafe key alone stays plain.
+        _refusal(agents_present=False, dir_name=None, keys={"hooks": {}})
+        _refusal(agents_present=False, dir_name=None, keys={"env": {"X": "1"}})
+        # `agent` alongside another unsafe key stays plain.
+        _refusal(agents_present=False, dir_name=None, keys={"agent": {}, "hooks": {}})
+        # The agents directory alongside a non-agent settings key stays plain.
+        _refusal(agents_present=True, dir_name=None, keys={"hooks": {}})
+
+    def test_managed_config_refusal_never_advertises_the_opt_out(self) -> None:
+        # Managed configuration is refused even when an agents directory is the
+        # only local customization: the flag cannot relax managed config, so the
+        # refusal must stay plain and take precedence over the agent vector.
+        agents = self.repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        self.managed_root.mkdir()
+        (self.managed_root / "managed-settings.json").write_text("{}", encoding="utf-8")
+
+        result = self.run_ralph(backend="claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("managed Claude configuration", result.stderr)
+        self.assertNotIn("--unsafe-allow-claude-agents", result.stderr)
+        self.assertFalse((self.calls / "claude").exists())
+
+    def test_flag_is_backend_strict_on_run_and_resume(self) -> None:
+        # The flag is Claude-specific; combining it with OpenCode is refused
+        # fail-closed before any backend, preflight, or handoff command exists.
+        run_opencode = self.run_ralph(
+            "--unsafe-allow-claude-agents", backend="opencode"
+        )
+        self.assertNotEqual(run_opencode.returncode, 0)
+        self.assertIn("--unsafe-allow-claude-agents is only valid with --backend claude", run_opencode.stderr)
+        self.assertFalse((self.calls / "opencode").exists())
+        self.assertFalse((self.calls / "caffeinate").exists())
+
+        resume_opencode = self.resume_ralph(
+            "opencode", "openai/gpt-5.6-sol", "ses_1", "--unsafe-allow-claude-agents"
+        )
+        self.assertNotEqual(resume_opencode.returncode, 0)
+        self.assertIn("--unsafe-allow-claude-agents is only valid with --backend claude", resume_opencode.stderr)
+        self.assertFalse((self.calls / "opencode").exists())
+        self.assertFalse((self.calls / "caffeinate").exists())
+
+    def test_claude_handoff_reproduces_flag_with_session_last(self) -> None:
+        events = self._claude_events("unused").splitlines()
+        assistant = json.loads(events[1])
+        assistant["message"]["content"] = [
+            {
+                "type": "tool_use",
+                "name": "AskUserQuestion",
+                "input": {"questions": [{"question": "Which migration path should I take?"}]},
+            }
+        ]
+        claude_events = "\n".join([events[0], json.dumps(assistant)])
+        agents = self.repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "custom.md").write_text("agent", encoding="utf-8")
+
+        with_flag = self.run_ralph(
+            "--unsafe-allow-claude-agents",
+            "--iterations",
+            "2",
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": claude_events},
+        )
+        self.assertEqual(with_flag.returncode, 2)
+        # Both the resume and the run command reproduce the flag so recovery
+        # re-establishes the same relaxed boundary.
+        self.assertIn("ralph resume --backend claude", with_flag.stderr)
+        resume_line = next(
+            line for line in with_flag.stderr.splitlines() if "manual resume:" in line
+        )
+        self.assertIn("--unsafe-allow-claude-agents", resume_line)
+        # --session must remain the final argument of the resume command.
+        self.assertTrue(resume_line.rstrip().endswith("--session claude-session-1"))
+        continue_line = next(
+            line for line in with_flag.stderr.splitlines() if "continue Ralph:" in line
+        )
+        self.assertIn("--unsafe-allow-claude-agents", continue_line)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # Without the flag, neither command mentions it. (Move the agents dir
+        # aside so the no-flag run is not refused before it can hand off.)
+        (agents / "custom.md").unlink()
+        agents.rmdir()
+        without_flag = self.run_ralph(
+            "--iterations",
+            "2",
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": claude_events},
+        )
+        self.assertEqual(without_flag.returncode, 2)
+        self.assertIn("manual resume:", without_flag.stderr)
+        self.assertNotIn("--unsafe-allow-claude-agents", without_flag.stderr)
 
     def test_claude_oauth_token_is_preserved_but_api_credentials_are_rejected(self) -> None:
         token_result = self.run_ralph(

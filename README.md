@@ -71,16 +71,25 @@ maximum and Ralph's timer no longer applies.
 
 By default the Claude backend refuses a repository that carries Claude
 subagents, because an unattended billed run cannot prove which subagents loaded.
+When a Claude agent vector is the *only* reason a repository is refused, the
+error names `--unsafe-allow-claude-agents` so the supported opt-out is
+discoverable from the failure; every other refusal — a hooks or plugins
+directory, managed or server-managed configuration, or any other unsafe settings
+key, including when `agent` appears alongside one — keeps the plain message,
+because the flag cannot relax those.
+
 Pass `--unsafe-allow-claude-agents` when a repo's loop legitimately develops or
 depends on subagents: it admits the repo's `.claude/agents` directory and the
 `.claude/settings.json` `agent` key, and warns that subagent isolation is not
 proven for that run. The flag is deliberately unsafe and narrowly scoped — it
 relaxes only those agent vectors. Hooks, plugins, managed configuration, MCP
 routing, and every other unsafe setting stay refused, and the runtime
-MCP/plugin/tool isolation proven from the session's init event is unchanged. The
-same flag is accepted by `ralph resume`, and Ralph reproduces it in the
-`resume` and `run` commands it prints for a handed-off session so recovery
-re-establishes the same relaxed boundary.
+MCP/plugin/tool isolation proven from the session's init event is unchanged. It
+is Claude-specific: combining it with `--backend opencode` is rejected fail-closed
+on both `ralph run` and `ralph resume`, so it never enters an OpenCode command.
+The same flag is accepted by `ralph resume` with the Claude backend, and Ralph
+reproduces it in the `resume` and `run` commands it prints for a handed-off
+session so recovery re-establishes the same relaxed boundary.
 
 Ralph snapshots the prompt once, starts a fresh session per iteration, and
 stops early only when the final assistant output contains the exact standalone

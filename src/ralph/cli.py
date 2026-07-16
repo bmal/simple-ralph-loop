@@ -712,6 +712,52 @@ def opencode_preflight(worktree: Path, slug: str, model: str, env: dict[str, str
         raise RalphError(f"selected model is unavailable: {model}")
 
 
+CLAUDE_CUSTOMIZATION_DIRS = ("agents", "hooks", "plugins")
+# Settings keys that, if present in `.claude/settings.json`, defeat the proof of
+# safe isolation. Only `agent` is relaxable via --unsafe-allow-claude-agents.
+UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
+    {
+        "agent",
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "enabledPlugins",
+        "env",
+        "extraKnownMarketplaces",
+        "hooks",
+    }
+)
+CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running Ralph"
+# Appended to the refusal only when a Claude agent vector — the `.claude/agents`
+# directory or the settings.json `agent` key — is the *sole* blocker, so the
+# operator can discover the supported opt-out from the failure itself. It is
+# withheld from every other refusal (a hooks/plugins directory, managed or
+# server-managed configuration, or any other unsafe settings key, including when
+# `agent` appears alongside one) because the flag cannot relax those and must
+# never be advertised as a false remedy.
+AGENT_OPT_OUT_HINT = (
+    "; a Claude agent vector is the only blocker, so you may re-run with "
+    "--unsafe-allow-claude-agents to admit the .claude/agents directory and the "
+    "settings.json 'agent' key for this run (unsafe: Ralph then cannot prove "
+    "Claude subagent isolation)"
+)
+
+
+def read_unsafe_settings_keys(settings_path: Path) -> set[str]:
+    # Return the unsafe keys present in `.claude/settings.json`, or an empty set
+    # when the file is absent. Malformed settings fail closed with their own
+    # message rather than being treated as carrying no unsafe keys.
+    if not settings_path.exists():
+        return set()
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise RalphError("Claude project settings are malformed") from None
+    if not isinstance(settings, dict):
+        raise RalphError("Claude project settings are malformed")
+    return set(UNSAFE_CLAUDE_SETTINGS_KEYS.intersection(settings))
+
+
 def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> None:
     claude_dir = worktree / ".claude"
     # --unsafe-allow-claude-agents relaxes only the agent vectors: the
@@ -727,10 +773,10 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
             "Claude subagent isolation for this run.",
             file=sys.stderr,
         )
-    customization_names = ("hooks", "plugins") if allow_agents else ("agents", "hooks", "plugins")
-    for name in customization_names:
-        if (claude_dir / name).exists():
-            raise RalphError("Claude customizations must be disabled before running Ralph")
+    # Managed and server-managed configuration is refused before the local
+    # customization checks: the flag cannot relax it, so it must take precedence
+    # over any co-present agent vector and never masquerade as something the
+    # opt-out could fix.
     managed_root = claude_managed_root()
     if any(
         path.exists()
@@ -750,29 +796,30 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
         raise RalphError("managed Claude preferences prevent proving safe isolation")
     if (Path.home() / ".claude" / "remote-settings.json").exists():
         raise RalphError("server-managed Claude settings prevent proving safe isolation")
-    settings_path = claude_dir / "settings.json"
-    if not settings_path.exists():
+    # Gather every local customization blocker before refusing so an
+    # agent-vector-only refusal can be told apart from one that also (or instead)
+    # trips a vector the flag cannot relax. When the flag is set the agent
+    # vectors are admitted and so are excluded from the offending sets.
+    relaxable_dirs = {"agents"} if allow_agents else set()
+    relaxable_keys = {"agent"} if allow_agents else set()
+    offending_dirs = [
+        name
+        for name in CLAUDE_CUSTOMIZATION_DIRS
+        if name not in relaxable_dirs and (claude_dir / name).exists()
+    ]
+    offending_keys = read_unsafe_settings_keys(claude_dir / "settings.json") - relaxable_keys
+    if not offending_dirs and not offending_keys:
         return
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        raise RalphError("Claude project settings are malformed") from None
-    if not isinstance(settings, dict):
-        raise RalphError("Claude project settings are malformed")
-    unsafe = {
-        "agent",
-        "apiKeyHelper",
-        "awsAuthRefresh",
-        "awsCredentialExport",
-        "enabledPlugins",
-        "env",
-        "extraKnownMarketplaces",
-        "hooks",
-    }
-    if allow_agents:
-        unsafe = unsafe - {"agent"}
-    if unsafe.intersection(settings):
-        raise RalphError("Claude customizations must be disabled before running Ralph")
+    # The hint is offered only when every offending item is an agent vector. If
+    # the flag is already set the agent vectors are filtered out above, so any
+    # surviving blocker is non-agent and the plain refusal stands.
+    agent_blocker = "agents" in offending_dirs or "agent" in offending_keys
+    non_agent_blocker = bool(
+        [name for name in offending_dirs if name != "agents"]
+        + [key for key in offending_keys if key != "agent"]
+    )
+    hint = agent_blocker and not non_agent_blocker
+    raise RalphError(CUSTOMIZATION_REFUSAL + (AGENT_OPT_OUT_HINT if hint else ""))
 
 
 def claude_preflight(
@@ -2183,7 +2230,20 @@ def validate_model(backend: str, model: str) -> None:
         raise RalphError("model must be a Claude subscription model")
 
 
+def reject_backend_incompatible_flags(args: argparse.Namespace) -> None:
+    # --unsafe-allow-claude-agents is meaningful only for the Claude backend: it
+    # relaxes Claude-specific agent vectors and nothing about OpenCode. Reject it
+    # fail-closed here — before any git, network, preflight, or backend work — so
+    # it can never be threaded into an OpenCode preflight nor reproduced in a
+    # generated OpenCode resume/run command, where it would be nonsensical.
+    if getattr(args, "unsafe_allow_claude_agents", False) and args.backend != "claude":
+        raise RalphError(
+            "--unsafe-allow-claude-agents is only valid with --backend claude"
+        )
+
+
 def run(args: argparse.Namespace) -> int:
+    reject_backend_incompatible_flags(args)
     if not 1 <= args.iterations <= 100:
         raise RalphError("iterations must be between 1 and 100")
     if not math.isfinite(args.timeout) or args.timeout < 0:
@@ -2235,6 +2295,7 @@ def clean(args: argparse.Namespace) -> int:
 
 
 def resume(args: argparse.Namespace) -> int:
+    reject_backend_incompatible_flags(args)
     validate_model(args.backend, args.model)
     worktree, _git_dir, _branch, _status, slug = git_context(args.worktree)
     # Re-establish the exact sanitized child environment and re-prove the
