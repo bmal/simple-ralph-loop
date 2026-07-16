@@ -1598,6 +1598,9 @@ def _consume_opencode_iteration(
                 controller.force_kill()
                 thread.join()
                 write_opencode_session(run_dir, result)
+                # A stopped backend can truncate its final output mid-character;
+                # blame Ralph's own timeout or interrupt before the contract.
+                raise_if_controlled_stop(controller, "OpenCode", result.session_id)
                 raise_backend_contract_failure(
                     result.session_id, "OpenCode emitted invalid UTF-8 output"
                 )
@@ -1613,6 +1616,7 @@ def _consume_opencode_iteration(
                 controller.force_kill()
                 thread.join()
                 write_opencode_session(run_dir, result)
+                raise_if_controlled_stop(controller, "OpenCode", result.session_id)
                 if result.session_id:
                     raise HandoffError(
                         "OpenCode emitted malformed structured output",
@@ -1624,6 +1628,10 @@ def _consume_opencode_iteration(
                 controller.stop_gracefully()
                 thread.join()
                 write_opencode_session(run_dir, result)
+                # A backend Ralph itself stopped may close its stream with an
+                # error event; report the timeout or interruption rather than
+                # misclassifying that artifact as a contract failure.
+                raise_if_controlled_stop(controller, "OpenCode", result.session_id)
                 if result.session_id:
                     raise HandoffError(
                         str(error),
@@ -1819,6 +1827,9 @@ def _consume_claude_iteration(
                 controller.force_kill()
                 thread.join()
                 write_claude_session(run_dir, result)
+                # A stopped backend can truncate its final output mid-character;
+                # blame Ralph's own timeout or interrupt before the contract.
+                raise_if_controlled_stop(controller, "Claude", result.session_id)
                 raise_backend_contract_failure(
                     result.session_id, "Claude emitted invalid UTF-8 output"
                 )
@@ -1835,6 +1846,7 @@ def _consume_claude_iteration(
                 controller.force_kill()
                 thread.join()
                 write_claude_session(run_dir, result)
+                raise_if_controlled_stop(controller, "Claude", result.session_id)
                 if result.session_id:
                     raise HandoffError(
                         "Claude emitted malformed structured output",
@@ -1848,6 +1860,11 @@ def _consume_claude_iteration(
                 write_claude_session(run_dir, result)
                 if isinstance(error, HandoffError):
                     raise
+                # An interrupted Claude session emits an error result event
+                # before exiting; when Ralph itself stopped the backend that
+                # event is an artifact of the stop, not a contract violation,
+                # so report the timeout or interruption instead.
+                raise_if_controlled_stop(controller, "Claude", result.session_id)
                 if result.session_id:
                     raise HandoffError(
                         str(error),
@@ -2421,10 +2438,10 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--timeout",
         type=float,
-        default=2700,
+        default=3600,
         help=(
             "seconds allowed per iteration; zero disables the limit "
-            f"(default: 2700, maximum: {MAX_ITERATION_TIMEOUT_SECONDS})"
+            f"(default: 3600, maximum: {MAX_ITERATION_TIMEOUT_SECONDS})"
         ),
     )
     run_parser.add_argument("--worktree")

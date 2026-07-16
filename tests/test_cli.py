@@ -224,6 +224,10 @@ class RalphCliTest(unittest.TestCase):
                   (sleep "$FAKE_CLAUDE_ORPHAN_SLEEP") &
                   exit 0
                 fi
+                if test -n "${FAKE_CLAUDE_ERROR_RESULT_ON_INT:-}"; then
+                  trap 'printf "%s\n" "$FAKE_CLAUDE_ERROR_RESULT_ON_INT"; exit 0' INT
+                  while :; do sleep 1 || true; done
+                fi
                 if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
                   trap 'printf INT >> "$FAKE_CALLS/claude-signals"' INT
                   trap 'printf TERM >> "$FAKE_CALLS/claude-signals"' TERM
@@ -728,11 +732,11 @@ class RalphCliTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("between 1 and 100", result.stderr)
 
-    def test_timeout_defaults_to_45_minutes_and_accepts_positive_or_zero_seconds(self) -> None:
+    def test_timeout_defaults_to_60_minutes_and_accepts_positive_or_zero_seconds(self) -> None:
         default = self.run_ralph()
         self.assertEqual(default.returncode, 0, default.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
-        self.assertEqual(json.loads((run_dir / "options.json").read_text())["timeout"], 2700)
+        self.assertEqual(json.loads((run_dir / "options.json").read_text())["timeout"], 3600)
 
         for path in self.calls.iterdir():
             path.unlink()
@@ -792,6 +796,41 @@ class RalphCliTest(unittest.TestCase):
         self.assertEqual(session["session_id"], "claude-session-1")
         self.assertFalse(session["final_result_received"])
         self.assertEqual((self.calls / "claude-signals").read_text(), "INTTERM")
+
+    def test_claude_timeout_is_not_misreported_when_the_interrupt_yields_an_error_result(self) -> None:
+        # The real Claude CLI answers Ralph's timeout interrupt with a final
+        # error result event (subtype error_during_execution) before exiting.
+        # That artifact of Ralph's own stop must surface as a timeout handoff,
+        # not as a backend contract failure.
+        error_result = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "session_id": "claude-session-1",
+            }
+        )
+        result = self.run_ralph(
+            "--timeout",
+            "0.1",
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events("unused").splitlines()[0],
+                "FAKE_CLAUDE_ERROR_RESULT_ON_INT": error_result,
+            },
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Claude iteration timed out", result.stderr)
+        self.assertNotIn("unsuccessful result", result.stderr)
+        self.assertIn("ralph resume --backend claude", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "timeout")
+        self.assertEqual(outcome["iterations"][0]["outcome"], "timeout")
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["session_id"], "claude-session-1")
+        self.assertFalse(session["final_result_received"])
 
     def test_timeout_before_session_metadata_still_consumes_the_started_iteration(self) -> None:
         result = self.run_ralph(

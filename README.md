@@ -54,7 +54,7 @@ so `git pull` first.
 ```sh
 ralph run prompt.md --backend opencode --iterations 5
 ralph run prompt.md --backend claude --iterations 5
-ralph run prompt.md --backend opencode --iterations 2 --timeout 3600
+ralph run prompt.md --backend opencode --iterations 2 --timeout 5400
 ```
 
 OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
@@ -62,7 +62,7 @@ OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
 example `ralph: backend claude, model claude-opus-4-8`) so the console states
 exactly what the loop is about to spend budget on. Use `--model` for another
 model in the selected subscription-backed provider and `--worktree PATH` to
-target another GitHub worktree. Each iteration defaults to 2,700 seconds (45 minutes). A positive
+target another GitHub worktree. Each iteration defaults to 3,600 seconds (60 minutes). A positive
 `--timeout` changes the limit up to a maximum of 2,000,000 seconds; `--timeout 0`
 deliberately disables it. Ralph raises the backend request and Bash-tool
 timeouts to their maximum so they always outlast an accepted Ralph timeout and
