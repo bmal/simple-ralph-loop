@@ -1092,23 +1092,28 @@ class ClaudeEventResult:
         content = message.get("content")
         if not isinstance(content, list):
             raise RalphError("Claude assistant event omitted content")
+        # Each Claude stream-json assistant event carries a complete message
+        # (there are no incremental text deltas without partial-message mode),
+        # so print each part on its own line: text as a paragraph, tool use as a
+        # bracketed progress marker matching the OpenCode backend's style.
+        # Printing with end="" here would glue consecutive messages together.
+        texts: list[str] = []
         for part in content:
-            if (
-                isinstance(part, dict)
-                and part.get("type") == "tool_use"
-                and part.get("name") == "AskUserQuestion"
-            ):
-                self.question = extract_question(part.get("input")) or "Claude attempted to ask a question."
-        text = "".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict)
-            and part.get("type") == "text"
-            and isinstance(part.get("text"), str)
-        )
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+                if part["text"]:
+                    print(redact(part["text"]), flush=True)
+                continue
+            if part.get("type") == "tool_use":
+                name = part.get("name")
+                if name == "AskUserQuestion":
+                    self.question = extract_question(part.get("input")) or "Claude attempted to ask a question."
+                print(redact(f"[{name if isinstance(name, str) and name else 'tool'}]"), flush=True)
+        text = "".join(texts)
         if text:
             self.assistant_results.append(text)
-            print(redact(text), end="", flush=True)
 
     def _accept_result(self, event: dict[str, Any]) -> None:
         self._require_session(event.get("session_id"))
@@ -1834,8 +1839,6 @@ def _consume_claude_iteration(
         raise_backend_contract_failure(
             result.session_id, "Claude emitted invalid UTF-8 on stderr"
         )
-    if result.assistant_results:
-        print()
     if returncode:
         if result.session_id:
             raise HandoffError(
@@ -2122,6 +2125,9 @@ def run_protected(
                 if number == 1
                 else secure_state_directory(run_dir, f"iteration-{number:03d}")
             )
+            # Mark the boundary between fresh sessions so multi-iteration
+            # console output is attributable to a specific iteration.
+            print(f"ralph: iteration {number} of {args.iterations}", file=sys.stderr)
             if args.backend == "claude":
                 claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_claude_agents)
             else:
