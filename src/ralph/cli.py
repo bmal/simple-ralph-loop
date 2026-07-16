@@ -714,7 +714,30 @@ def common_preflight(worktree: Path, slug: str, executable: str, env: dict[str, 
         raise RalphError("origin does not match the accessible GitHub repository")
 
 
-def opencode_preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> None:
+def reject_opencode_agents(config: dict[str, Any], allow_agents: bool) -> None:
+    # OpenCode loads project (`.opencode/agent`) and global agent definitions
+    # even under `--pure`, and they all surface in the effective configuration's
+    # `agent` map, so that map is the single authoritative proof of agent
+    # isolation. An unfamiliar shape fails closed like every other preflight
+    # proof. --unsafe-allow-agents admits a non-empty map with the same trade as
+    # the Claude backend: the operator vouches for the agents for this run.
+    agents = config.get("agent")
+    if not isinstance(agents, dict):
+        raise RalphError("effective OpenCode configuration omitted the agent map")
+    if not agents:
+        return
+    if not allow_agents:
+        raise RalphError(OPENCODE_AGENT_REFUSAL)
+    print(
+        "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
+        "OpenCode agent isolation for this run.",
+        file=sys.stderr,
+    )
+
+
+def opencode_preflight(
+    worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = False
+) -> None:
     common_preflight(worktree, slug, "opencode", env)
     reject_custom_tools(worktree)
 
@@ -726,17 +749,21 @@ def opencode_preflight(worktree: Path, slug: str, model: str, env: dict[str, str
 
     resolved = command(["opencode", "--pure", "debug", "config"], cwd=worktree, env=env).stdout
     try:
-        validate_effective_config(json.loads(resolved), model)
+        config = json.loads(resolved)
     except json.JSONDecodeError:
         raise RalphError("effective OpenCode configuration is malformed") from None
+    validate_effective_config(config, model)
     models = command(["opencode", "--pure", "models", "openai"], cwd=worktree, env=env).stdout.splitlines()
     if model not in {item.strip() for item in models}:
         raise RalphError(f"selected model is unavailable: {model}")
+    # Checked after every other proof so the opt-out hint in the refusal is
+    # advertised only when the agent map truly is the sole remaining blocker.
+    reject_opencode_agents(config, allow_agents)
 
 
 CLAUDE_CUSTOMIZATION_DIRS = ("agents", "hooks", "plugins")
 # Settings keys that, if present in `.claude/settings.json`, defeat the proof of
-# safe isolation. Only `agent` is relaxable via --unsafe-allow-claude-agents.
+# safe isolation. Only `agent` is relaxable via --unsafe-allow-agents.
 UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
     {
         "agent",
@@ -759,9 +786,17 @@ CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running R
 # never be advertised as a false remedy.
 AGENT_OPT_OUT_HINT = (
     "; a Claude agent vector is the only blocker, so you may re-run with "
-    "--unsafe-allow-claude-agents to admit the .claude/agents directory and the "
+    "--unsafe-allow-agents to admit the .claude/agents directory and the "
     "settings.json 'agent' key for this run (unsafe: Ralph then cannot prove "
     "Claude subagent isolation)"
+)
+# OpenCode counterpart to AGENT_OPT_OUT_HINT. The agent check runs after every
+# other OpenCode preflight proof, so when this refusal fires the agent map is
+# by construction the only blocker and the opt-out is never a false remedy.
+OPENCODE_AGENT_REFUSAL = (
+    "OpenCode agents must be disabled before running Ralph; you may re-run with "
+    "--unsafe-allow-agents to admit the effective configuration's agents for "
+    "this run (unsafe: Ralph then cannot prove OpenCode agent isolation)"
 )
 
 
@@ -782,7 +817,7 @@ def read_unsafe_settings_keys(settings_path: Path) -> set[str]:
 
 def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> None:
     claude_dir = worktree / ".claude"
-    # --unsafe-allow-claude-agents relaxes only the agent vectors: the
+    # --unsafe-allow-agents relaxes only the agent vectors: the
     # `.claude/agents` directory and the settings.json `agent` key. It exists for
     # repos whose loop develops or depends on subagents. Hooks, plugins, managed
     # configuration, and every other unsafe setting stay refused, and runtime
@@ -791,7 +826,7 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
     # the operator vouches for them for this run.
     if allow_agents and (claude_dir / "agents").exists():
         print(
-            "WARNING: --unsafe-allow-claude-agents is set; Ralph is not proving "
+            "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
             "Claude subagent isolation for this run.",
             file=sys.stderr,
         )
@@ -1921,7 +1956,7 @@ def resume_command(
     # Reproduce the relaxed check so the handoff can re-prove the same boundary;
     # without it resume would refuse the very agents the run was allowed.
     if allow_agents:
-        args.append("--unsafe-allow-claude-agents")
+        args.append("--unsafe-allow-agents")
     args += ["--session", session_id]
     return shell_command(args, worktree)
 
@@ -1951,7 +1986,7 @@ def restart_command(
         str(timeout),
     ]
     if allow_agents:
-        args.append("--unsafe-allow-claude-agents")
+        args.append("--unsafe-allow-agents")
     return shell_command(args, worktree)
 
 
@@ -2071,6 +2106,10 @@ def run_protected(
     slug: str,
     assertion: CaffeinateAssertion,
 ) -> int:
+    # Announce the resolved routing up front so a run's console output states
+    # exactly which backend and model the loop is about to spend budget on,
+    # including when the model came from DEFAULT_MODELS rather than --model.
+    print(f"ralph: backend {args.backend}, model {args.model}", file=sys.stderr)
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
     env = clean_environment(args.model, args.backend)
@@ -2129,9 +2168,9 @@ def run_protected(
             # console output is attributable to a specific iteration.
             print(f"ralph: iteration {number} of {args.iterations}", file=sys.stderr)
             if args.backend == "claude":
-                claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_claude_agents)
+                claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
             else:
-                opencode_preflight(worktree, slug, args.model, env)
+                opencode_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
             iteration_started = datetime.now(timezone.utc).isoformat()
             outcome, session_id = execute_iteration(
                 args.backend, worktree, iteration_dir, prompt, args.model, env, args.timeout
@@ -2182,7 +2221,7 @@ def run_protected(
             remaining=args.iterations - number,
             run_id=run_dir.name,
             timeout=args.timeout,
-            allow_agents=args.unsafe_allow_claude_agents,
+            allow_agents=args.unsafe_allow_agents,
         )
         return 2
     except StartedIterationError as error:
@@ -2223,7 +2262,7 @@ def run_protected(
             remaining=args.iterations - number,
             run_id=run_dir.name,
             timeout=args.timeout,
-            allow_agents=args.unsafe_allow_claude_agents,
+            allow_agents=args.unsafe_allow_agents,
         )
         return 2
     except RalphError:
@@ -2264,20 +2303,7 @@ def validate_model(backend: str, model: str) -> None:
         raise RalphError("model must be a Claude subscription model")
 
 
-def reject_backend_incompatible_flags(args: argparse.Namespace) -> None:
-    # --unsafe-allow-claude-agents is meaningful only for the Claude backend: it
-    # relaxes Claude-specific agent vectors and nothing about OpenCode. Reject it
-    # fail-closed here — before any git, network, preflight, or backend work — so
-    # it can never be threaded into an OpenCode preflight nor reproduced in a
-    # generated OpenCode resume/run command, where it would be nonsensical.
-    if getattr(args, "unsafe_allow_claude_agents", False) and args.backend != "claude":
-        raise RalphError(
-            "--unsafe-allow-claude-agents is only valid with --backend claude"
-        )
-
-
 def run(args: argparse.Namespace) -> int:
-    reject_backend_incompatible_flags(args)
     if not 1 <= args.iterations <= 100:
         raise RalphError("iterations must be between 1 and 100")
     if not math.isfinite(args.timeout) or args.timeout < 0:
@@ -2329,7 +2355,6 @@ def clean(args: argparse.Namespace) -> int:
 
 
 def resume(args: argparse.Namespace) -> int:
-    reject_backend_incompatible_flags(args)
     validate_model(args.backend, args.model)
     worktree, _git_dir, _branch, _status, slug = git_context(args.worktree)
     # Re-establish the exact sanitized child environment and re-prove the
@@ -2340,7 +2365,7 @@ def resume(args: argparse.Namespace) -> int:
     env = clean_environment(args.model, args.backend)
     set_active_redactor(collect_secrets())
     if args.backend == "claude":
-        claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_claude_agents)
+        claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
         backend_args = [
             "claude",
             "--resume",
@@ -2355,7 +2380,7 @@ def resume(args: argparse.Namespace) -> int:
             CLAUDE_SETTINGS,
         ]
     else:
-        opencode_preflight(worktree, slug, args.model, env)
+        opencode_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
         backend_args = [
             "opencode",
             "--pure",
@@ -2404,11 +2429,13 @@ def parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--worktree")
     run_parser.add_argument(
-        "--unsafe-allow-claude-agents",
+        "--unsafe-allow-agents",
         action="store_true",
         help=(
-            "allow a repo's .claude/agents and settings.json 'agent' key instead of "
-            "refusing them; Ralph then cannot prove Claude subagent isolation (unsafe)"
+            "allow the repo's backend agents instead of refusing them (Claude: "
+            ".claude/agents and the settings.json 'agent' key; OpenCode: the "
+            "effective configuration's agent map); Ralph then cannot prove "
+            "agent isolation (unsafe)"
         ),
     )
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
@@ -2421,11 +2448,13 @@ def parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--session", required=True)
     resume_parser.add_argument("--worktree")
     resume_parser.add_argument(
-        "--unsafe-allow-claude-agents",
+        "--unsafe-allow-agents",
         action="store_true",
         help=(
-            "allow a repo's .claude/agents and settings.json 'agent' key instead of "
-            "refusing them; Ralph then cannot prove Claude subagent isolation (unsafe)"
+            "allow the repo's backend agents instead of refusing them (Claude: "
+            ".claude/agents and the settings.json 'agent' key; OpenCode: the "
+            "effective configuration's agent map); Ralph then cannot prove "
+            "agent isolation (unsafe)"
         ),
     )
     return result

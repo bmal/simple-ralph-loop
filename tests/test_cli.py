@@ -328,7 +328,7 @@ class RalphCliTest(unittest.TestCase):
             )
         return sequence
 
-    def _config(self) -> str:
+    def _config(self, agents: dict | None = None) -> str:
         return json.dumps(
             {
                 "model": "openai/gpt-5.6-sol",
@@ -341,6 +341,10 @@ class RalphCliTest(unittest.TestCase):
                 "autoupdate": False,
                 "formatter": False,
                 "lsp": False,
+                # OpenCode surfaces every loaded agent (project `.opencode/agent`
+                # and global definitions, even under --pure) in this map, so an
+                # empty map is the effective-config proof of agent isolation.
+                "agent": agents or {},
             }
         )
 
@@ -583,6 +587,39 @@ class RalphCliTest(unittest.TestCase):
         child_env = (self.calls / "env").read_text()
         self.assertIn("OPENCODE_DISABLE_AUTOUPDATE=true", child_env)
         self.assertNotIn("OPENAI_API_KEY=", child_env)
+
+    def test_run_announces_backend_and_resolved_model(self) -> None:
+        # The console must state exactly which backend and model the loop is
+        # about to spend budget on, including a model that came from
+        # DEFAULT_MODELS rather than an explicit --model.
+        opencode = self.run_ralph()
+        self.assertEqual(opencode.returncode, 0, opencode.stderr)
+        self.assertIn("ralph: backend opencode, model openai/gpt-5.6-sol", opencode.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        claude = self.run_ralph(backend="claude")
+        self.assertEqual(claude.returncode, 0, claude.stderr)
+        self.assertIn("ralph: backend claude, model claude-opus-4-8", claude.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # An explicit --model is announced verbatim.
+        requested = "claude-sonnet-4-6"
+        explicit = self.run_ralph(
+            "--model",
+            requested,
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events(
+                    "Work complete.\n<promise>COMPLETE</promise>", model=requested
+                )
+            },
+        )
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertIn(f"ralph: backend claude, model {requested}", explicit.stderr)
 
     def test_success_without_marker_reports_exhausted_budget(self) -> None:
         result = self.run_ralph(
@@ -1891,7 +1928,7 @@ class RalphCliTest(unittest.TestCase):
         self.assertNotEqual(malformed.returncode, 0)
         self.assertIn("malformed structured output", malformed.stderr)
 
-    def test_unsafe_allow_claude_agents_relaxes_only_the_agent_vectors(self) -> None:
+    def test_unsafe_allow_agents_relaxes_only_the_claude_agent_vectors(self) -> None:
         agents = self.repo / ".claude" / "agents"
         agents.mkdir(parents=True)
         (agents / "custom.md").write_text("custom agent", encoding="utf-8")
@@ -1901,10 +1938,10 @@ class RalphCliTest(unittest.TestCase):
         self.assertIn("Claude customizations", refused.stderr)
         self.assertFalse((self.calls / "claude").exists())
 
-        allowed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        allowed = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         self.assertTrue((self.calls / "claude").exists())
-        self.assertIn("--unsafe-allow-claude-agents is set", allowed.stderr)
+        self.assertIn("--unsafe-allow-agents is set", allowed.stderr)
 
         for path in self.calls.iterdir():
             path.unlink()
@@ -1913,7 +1950,7 @@ class RalphCliTest(unittest.TestCase):
         # refused, and the backend is never launched.
         hooks = self.repo / ".claude" / "hooks"
         hooks.mkdir()
-        with_hooks = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        with_hooks = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertNotEqual(with_hooks.returncode, 0)
         self.assertIn("Claude customizations", with_hooks.stderr)
         self.assertFalse((self.calls / "claude").exists())
@@ -1922,7 +1959,7 @@ class RalphCliTest(unittest.TestCase):
         # settings.json: the flag admits the `agent` key but not other unsafe keys.
         settings = self.repo / ".claude" / "settings.json"
         settings.write_text(json.dumps({"agent": {"reviewer": {}}}), encoding="utf-8")
-        agent_key = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        agent_key = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertEqual(agent_key.returncode, 0, agent_key.stderr)
 
         for path in self.calls.iterdir():
@@ -1930,7 +1967,7 @@ class RalphCliTest(unittest.TestCase):
         settings.write_text(
             json.dumps({"agent": {"reviewer": {}}, "hooks": {}}), encoding="utf-8"
         )
-        mixed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        mixed = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertNotEqual(mixed.returncode, 0)
         self.assertIn("Claude customizations", mixed.stderr)
 
@@ -1946,7 +1983,7 @@ class RalphCliTest(unittest.TestCase):
         dir_only = self.run_ralph(backend="claude")
         self.assertNotEqual(dir_only.returncode, 0)
         self.assertIn("Claude customizations", dir_only.stderr)
-        self.assertIn("--unsafe-allow-claude-agents", dir_only.stderr)
+        self.assertIn("--unsafe-allow-agents", dir_only.stderr)
         self.assertFalse((self.calls / "claude").exists())
         (agents / "custom.md").unlink()
         agents.rmdir()
@@ -1956,7 +1993,7 @@ class RalphCliTest(unittest.TestCase):
         key_only = self.run_ralph(backend="claude")
         self.assertNotEqual(key_only.returncode, 0)
         self.assertIn("Claude customizations", key_only.stderr)
-        self.assertIn("--unsafe-allow-claude-agents", key_only.stderr)
+        self.assertIn("--unsafe-allow-agents", key_only.stderr)
         settings.unlink()
 
     def test_non_agent_refusals_never_advertise_the_opt_out(self) -> None:
@@ -1978,7 +2015,7 @@ class RalphCliTest(unittest.TestCase):
             self.assertIn("Claude customizations", result.stderr)
             # The opt-out must never be dangled when the flag cannot relax the
             # blocker; setting it would be a false remedy.
-            self.assertNotIn("--unsafe-allow-claude-agents", result.stderr)
+            self.assertNotIn("--unsafe-allow-agents", result.stderr)
             self.assertFalse((self.calls / "claude").exists())
             if agents_present:
                 agents.rmdir()
@@ -2015,27 +2052,111 @@ class RalphCliTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("managed Claude configuration", result.stderr)
-        self.assertNotIn("--unsafe-allow-claude-agents", result.stderr)
+        self.assertNotIn("--unsafe-allow-agents", result.stderr)
         self.assertFalse((self.calls / "claude").exists())
 
-    def test_flag_is_backend_strict_on_run_and_resume(self) -> None:
-        # The flag is Claude-specific; combining it with OpenCode is refused
-        # fail-closed before any backend, preflight, or handoff command exists.
-        run_opencode = self.run_ralph(
-            "--unsafe-allow-claude-agents", backend="opencode"
-        )
-        self.assertNotEqual(run_opencode.returncode, 0)
-        self.assertIn("--unsafe-allow-claude-agents is only valid with --backend claude", run_opencode.stderr)
-        self.assertFalse((self.calls / "opencode").exists())
-        self.assertFalse((self.calls / "caffeinate").exists())
+    def test_opencode_agents_are_refused_without_the_flag_and_admitted_with_it(self) -> None:
+        # OpenCode loads project and global agents even under --pure, and they
+        # all surface in the effective configuration's agent map, so a
+        # non-empty map is refused before any session starts — and the refusal
+        # advertises the opt-out, because the agent check runs after every
+        # other preflight proof and is by construction the sole blocker.
+        agents_config = self._config(agents={"reviewer": {"name": "reviewer"}})
+        refused = self.run_ralph(env={"FAKE_CONFIG": agents_config})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("OpenCode agents must be disabled", refused.stderr)
+        self.assertIn("--unsafe-allow-agents", refused.stderr)
+        self.assertFalse((self.calls / "stdin").exists())
 
-        resume_opencode = self.resume_ralph(
-            "opencode", "openai/gpt-5.6-sol", "ses_1", "--unsafe-allow-claude-agents"
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # With the flag the same configuration runs, with the isolation warning.
+        allowed = self.run_ralph("--unsafe-allow-agents", env={"FAKE_CONFIG": agents_config})
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn("Ralph is not proving OpenCode agent isolation", allowed.stderr)
+        self.assertTrue((self.calls / "stdin").exists())
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # Flag set with an empty agent map: the run proceeds and the warning
+        # stays silent, exactly like the Claude backend with no agents present.
+        clean_with_flag = self.run_ralph("--unsafe-allow-agents")
+        self.assertEqual(clean_with_flag.returncode, 0, clean_with_flag.stderr)
+        self.assertNotIn("Ralph is not proving OpenCode agent isolation", clean_with_flag.stderr)
+
+    def test_opencode_config_without_an_agent_map_fails_closed(self) -> None:
+        # An effective configuration whose agent map is missing or not an
+        # object is unfamiliar: Ralph cannot prove agent isolation from it, so
+        # it is refused even when the flag is set.
+        config = json.loads(self._config())
+        del config["agent"]
+        for extra in ((), ("--unsafe-allow-agents",)):
+            with self.subTest(extra=extra):
+                result = self.run_ralph(*extra, env={"FAKE_CONFIG": json.dumps(config)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("omitted the agent map", result.stderr)
+                self.assertFalse((self.calls / "stdin").exists())
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_opencode_handoff_and_resume_reproduce_the_flag(self) -> None:
+        # A handed-off OpenCode run under the flag reproduces it in both the
+        # resume and the continue commands, and `ralph resume` accepts it and
+        # re-proves the same relaxed boundary.
+        agents_config = self._config(agents={"reviewer": {"name": "reviewer"}})
+        final = "<promise>NEEDS_INPUT</promise>\nWhich option should I use?"
+        handoff = self.run_ralph(
+            "--unsafe-allow-agents",
+            "--iterations",
+            "2",
+            env={
+                "FAKE_CONFIG": agents_config,
+                "FAKE_EVENTS": self._events(final),
+                "FAKE_EXPORT": self._export(final),
+            },
         )
-        self.assertNotEqual(resume_opencode.returncode, 0)
-        self.assertIn("--unsafe-allow-claude-agents is only valid with --backend claude", resume_opencode.stderr)
-        self.assertFalse((self.calls / "opencode").exists())
-        self.assertFalse((self.calls / "caffeinate").exists())
+        self.assertEqual(handoff.returncode, 2)
+        resume_line = next(
+            line for line in handoff.stderr.splitlines() if "manual resume:" in line
+        )
+        self.assertIn("--unsafe-allow-agents", resume_line)
+        self.assertTrue(resume_line.rstrip().endswith("--session ses_1"))
+        continue_line = next(
+            line for line in handoff.stderr.splitlines() if "continue Ralph:" in line
+        )
+        self.assertIn("--unsafe-allow-agents", continue_line)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # Without the flag, resuming the agents configuration is refused before
+        # the backend relaunches.
+        refused = self.resume_ralph(
+            "opencode", "openai/gpt-5.6-sol", "ses_1", env={"FAKE_CONFIG": agents_config}
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("OpenCode agents must be disabled", refused.stderr)
+        self.assertFalse((self.calls / "opencode-resume").exists())
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # With the flag, the same configuration resumes with the isolation
+        # warning, and the relaunch argv never carries the flag itself.
+        allowed = self.resume_ralph(
+            "opencode",
+            "openai/gpt-5.6-sol",
+            "ses_1",
+            "--unsafe-allow-agents",
+            env={"FAKE_CONFIG": agents_config},
+        )
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn("Ralph is not proving OpenCode agent isolation", allowed.stderr)
+        resume_call = (self.calls / "opencode-resume").read_text()
+        self.assertIn("--session ses_1", resume_call)
+        self.assertNotIn("--unsafe-allow-agents", resume_call)
 
     def test_claude_handoff_reproduces_flag_with_session_last(self) -> None:
         events = self._claude_events("unused").splitlines()
@@ -2053,7 +2174,7 @@ class RalphCliTest(unittest.TestCase):
         (agents / "custom.md").write_text("agent", encoding="utf-8")
 
         with_flag = self.run_ralph(
-            "--unsafe-allow-claude-agents",
+            "--unsafe-allow-agents",
             "--iterations",
             "2",
             backend="claude",
@@ -2066,13 +2187,13 @@ class RalphCliTest(unittest.TestCase):
         resume_line = next(
             line for line in with_flag.stderr.splitlines() if "manual resume:" in line
         )
-        self.assertIn("--unsafe-allow-claude-agents", resume_line)
+        self.assertIn("--unsafe-allow-agents", resume_line)
         # --session must remain the final argument of the resume command.
         self.assertTrue(resume_line.rstrip().endswith("--session claude-session-1"))
         continue_line = next(
             line for line in with_flag.stderr.splitlines() if "continue Ralph:" in line
         )
-        self.assertIn("--unsafe-allow-claude-agents", continue_line)
+        self.assertIn("--unsafe-allow-agents", continue_line)
 
         for path in self.calls.iterdir():
             path.unlink()
@@ -2089,7 +2210,7 @@ class RalphCliTest(unittest.TestCase):
         )
         self.assertEqual(without_flag.returncode, 2)
         self.assertIn("manual resume:", without_flag.stderr)
-        self.assertNotIn("--unsafe-allow-claude-agents", without_flag.stderr)
+        self.assertNotIn("--unsafe-allow-agents", without_flag.stderr)
 
     def test_flag_does_not_relax_plugins_or_mixed_agents_plugins(self) -> None:
         claude_dir = self.repo / ".claude"
@@ -2100,10 +2221,10 @@ class RalphCliTest(unittest.TestCase):
         # agents directory present — the warning stays silent and the plain
         # refusal is offered with no opt-out hint.
         plugins.mkdir(parents=True)
-        plugins_only = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        plugins_only = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertNotEqual(plugins_only.returncode, 0)
         self.assertIn("Claude customizations", plugins_only.stderr)
-        self.assertNotIn("--unsafe-allow-claude-agents", plugins_only.stderr)
+        self.assertNotIn("--unsafe-allow-agents", plugins_only.stderr)
         self.assertFalse((self.calls / "claude").exists())
 
         for path in self.calls.iterdir():
@@ -2116,7 +2237,7 @@ class RalphCliTest(unittest.TestCase):
         agents = claude_dir / "agents"
         agents.mkdir()
         (agents / "custom.md").write_text("agent", encoding="utf-8")
-        mixed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        mixed = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertNotEqual(mixed.returncode, 0)
         self.assertIn("Claude customizations", mixed.stderr)
         self.assertNotIn("the only blocker", mixed.stderr)
@@ -2131,10 +2252,10 @@ class RalphCliTest(unittest.TestCase):
         # so it stays refused with the plain managed-config message and no hint.
         self.managed_root.mkdir()
         (self.managed_root / "managed-settings.json").write_text("{}", encoding="utf-8")
-        managed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        managed = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertNotEqual(managed.returncode, 0)
         self.assertIn("managed Claude configuration", managed.stderr)
-        self.assertNotIn("--unsafe-allow-claude-agents", managed.stderr)
+        self.assertNotIn("--unsafe-allow-agents", managed.stderr)
         self.assertFalse((self.calls / "claude").exists())
         (self.managed_root / "managed-settings.json").unlink()
         self.managed_root.rmdir()
@@ -2159,12 +2280,12 @@ class RalphCliTest(unittest.TestCase):
                 settings.write_text(
                     json.dumps({"agent": {"reviewer": {}}, key: {}}), encoding="utf-8"
                 )
-                result = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+                result = self.run_ralph("--unsafe-allow-agents", backend="claude")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Claude customizations", result.stderr)
                 # No agents *directory* is present, so the warning is silent and
                 # the flag string must not appear anywhere in the output.
-                self.assertNotIn("--unsafe-allow-claude-agents", result.stderr)
+                self.assertNotIn("--unsafe-allow-agents", result.stderr)
                 self.assertFalse((self.calls / "claude").exists())
                 for path in self.calls.iterdir():
                     path.unlink()
@@ -2177,7 +2298,7 @@ class RalphCliTest(unittest.TestCase):
         agents = claude_dir / "agents"
         agents.mkdir(parents=True)
         (agents / "custom.md").write_text("agent", encoding="utf-8")
-        with_dir = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        with_dir = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertEqual(with_dir.returncode, 0, with_dir.stderr)
         self.assertIn(warning, with_dir.stderr)
         (agents / "custom.md").unlink()
@@ -2191,10 +2312,10 @@ class RalphCliTest(unittest.TestCase):
         # keys on the directory, not the settings key.
         settings = claude_dir / "settings.json"
         settings.write_text(json.dumps({"agent": {"reviewer": {}}}), encoding="utf-8")
-        key_only = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        key_only = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertEqual(key_only.returncode, 0, key_only.stderr)
         self.assertNotIn(warning, key_only.stderr)
-        self.assertNotIn("--unsafe-allow-claude-agents", key_only.stderr)
+        self.assertNotIn("--unsafe-allow-agents", key_only.stderr)
         settings.unlink()
         claude_dir.rmdir()
 
@@ -2202,7 +2323,7 @@ class RalphCliTest(unittest.TestCase):
             path.unlink()
 
         # Flag set with no .claude customizations at all: warning stays silent.
-        clean_with_flag = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        clean_with_flag = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertEqual(clean_with_flag.returncode, 0, clean_with_flag.stderr)
         self.assertNotIn(warning, clean_with_flag.stderr)
 
@@ -2230,10 +2351,10 @@ class RalphCliTest(unittest.TestCase):
 
         # The flag is a preflight relaxation only: the launch argv is identical
         # to a run without it and never carries the flag itself.
-        allowed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        allowed = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         flagged_launch = _launch_line()
-        self.assertNotIn("--unsafe-allow-claude-agents", flagged_launch)
+        self.assertNotIn("--unsafe-allow-agents", flagged_launch)
         self.assertIn("--strict-mcp-config", flagged_launch)
         self.assertIn("--setting-sources project", flagged_launch)
         self.assertIn("--dangerously-skip-permissions", flagged_launch)
@@ -2266,7 +2387,7 @@ class RalphCliTest(unittest.TestCase):
                 init.update(mutation)
                 event_lines[0] = json.dumps(init)
                 result = self.run_ralph(
-                    "--unsafe-allow-claude-agents",
+                    "--unsafe-allow-agents",
                     backend="claude",
                     env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)},
                 )
@@ -2301,13 +2422,13 @@ class RalphCliTest(unittest.TestCase):
             "claude",
             "claude-opus-4-8",
             "claude-session-1",
-            "--unsafe-allow-claude-agents",
+            "--unsafe-allow-agents",
         )
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         self.assertIn("Ralph is not proving Claude subagent isolation", allowed.stderr)
         resume_call = (self.calls / "claude-resume").read_text()
         self.assertIn("--resume claude-session-1", resume_call)
-        self.assertNotIn("--unsafe-allow-claude-agents", resume_call)
+        self.assertNotIn("--unsafe-allow-agents", resume_call)
 
     def test_claude_oauth_token_is_preserved_but_api_credentials_are_rejected(self) -> None:
         token_result = self.run_ralph(
