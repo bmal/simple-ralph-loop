@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import email
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import time
 import unittest
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import ralph  # noqa: E402  (import after sys.path is extended)
 from ralph import cli  # noqa: E402  (import after sys.path is extended)
 
 
@@ -38,6 +43,13 @@ class RalphCliTest(unittest.TestCase):
         self.bin.mkdir()
         self.calls = self.base / "calls"
         self.calls.mkdir()
+        # Isolated stand-ins for host state so Claude customization, routing, and
+        # home-directory checks can never pass or fail because of the real
+        # machine the suite happens to run on (managed profiles, MDM Claude
+        # configuration, or the operator's home directory).
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.managed_root = self.base / "managed-claude"
         self._write_fakes()
 
     def _script(self, name: str, body: str) -> None:
@@ -46,6 +58,16 @@ class RalphCliTest(unittest.TestCase):
         path.chmod(0o755)
 
     def _write_fakes(self) -> None:
+        # Stand-in for `/usr/bin/profiles`: reports no managed configuration
+        # profiles so the Claude managed-preferences check is deterministic and
+        # never reads the host's real MDM state.
+        self._script(
+            "profiles",
+            """
+            printf '%s\\n' "$*" >> "$FAKE_CALLS/profiles"
+            printf '%s\\n' 'There are no configuration profiles installed'
+            """,
+        )
         self._script(
             "gh",
             """
@@ -362,15 +384,47 @@ class RalphCliTest(unittest.TestCase):
         ]
         return "\n".join(json.dumps(event) for event in events)
 
+    # Host variables the child legitimately needs (locale, temp directories,
+    # certificate discovery, and git's idea of the current user). Anything not
+    # listed here — notably operator LLM API keys, custom endpoints, and ambient
+    # Claude session variables such as ANTHROPIC_BASE_URL or CLAUDE_CODE_* — is
+    # deliberately dropped so the suite behaves identically regardless of the
+    # shell it runs in and never trips Ralph's fail-closed environment checks.
+    _ENV_ALLOWLIST = (
+        "PATH",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+
     def _environment(self, env: dict[str, str] | None = None) -> dict[str, str]:
-        child_env = os.environ.copy()
+        child_env = {
+            key: os.environ[key] for key in self._ENV_ALLOWLIST if key in os.environ
+        }
         child_env.update(
             {
-                "PATH": f"{self.bin}:{child_env['PATH']}",
+                "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
                 "PYTHONPATH": str(ROOT / "src"),
                 # Absolute path to the fake caffeinate: production uses
                 # /usr/bin/caffeinate, and this test-only seam substitutes it.
                 "RALPH_CAFFEINATE": str(self.bin / "caffeinate"),
+                # Redirect every host-state lookup at isolated stand-ins so
+                # managed-configuration and home-directory checks are
+                # deterministic (see setUp).
+                "HOME": str(self.home),
+                "RALPH_CLAUDE_MANAGED_ROOT": str(self.managed_root),
+                "RALPH_CLAUDE_PROFILES": str(self.bin / "profiles"),
                 "FAKE_CALLS": str(self.calls),
                 "FAKE_CONFIG": self._config(),
                 "FAKE_AUTH": "┌  Credentials ~/.local/share/opencode/auth.json\n│\n●  OpenAI oauth\n│\n└  1 credentials",
@@ -478,6 +532,32 @@ class RalphCliTest(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def _await_ready(
+        self,
+        marker: Path,
+        process: subprocess.Popen[str],
+        *,
+        what: str = "backend",
+        timeout: float = 20.0,
+    ) -> None:
+        """Block until *marker* exists, using an explicit deadline instead of a
+        fixed polling window so a slow machine gets ample time. If the child
+        exits before signalling readiness, fail immediately with its captured
+        output rather than waiting out the timeout on a process that is already
+        gone."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if marker.exists():
+                return
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(
+                    f"{what} exited early with status {process.returncode} before "
+                    f"signalling readiness:\n{stdout}{stderr}"
+                )
+            time.sleep(0.01)
+        self.fail(f"{what} did not signal readiness within {timeout:.0f}s")
 
     def test_exact_completion_runs_safely_and_retains_evidence(self) -> None:
         result = self.run_ralph()
@@ -731,11 +811,7 @@ class RalphCliTest(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.addCleanup(lambda: process.poll() is None and process.kill())
-        for _ in range(100):
-            if (self.calls / "env").exists():
-                break
-            time.sleep(0.02)
-        self.assertTrue((self.calls / "env").exists(), "backend did not start")
+        self._await_ready(self.calls / "env", process)
 
         started = time.monotonic()
         process.send_signal(signal.SIGINT)
@@ -1227,12 +1303,7 @@ class RalphCliTest(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.addCleanup(lambda: first.poll() is None and first.kill())
-        ready = Path(f"{blocker}.ready")
-        for _ in range(100):
-            if ready.exists():
-                break
-            time.sleep(0.02)
-        self.assertTrue(ready.exists(), "first loop did not reach the backend")
+        self._await_ready(Path(f"{blocker}.ready"), first, what="first loop")
 
         second = self.run_ralph()
         self.assertNotEqual(second.returncode, 0)
@@ -1302,12 +1373,7 @@ class RalphCliTest(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.addCleanup(lambda: first.poll() is None and first.kill())
-        ready = Path(f"{blocker}.ready")
-        for _ in range(100):
-            if ready.exists():
-                break
-            time.sleep(0.02)
-        self.assertTrue(ready.exists(), "first worktree did not reach the backend")
+        self._await_ready(Path(f"{blocker}.ready"), first, what="first worktree")
 
         independent = subprocess.run(
             self._command(worktree=other),
@@ -1865,6 +1931,34 @@ class RalphCliTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("server-managed Claude settings", result.stderr)
 
+    def test_claude_rejects_managed_configuration_directory(self) -> None:
+        # The managed-root check is host-isolated through a seam; confirm the seam
+        # still fires (it is not a silent bypass) when managed config is present.
+        self.managed_root.mkdir()
+        (self.managed_root / "managed-settings.json").write_text("{}", encoding="utf-8")
+
+        result = self.run_ralph(backend="claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("managed Claude configuration", result.stderr)
+
+    def test_claude_rejects_managed_configuration_profiles(self) -> None:
+        # A configuration profile that manages Claude Code must stop the run. The
+        # profiles tool is host-isolated through a seam, so drive it with a fake
+        # that reports a managing profile and confirm the check still fires.
+        self._script(
+            "profiles",
+            """
+            printf '%s\\n' "$*" >> "$FAKE_CALLS/profiles"
+            printf '%s\\n' 'com.anthropic.claudecode'
+            """,
+        )
+
+        result = self.run_ralph(backend="claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("managed Claude preferences", result.stderr)
+
     def test_claude_fails_closed_on_runtime_customization_and_backend_contract_errors(self) -> None:
         event_lines = self._claude_events("Done").splitlines()
         init = json.loads(event_lines[0])
@@ -2028,26 +2122,77 @@ class RalphCliTest(unittest.TestCase):
         json.loads(session_text)
         self.assertNotIn(token, (run_dir / "stdout.ndjson").read_text())
 
-    def test_isolated_package_install_exposes_cli_help_without_a_backend(self) -> None:
-        backend = subprocess.run(
-            [sys.executable, "-c", "import setuptools"],
+class PackagingLifecycleTest(unittest.TestCase):
+    """Non-skippable, backend-free packaging qualification.
+
+    The supported qualification path is expected to provide the declared PEP 517
+    build backend (setuptools). Its absence is a hard failure here rather than a
+    silent skip, so a broken qualification environment cannot masquerade as a
+    passing packaging check. No live language model is ever invoked.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import setuptools  # noqa: F401
+        except ImportError as error:  # pragma: no cover - only on a broken env
+            raise AssertionError(
+                "the declared PEP 517 build backend (setuptools>=77) is required "
+                "for packaging qualification and must not be skipped"
+            ) from error
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        # Build from an isolated copy of the packaging inputs so wheel/sdist
+        # construction never writes build artifacts into the checkout under test.
+        self.source = self.work / "source"
+        self.source.mkdir()
+        shutil.copytree(ROOT / "src", self.source / "src")
+        for name in ("pyproject.toml", "README.md", "LICENSE"):
+            shutil.copy2(ROOT / name, self.source / name)
+
+    def _pep517_build(self, hook: str) -> Path:
+        """Invoke the declared setuptools PEP 517 backend directly, using only
+        declared build tooling and the standard library (no third-party build
+        front-end)."""
+        out = self.work / hook
+        out.mkdir()
+        # The backend logs build chatter to stdout; redirect it to stderr so the
+        # only thing on stdout is the returned artifact name.
+        script = (
+            "import contextlib, sys\n"
+            "from setuptools import build_meta\n"
+            "with contextlib.redirect_stdout(sys.stderr):\n"
+            f"    name = build_meta.{hook}(sys.argv[1])\n"
+            "sys.stdout.write(name)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(out)],
+            cwd=self.source,
             text=True,
             capture_output=True,
         )
-        if backend.returncode:
-            self.skipTest("setuptools build backend is not installed")
-        target = self.base / "installed"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        artifact = out / result.stdout.strip()
+        self.assertTrue(artifact.is_file(), f"{hook} produced no artifact: {result.stdout!r}")
+        return artifact
+
+    def test_wheel_install_exposes_cli_help_without_a_backend(self) -> None:
+        wheel = self._pep517_build("build_wheel")
+        target = self.work / "install"
         installed = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pip",
                 "install",
-                "--no-build-isolation",
+                "--no-index",
                 "--no-deps",
                 "--target",
                 str(target),
-                str(ROOT),
+                str(wheel),
             ],
             text=True,
             capture_output=True,
@@ -2055,22 +2200,77 @@ class RalphCliTest(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr)
 
         executable = target / "bin" / "ralph"
-        help_result = subprocess.run(
-            [str(executable), "--help"],
-            env={**os.environ, "PYTHONPATH": str(target)},
-            text=True,
-            capture_output=True,
+        self.assertTrue(executable.is_file(), "console entry point was not installed")
+        env = {**os.environ, "PYTHONPATH": str(target)}
+        top = subprocess.run(
+            [str(executable), "--help"], env=env, text=True, capture_output=True
         )
-        self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("{run,clean,resume}", help_result.stdout)
-        for command in ("run", "clean", "resume"):
-            command_help = subprocess.run(
-                [str(executable), command, "--help"],
-                env={**os.environ, "PYTHONPATH": str(target)},
-                text=True,
-                capture_output=True,
+        self.assertEqual(top.returncode, 0, top.stderr)
+        self.assertIn("{run,clean,resume}", top.stdout)
+        for sub in ("run", "clean", "resume"):
+            sub_help = subprocess.run(
+                [str(executable), sub, "--help"], env=env, text=True, capture_output=True
             )
-            self.assertEqual(command_help.returncode, 0, command_help.stderr)
+            self.assertEqual(sub_help.returncode, 0, sub_help.stderr)
+            self.assertIn(sub, sub_help.stdout)
+
+    def test_wheel_metadata_declares_entry_point_version_license_and_no_deps(self) -> None:
+        wheel = self._pep517_build("build_wheel")
+        with zipfile.ZipFile(wheel) as archive:
+            names = archive.namelist()
+            metadata_text = archive.read(
+                next(n for n in names if n.endswith(".dist-info/METADATA"))
+            ).decode("utf-8")
+            entry_points = archive.read(
+                next(n for n in names if n.endswith(".dist-info/entry_points.txt"))
+            ).decode("utf-8")
+            license_members = [
+                n
+                for n in names
+                if ".dist-info/licenses/" in n or n.endswith(".dist-info/LICENSE")
+            ]
+            license_text = archive.read(license_members[0]).decode("utf-8") if license_members else ""
+
+        metadata = email.message_from_string(metadata_text)
+        self.assertEqual(metadata["Name"], "simple-ralph-loop")
+        self.assertEqual(metadata["Version"], "0.1.0")
+        self.assertEqual(metadata["Version"], ralph.__version__)
+        self.assertIn("3.11", metadata["Requires-Python"] or "")
+        # Empty runtime dependency set: setuptools omits Requires-Dist entirely.
+        self.assertIsNone(metadata.get_all("Requires-Dist"))
+        # License attribution: SPDX expression plus the bundled license file.
+        self.assertEqual(metadata["License-Expression"], "MIT")
+        self.assertTrue(license_members, "LICENSE file was not bundled in the wheel")
+        self.assertIn("MIT License", license_text)
+        # Console entry point routes `ralph` to the CLI main.
+        self.assertIn("[console_scripts]", entry_points)
+        self.assertIn("ralph = ralph.cli:main", entry_points)
+        # The corrected README must not resurface the unpublished-PyPI claim.
+        self.assertNotIn("pipx install simple-ralph-loop", metadata_text)
+
+    def test_sdist_contains_sources_and_metadata(self) -> None:
+        sdist = self._pep517_build("build_sdist")
+        self.assertTrue(sdist.name.endswith(".tar.gz"), sdist.name)
+        with tarfile.open(sdist, "r:gz") as archive:
+            members = archive.getnames()
+            pkg_info_name = next(n for n in members if n.endswith("/PKG-INFO"))
+            pkg_info = archive.extractfile(pkg_info_name).read().decode("utf-8")
+
+        relative = {name.split("/", 1)[1] for name in members if "/" in name}
+        for expected in (
+            "pyproject.toml",
+            "README.md",
+            "LICENSE",
+            "src/ralph/__init__.py",
+            "src/ralph/cli.py",
+            "PKG-INFO",
+        ):
+            self.assertIn(expected, relative, f"{expected} missing from sdist")
+        metadata = email.message_from_string(pkg_info)
+        self.assertEqual(metadata["Name"], "simple-ralph-loop")
+        self.assertEqual(metadata["Version"], "0.1.0")
+        self.assertEqual(metadata["License-Expression"], "MIT")
+        self.assertIsNone(metadata.get_all("Requires-Dist"))
 
 
 class WorktreeLockMetadataTest(unittest.TestCase):

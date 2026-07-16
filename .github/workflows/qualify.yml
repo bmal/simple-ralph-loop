@@ -1,0 +1,35 @@
+name: qualify
+
+# Reproducible qualification for the macOS-only Ralph helper. The deterministic
+# unittest suite (CLI-boundary behavior plus the non-skippable packaging smokes)
+# runs on Python 3.11 and a current newer version, using only the declared build
+# tooling and the standard library. It never invokes a live Claude or OpenCode
+# model or consumes any subscription allowance: the suite drives fake backends
+# placed on PATH.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # macOS is the only supported platform (caffeinate, profiles, sys.platform).
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the declared PEP 517 build tooling
+        # setuptools is the declared build backend; the packaging smokes fail
+        # closed (rather than skip) when it is absent, so install it explicitly.
+        run: python -m pip install --upgrade "setuptools>=77" wheel
+      - name: Run the deterministic no-model suite
+        run: python -m unittest discover -s tests -v

@@ -34,6 +34,12 @@ MAX_PROMPT_BYTES = 10 * 1024 * 1024
 # is an internal test seam that lets the suite substitute a fake; production
 # runs never set it and always use the system binary.
 DEFAULT_CAFFEINATE = "/usr/bin/caffeinate"
+# Host locations consulted to detect MDM-managed Claude configuration. Both are
+# absolute system paths in production; dedicated test seams (see
+# claude_managed_root / claude_profiles_executable) let the suite isolate the
+# checks from real host state without weakening the production defaults.
+DEFAULT_CLAUDE_MANAGED_ROOT = "/Library/Application Support/ClaudeCode"
+DEFAULT_CLAUDE_PROFILES = "/usr/bin/profiles"
 # Backend request and Bash-tool timeouts are configured in integer
 # milliseconds and are bounded by a signed 32-bit value, so they can never be
 # made truly infinite. Ralph pins them to this ceiling and caps its own
@@ -201,6 +207,22 @@ def caffeinate_executable() -> str:
     # Always an absolute path so the sleep assertion cannot be satisfied by a
     # PATH-shadowed executable. RALPH_CAFFEINATE is honored only as a test seam.
     return os.environ.get("RALPH_CAFFEINATE") or DEFAULT_CAFFEINATE
+
+
+def claude_managed_root() -> Path:
+    # System directory holding MDM-managed Claude configuration. Its default is
+    # an absolute macOS path; RALPH_CLAUDE_MANAGED_ROOT is honored only as a test
+    # seam so the suite can point the managed-config check at an isolated,
+    # host-independent location. Production runs never set it.
+    return Path(os.environ.get("RALPH_CLAUDE_MANAGED_ROOT") or DEFAULT_CLAUDE_MANAGED_ROOT)
+
+
+def claude_profiles_executable() -> str:
+    # Absolute path to the macOS `profiles` tool used to detect MDM-managed
+    # Claude preferences. RALPH_CLAUDE_PROFILES is honored only as a test seam so
+    # the suite does not depend on the host's real configuration profiles;
+    # production runs never set it and always use the system binary.
+    return os.environ.get("RALPH_CLAUDE_PROFILES") or DEFAULT_CLAUDE_PROFILES
 
 
 class RalphError(Exception):
@@ -695,7 +717,7 @@ def reject_claude_customizations(worktree: Path) -> None:
     for name in ("agents", "hooks", "plugins"):
         if (claude_dir / name).exists():
             raise RalphError("Claude customizations must be disabled before running Ralph")
-    managed_root = Path("/Library/Application Support/ClaudeCode")
+    managed_root = claude_managed_root()
     if any(
         path.exists()
         for path in (
@@ -706,7 +728,7 @@ def reject_claude_customizations(worktree: Path) -> None:
     ):
         raise RalphError("managed Claude configuration prevents proving safe isolation")
     managed_preferences = command(
-        ["/usr/bin/profiles", "show", "-type", "configuration"], allow_failure=True
+        [claude_profiles_executable(), "show", "-type", "configuration"], allow_failure=True
     )
     if managed_preferences.returncode:
         raise RalphError("could not inspect managed Claude preferences")

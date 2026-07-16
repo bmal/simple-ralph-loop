@@ -22,15 +22,30 @@ environment variables from child sessions without printing their values.
 
 ## Install
 
-Install, upgrade, and uninstall with pipx:
+`simple-ralph-loop` is not published to PyPI, so install it from source with
+pipx. From a checkout of this repository:
 
 ```sh
-pipx install simple-ralph-loop
+pipx install .
+```
+
+Or install directly from GitHub without cloning:
+
+```sh
+pipx install git+https://github.com/bmal/simple-ralph-loop.git
+```
+
+Either form registers the distribution as `simple-ralph-loop`, so upgrade and
+uninstall by that name:
+
+```sh
 pipx upgrade simple-ralph-loop
 pipx uninstall simple-ralph-loop
 ```
 
-From a source checkout, use `pipx install .`.
+`pipx upgrade` reinstalls from the same source it was installed from (the local
+checkout or the Git URL). Upgrading a checkout install re-reads that directory,
+so `git pull` first.
 
 ## Run
 
