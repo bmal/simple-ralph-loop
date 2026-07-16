@@ -355,7 +355,7 @@ class RalphCliTest(unittest.TestCase):
                 "type": "system",
                 "subtype": "init",
                 "session_id": session_id,
-                "apiKeySource": "oauth",
+                "apiKeySource": "none",
                 "model": model,
                 "permissionMode": "bypassPermissions",
                 "tools": ["Bash", "Read", "Edit"],
@@ -2409,6 +2409,56 @@ class RalphCliTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("Claude session failed", failed.stderr)
 
+    def test_real_claude_init_contract_is_accepted(self) -> None:
+        # Mirror the init event a real subscription Claude Code 2.1.211 session
+        # emits: `apiKeySource` is "none" (no metered API key; billing rides the
+        # OAuth login preflight proved), the tools list is the full built-in
+        # harness set, and unknown informational fields are present. Regression
+        # for a live run refused with "did not use subscription OAuth" because
+        # the parser demanded a fictional "oauth" value the CLI never reports.
+        event_lines = self._claude_events("<promise>COMPLETE</promise>").splitlines()
+        init = json.loads(event_lines[0])
+        init["tools"] = [
+            "Task", "Bash", "CronCreate", "CronDelete", "CronList", "DesignSync",
+            "Edit", "EnterWorktree", "ExitWorktree", "Monitor", "NotebookEdit",
+            "PushNotification", "Read", "RemoteTrigger", "ReportFindings",
+            "ScheduleWakeup", "SendMessage", "Skill", "TaskCreate", "TaskGet",
+            "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "ToolSearch",
+            "WebFetch", "WebSearch", "Workflow", "Write",
+        ]
+        init["slash_commands"] = ["init", "review"]
+        init["agents"] = ["claude", "Explore", "general-purpose"]
+        init["capabilities"] = ["interrupt_receipt_v1"]
+        init["claude_code_version"] = "2.1.211"
+        event_lines[0] = json.dumps(init)
+        result = self.run_ralph(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.calls / "claude").exists())
+
+    def test_api_key_sourced_claude_session_fails_closed(self) -> None:
+        # Any reported API-key source means the session is metered, not
+        # subscription OAuth; every such value must stop the run. "oauth" is
+        # included because no real CLI reports it: an unexpected value must
+        # fail closed rather than be mistaken for a subscription proof.
+        for source in ("ANTHROPIC_API_KEY", "apiKeyHelper", "oauth", "", None):
+            with self.subTest(apiKeySource=source):
+                for path in self.calls.iterdir():
+                    path.unlink()
+                event_lines = self._claude_events("Done").splitlines()
+                init = json.loads(event_lines[0])
+                if source is None:
+                    init.pop("apiKeySource", None)
+                else:
+                    init["apiKeySource"] = source
+                event_lines[0] = json.dumps(init)
+                result = self.run_ralph(
+                    backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("did not use subscription OAuth", result.stderr)
+
     def test_resume_relaunches_sanitized_full_auto_backend(self) -> None:
         opencode = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_9")
         self.assertEqual(opencode.returncode, 0, opencode.stderr)
@@ -2584,8 +2634,12 @@ class RalphCliTest(unittest.TestCase):
         # JSON nested past the interpreter's recursion limit raises RecursionError
         # rather than json.JSONDecodeError. Both backends must treat it as
         # malformed structured output and hand off, never emit a raw traceback.
+        # CPython 3.13 guards C recursion by probing real stack headroom, so a
+        # fixed shallow depth parses fine when the process has a roomy stack.
+        # macOS hard-caps thread stacks at 64 MiB, which 5M frames always
+        # exceed, so this depth deterministically raises RecursionError.
         deep = self.base / "deep.json"
-        depth = 100_000
+        depth = 5_000_000
         deep.write_text("[" * depth + "]" * depth + "\n", encoding="utf-8")
 
         opencode = self._run_guarded(

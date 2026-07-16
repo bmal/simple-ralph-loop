@@ -116,25 +116,47 @@ LLM_ENV_VARS = {
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
 }
+# Built-in tool names a subscription Claude Code >= 2.1.208 session may report
+# in its init event (observed against 2.1.211). MCP tools are namespaced
+# `mcp__server__tool` and plugin tools carry their own names, so anything
+# outside this set still fails the subset assertion closed.
 CLAUDE_BUILTIN_TOOLS = {
     "Agent",
     "AskUserQuestion",
     "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
     "Edit",
     "EnterPlanMode",
+    "EnterWorktree",
     "ExitPlanMode",
+    "ExitWorktree",
     "Glob",
     "Grep",
     "LSP",
+    "Monitor",
     "NotebookEdit",
+    "PushNotification",
     "Read",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
     "Skill",
     "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
     "TaskOutput",
     "TaskStop",
+    "TaskUpdate",
     "TodoWrite",
+    "ToolSearch",
     "WebFetch",
     "WebSearch",
+    "Workflow",
     "Write",
 }
 CLAUDE_SETTINGS = json.dumps(
@@ -1038,7 +1060,13 @@ class ClaudeEventResult:
         self.initial_model = model
         if model != self.expected_model:
             raise RalphError("Claude initial model did not match the selected model")
-        if event.get("apiKeySource") != "oauth":
+        # `apiKeySource` reports where a metered API key came from. A real
+        # subscription-OAuth session (Claude Code >= 2.1.208) reports "none":
+        # no API key is in play, so billing rides the OAuth login that
+        # preflight already proved is a pro/max subscription. Any other value
+        # ("ANTHROPIC_API_KEY", "apiKeyHelper", ...) means a metered key was
+        # loaded, so fail closed.
+        if event.get("apiKeySource") != "none":
             raise RalphError("Claude session did not use subscription OAuth")
         if event.get("permissionMode") != "bypassPermissions":
             raise RalphError("Claude session did not enter full-auto permission mode")
