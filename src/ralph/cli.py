@@ -863,11 +863,24 @@ class EventResult:
             self.assistant_messages.append(message_id)
         self.parts[part_id] = (message_id, text)
         if trusted or message_id in self.assistant_messages:
-            previous = self.printed.get(part_id, "")
-            delta = text[len(previous) :] if text.startswith(previous) else text
-            if delta:
-                print(redact(delta), end="", flush=True)
-            self.printed[part_id] = text
+            # Redact the whole accumulated part text, then diff against what was
+            # already shown. Diffing the raw suffix instead would split a secret
+            # across streaming chunk boundaries so neither fragment matched the
+            # full value -- leaking it to the live console even though the
+            # retained log (redacted a whole line at a time) stayed safe.
+            # Comparing redacted-to-redacted closes that gap.
+            redacted = redact(text)
+            shown = self.printed.get(part_id, "")
+            if redacted.startswith(shown):
+                addition = redacted[len(shown) :]
+            else:
+                # A secret only completed once this chunk arrived, so the
+                # already-shown prefix changed under redaction. Reprint the fully
+                # redacted part on a fresh line rather than emit a raw fragment.
+                addition = ("\n" if shown else "") + redacted
+            if addition:
+                print(addition, end="", flush=True)
+            self.printed[part_id] = redacted
 
     def _print_progress(self, event_type: str, part: dict[str, Any]) -> None:
         if event_type == "tool_use":
@@ -1459,7 +1472,11 @@ def _consume_opencode_iteration(
             retained.flush()
             try:
                 result.accept(json.loads(line))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # RecursionError comes from JSON nested past the interpreter
+                # limit (or a pathologically deep question payload); treat it as
+                # malformed output and fail closed rather than let it escape as a
+                # traceback past every handler.
                 controller.force_kill()
                 thread.join()
                 write_opencode_session(run_dir, result)
@@ -1677,7 +1694,11 @@ def _consume_claude_iteration(
             try:
                 event = json.loads(line)
                 result.accept(event)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # RecursionError comes from JSON nested past the interpreter
+                # limit (or a pathologically deep question payload); treat it as
+                # malformed output and fail closed rather than let it escape as a
+                # traceback past every handler.
                 controller.force_kill()
                 thread.join()
                 write_claude_session(run_dir, result)

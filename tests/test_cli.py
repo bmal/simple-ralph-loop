@@ -2122,6 +2122,94 @@ class RalphCliTest(unittest.TestCase):
         json.loads(session_text)
         self.assertNotIn(token, (run_dir / "stdout.ndjson").read_text())
 
+    def test_streamed_secret_split_across_chunks_is_not_leaked_to_console(self) -> None:
+        # OpenCode streams a growing text part. The secret straddles the boundary
+        # between what was already printed and the new suffix, so a naive raw-delta
+        # redaction would print each half unredacted and the full token would
+        # appear on stdout. Redacting the whole accumulated text must prevent that.
+        token = "oauth-subscription-token-1234567890"
+        first = f"Token: {token[:20]}"
+        full = f"Token: {token} echoed.\nWork complete.\n<promise>COMPLETE</promise>"
+
+        def text_event(text: str) -> str:
+            return json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses_1",
+                    "part": {
+                        "id": "part_1",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_1",
+                        "type": "text",
+                        "text": text,
+                        "time": {"start": 1, "end": 2},
+                    },
+                }
+            )
+
+        result = self.run_ralph(
+            env={
+                "CLAUDE_CODE_OAUTH_TOKEN": token,
+                "FAKE_EVENTS": text_event(first) + "\n" + text_event(full),
+                "FAKE_EXPORT": self._export(full),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(token, result.stdout)
+        self.assertIn("[redacted]", result.stdout)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertNotIn(token, (run_dir / "stdout.ndjson").read_text())
+
+    def test_deeply_nested_json_fails_closed_without_traceback(self) -> None:
+        # JSON nested past the interpreter's recursion limit raises RecursionError
+        # rather than json.JSONDecodeError. Both backends must treat it as
+        # malformed structured output and hand off, never emit a raw traceback.
+        deep = self.base / "deep.json"
+        depth = 100_000
+        deep.write_text("[" * depth + "]" * depth + "\n", encoding="utf-8")
+
+        opencode = self._run_guarded(
+            env={
+                "FAKE_EVENTS": self._events("Partial work"),
+                "FAKE_RAW_STDOUT_FILE": str(deep),
+            }
+        )
+        self.assertEqual(opencode.returncode, 2, opencode.stderr)
+        self.assertIn("malformed structured output", opencode.stderr)
+        self.assertIn("--session ses_1", opencode.stderr)
+        self.assertNotIn("Traceback", opencode.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertEqual(
+            json.loads((run_dir / "outcome.json").read_text())["outcome"],
+            "backend_contract_failure",
+        )
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        claude = self._run_guarded(
+            backend="claude",
+            env={
+                "FAKE_CLAUDE_EVENTS": self._claude_events("unused").splitlines()[0],
+                "FAKE_CLAUDE_RAW_STDOUT_FILE": str(deep),
+            },
+        )
+        self.assertEqual(claude.returncode, 2, claude.stderr)
+        self.assertIn("malformed structured output", claude.stderr)
+        self.assertIn("--session claude-session-1", claude.stderr)
+        self.assertNotIn("Traceback", claude.stderr)
+
+    def test_dirty_worktree_warns_but_permits_the_run(self) -> None:
+        # A dirty worktree is recorded and warned about but never refused.
+        (self.repo / "uncommitted.txt").write_text("work in progress", encoding="utf-8")
+
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("uncommitted changes", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertIn("uncommitted.txt", (run_dir / "git-status.txt").read_text())
+
 class PackagingLifecycleTest(unittest.TestCase):
     """Non-skippable, backend-free packaging qualification.
 
