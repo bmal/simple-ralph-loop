@@ -18,7 +18,9 @@ the returned subscription token as `CLAUDE_CODE_OAUTH_TOKEN`.
 
 Ralph refuses API keys, custom endpoints, alternate providers, ambiguous
 routing, and unsafe backend customizations. It removes known inference API
-environment variables from child sessions without printing their values.
+environment variables from child sessions without printing their values. The
+one scoped exception is `--unsafe-allow-claude-agents`, described under
+[Run](#run), which opts a repository's Claude subagents back in.
 
 ## Install
 
@@ -66,6 +68,19 @@ never expire underneath legitimate work. Those backend limits are bounded
 integers and cannot be made truly infinite, which is why a positive Ralph
 timeout is capped below their ceiling; with `--timeout 0` they stay pinned at
 maximum and Ralph's timer no longer applies.
+
+By default the Claude backend refuses a repository that carries Claude
+subagents, because an unattended billed run cannot prove which subagents loaded.
+Pass `--unsafe-allow-claude-agents` when a repo's loop legitimately develops or
+depends on subagents: it admits the repo's `.claude/agents` directory and the
+`.claude/settings.json` `agent` key, and warns that subagent isolation is not
+proven for that run. The flag is deliberately unsafe and narrowly scoped — it
+relaxes only those agent vectors. Hooks, plugins, managed configuration, MCP
+routing, and every other unsafe setting stay refused, and the runtime
+MCP/plugin/tool isolation proven from the session's init event is unchanged. The
+same flag is accepted by `ralph resume`, and Ralph reproduces it in the
+`resume` and `run` commands it prints for a handed-off session so recovery
+re-establishes the same relaxed boundary.
 
 Ralph snapshots the prompt once, starts a fresh session per iteration, and
 stops early only when the final assistant output contains the exact standalone
