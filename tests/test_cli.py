@@ -1890,6 +1890,49 @@ class RalphCliTest(unittest.TestCase):
         self.assertNotEqual(malformed.returncode, 0)
         self.assertIn("malformed structured output", malformed.stderr)
 
+    def test_unsafe_allow_claude_agents_relaxes_only_the_agent_vectors(self) -> None:
+        agents = self.repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "custom.md").write_text("custom agent", encoding="utf-8")
+
+        refused = self.run_ralph(backend="claude")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Claude customizations", refused.stderr)
+        self.assertFalse((self.calls / "claude").exists())
+
+        allowed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertTrue((self.calls / "claude").exists())
+        self.assertIn("--unsafe-allow-claude-agents is set", allowed.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+
+        # The flag is scoped to agents: a co-present hooks directory is still
+        # refused, and the backend is never launched.
+        hooks = self.repo / ".claude" / "hooks"
+        hooks.mkdir()
+        with_hooks = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        self.assertNotEqual(with_hooks.returncode, 0)
+        self.assertIn("Claude customizations", with_hooks.stderr)
+        self.assertFalse((self.calls / "claude").exists())
+        hooks.rmdir()
+
+        # settings.json: the flag admits the `agent` key but not other unsafe keys.
+        settings = self.repo / ".claude" / "settings.json"
+        settings.write_text(json.dumps({"agent": {"reviewer": {}}}), encoding="utf-8")
+        agent_key = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        self.assertEqual(agent_key.returncode, 0, agent_key.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        settings.write_text(
+            json.dumps({"agent": {"reviewer": {}}, "hooks": {}}), encoding="utf-8"
+        )
+        mixed = self.run_ralph("--unsafe-allow-claude-agents", backend="claude")
+        self.assertNotEqual(mixed.returncode, 0)
+        self.assertIn("Claude customizations", mixed.stderr)
+
     def test_claude_oauth_token_is_preserved_but_api_credentials_are_rejected(self) -> None:
         token_result = self.run_ralph(
             backend="claude",

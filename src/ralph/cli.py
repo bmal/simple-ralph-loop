@@ -712,9 +712,23 @@ def opencode_preflight(worktree: Path, slug: str, model: str, env: dict[str, str
         raise RalphError(f"selected model is unavailable: {model}")
 
 
-def reject_claude_customizations(worktree: Path) -> None:
+def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> None:
     claude_dir = worktree / ".claude"
-    for name in ("agents", "hooks", "plugins"):
+    # --unsafe-allow-claude-agents relaxes only the agent vectors: the
+    # `.claude/agents` directory and the settings.json `agent` key. It exists for
+    # repos whose loop develops or depends on subagents. Hooks, plugins, managed
+    # configuration, and every other unsafe setting stay refused, and runtime
+    # MCP/plugin/tool isolation is still proven from the init event. The trade is
+    # deliberate and unsafe: Ralph can no longer prove which subagents loaded, so
+    # the operator vouches for them for this run.
+    if allow_agents and (claude_dir / "agents").exists():
+        print(
+            "WARNING: --unsafe-allow-claude-agents is set; Ralph is not proving "
+            "Claude subagent isolation for this run.",
+            file=sys.stderr,
+        )
+    customization_names = ("hooks", "plugins") if allow_agents else ("agents", "hooks", "plugins")
+    for name in customization_names:
         if (claude_dir / name).exists():
             raise RalphError("Claude customizations must be disabled before running Ralph")
     managed_root = claude_managed_root()
@@ -755,13 +769,17 @@ def reject_claude_customizations(worktree: Path) -> None:
         "extraKnownMarketplaces",
         "hooks",
     }
+    if allow_agents:
+        unsafe = unsafe - {"agent"}
     if unsafe.intersection(settings):
         raise RalphError("Claude customizations must be disabled before running Ralph")
 
 
-def claude_preflight(worktree: Path, slug: str, model: str, env: dict[str, str]) -> None:
+def claude_preflight(
+    worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = False
+) -> None:
     common_preflight(worktree, slug, "claude", env)
-    reject_claude_customizations(worktree)
+    reject_claude_customizations(worktree, allow_agents)
     version = command(["claude", "--version"], cwd=worktree, env=env).stdout
     if version_tuple(version, "Claude Code") < MIN_CLAUDE_VERSION:
         raise RalphError("Claude Code 2.1.208 or newer is required")
@@ -1803,28 +1821,31 @@ def shell_command(args: list[str], worktree: Path) -> str:
     return f"cd {shlex.quote(str(worktree))} && {shlex.join(args)}"
 
 
-def resume_command(backend: str, model: str, worktree: Path, session_id: str) -> str:
+def resume_command(
+    backend: str, model: str, worktree: Path, session_id: str, allow_agents: bool = False
+) -> str:
     # A dedicated `ralph resume` re-establishes the full subscription trust
     # boundary (sanitized environment, per-session OAuth/routing proof, isolated
     # configuration, full-auto permissions, and caffeinate) before handing an
     # operator the interactive backend. A raw backend command would inherit the
     # operator's ambient environment and skip that proof, so recovery is routed
     # through Ralph itself. --session is placed last so callers can rely on it.
-    return shell_command(
-        [
-            "ralph",
-            "resume",
-            "--backend",
-            backend,
-            "--model",
-            model,
-            "--worktree",
-            str(worktree),
-            "--session",
-            session_id,
-        ],
-        worktree,
-    )
+    args = [
+        "ralph",
+        "resume",
+        "--backend",
+        backend,
+        "--model",
+        model,
+        "--worktree",
+        str(worktree),
+    ]
+    # Reproduce the relaxed check so the handoff can re-prove the same boundary;
+    # without it resume would refuse the very agents the run was allowed.
+    if allow_agents:
+        args.append("--unsafe-allow-claude-agents")
+    args += ["--session", session_id]
+    return shell_command(args, worktree)
 
 
 def restart_command(
@@ -1834,25 +1855,26 @@ def restart_command(
     prompt_path: Path,
     remaining: int,
     timeout: float,
+    allow_agents: bool = False,
 ) -> str:
-    return shell_command(
-        [
-            "ralph",
-            "run",
-            str(prompt_path),
-            "--backend",
-            backend,
-            "--iterations",
-            str(remaining),
-            "--model",
-            model,
-            "--worktree",
-            str(worktree),
-            "--timeout",
-            str(timeout),
-        ],
-        worktree,
-    )
+    args = [
+        "ralph",
+        "run",
+        str(prompt_path),
+        "--backend",
+        backend,
+        "--iterations",
+        str(remaining),
+        "--model",
+        model,
+        "--worktree",
+        str(worktree),
+        "--timeout",
+        str(timeout),
+    ]
+    if allow_agents:
+        args.append("--unsafe-allow-claude-agents")
+    return shell_command(args, worktree)
 
 
 def print_handoff(
@@ -1867,6 +1889,7 @@ def print_handoff(
     remaining: int,
     run_id: str,
     timeout: float,
+    allow_agents: bool = False,
 ) -> None:
     terminal = sys.stderr.isatty()
     if terminal:
@@ -1882,13 +1905,14 @@ def print_handoff(
         # Without a session id there is nothing to resume; the operator handoff
         # still prints the remaining-budget command so the loop can continue.
         print(
-            f"manual resume: {resume_command(backend, model, worktree, session_id)}",
+            f"manual resume: {resume_command(backend, model, worktree, session_id, allow_agents)}",
             file=sys.stderr,
         )
     print(f"iterations remaining: {remaining}", file=sys.stderr)
     if remaining:
         print(
-            f"continue Ralph: {restart_command(backend, model, worktree, prompt_path, remaining, timeout)}",
+            "continue Ralph: "
+            f"{restart_command(backend, model, worktree, prompt_path, remaining, timeout, allow_agents)}",
             file=sys.stderr,
         )
     else:
@@ -2024,7 +2048,7 @@ def run_protected(
                 else secure_state_directory(run_dir, f"iteration-{number:03d}")
             )
             if args.backend == "claude":
-                claude_preflight(worktree, slug, args.model, env)
+                claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_claude_agents)
             else:
                 opencode_preflight(worktree, slug, args.model, env)
             iteration_started = datetime.now(timezone.utc).isoformat()
@@ -2077,6 +2101,7 @@ def run_protected(
             remaining=args.iterations - number,
             run_id=run_dir.name,
             timeout=args.timeout,
+            allow_agents=args.unsafe_allow_claude_agents,
         )
         return 2
     except StartedIterationError as error:
@@ -2117,6 +2142,7 @@ def run_protected(
             remaining=args.iterations - number,
             run_id=run_dir.name,
             timeout=args.timeout,
+            allow_agents=args.unsafe_allow_claude_agents,
         )
         return 2
     except RalphError:
@@ -2219,7 +2245,7 @@ def resume(args: argparse.Namespace) -> int:
     env = clean_environment(args.model, args.backend)
     set_active_redactor(collect_secrets())
     if args.backend == "claude":
-        claude_preflight(worktree, slug, args.model, env)
+        claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_claude_agents)
         backend_args = [
             "claude",
             "--resume",
@@ -2282,6 +2308,14 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument("--worktree")
+    run_parser.add_argument(
+        "--unsafe-allow-claude-agents",
+        action="store_true",
+        help=(
+            "allow a repo's .claude/agents and settings.json 'agent' key instead of "
+            "refusing them; Ralph then cannot prove Claude subagent isolation (unsafe)"
+        ),
+    )
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")
     resume_parser = subcommands.add_parser(
@@ -2291,6 +2325,14 @@ def parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--model", required=True)
     resume_parser.add_argument("--session", required=True)
     resume_parser.add_argument("--worktree")
+    resume_parser.add_argument(
+        "--unsafe-allow-claude-agents",
+        action="store_true",
+        help=(
+            "allow a repo's .claude/agents and settings.json 'agent' key instead of "
+            "refusing them; Ralph then cannot prove Claude subagent isolation (unsafe)"
+        ),
+    )
     return result
 
 
