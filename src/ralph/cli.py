@@ -189,7 +189,7 @@ def parser() -> argparse.ArgumentParser:
             "disable host isolation: skip the Seatbelt sandbox wrap and its "
             "self-test so the backend runs unconfined and may write outside the "
             "worktree or read the operator's credentials (unsafe). Separate from "
-            "orthogonal to --unsafe-allow-agents; relaxes only host isolation"
+            "and orthogonal to --unsafe-allow-agents; relaxes only host isolation"
         ),
     )
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")

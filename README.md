@@ -4,6 +4,13 @@
 sessions, while refusing metered LLM API authentication. It is a macOS-only
 personal helper for completing ordered GitHub issue work with a finite budget.
 
+Before spending budget, Ralph proves three guarantees: **subscription-only
+authentication** (no metered API billing), **customization isolation** (no
+unproven backend agents, hooks, or plugins), and **host isolation** (the
+backend session is confined by a Seatbelt sandbox so it cannot write outside
+its sanctioned areas or read the operator's famous credential paths). Host
+isolation defends against accident, not malice — see [Safety](#safety).
+
 ## Prerequisites
 
 - macOS with `/usr/bin/caffeinate` and Python 3.11 or newer
@@ -18,9 +25,10 @@ the returned subscription token as `CLAUDE_CODE_OAUTH_TOKEN`.
 
 Ralph refuses API keys, custom endpoints, alternate providers, ambiguous
 routing, and unsafe backend customizations. It removes known inference API
-environment variables from child sessions without printing their values. The
-one scoped exception is `--unsafe-allow-agents`, described under
-[Run](#run), which opts a repository's backend agents back in.
+environment variables from child sessions without printing their values. Two
+narrowly-scoped opt-outs, both described under [Run](#run), each relax exactly
+one guarantee and nothing else: `--unsafe-allow-agents` opts a repository's
+backend agents back in, and `--unsafe-no-sandbox` disables host isolation.
 
 ## Install
 
@@ -96,6 +104,17 @@ with either backend, and Ralph reproduces it in the `resume` and `run` commands
 it prints for a handed-off session so recovery re-establishes the same relaxed
 boundary.
 
+Every automated iteration and every recovery session is wrapped in a Seatbelt
+sandbox (host isolation, described under [Safety](#safety)). Pass
+`--unsafe-no-sandbox` only for a project genuinely incompatible with Seatbelt:
+it skips the sandbox wrap and its self-test so the backend runs unconfined, and
+it prints a loud stderr warning at launch. This flag is separate from and
+orthogonal to `--unsafe-allow-agents` — it relaxes only host isolation, and
+every other protection (subscription-only auth, customization isolation, secret
+redaction) is untouched. `ralph resume` accepts it too, and Ralph reproduces it
+verbatim in the `resume` and `run` commands it prints for a handed-off session
+so a recovered session re-establishes the identical relaxed boundary.
+
 Ralph snapshots the prompt once, starts a fresh session per iteration, and
 stops early only when the final assistant output contains the exact standalone
 line `<promise>COMPLETE</promise>`. Exhausting the budget without that marker is
@@ -132,6 +151,56 @@ ralph clean --worktree PATH
 Ralph always grants dangerous full-auto permissions. The backend can edit
 files and run commands without confirmation. Review the prompt, repository,
 and effective authentication before starting an unattended run.
+
+### Host isolation
+
+Ralph confines every backend session in a Seatbelt sandbox it generates at
+runtime and wraps the backend in via `/usr/bin/sandbox-exec` — the third proven
+guarantee alongside subscription-only auth and customization isolation. The
+policy is a **write allow-list** (the worktree, the resolved `.git/ralph` state,
+the session tmp, and the running backend's own state directory) and a **read
+deny-list** (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.azure`,
+`~/.kube`, `~/.netrc`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, browser
+profiles, `~/Library/Keychains`, and the *other* backend's auth store). Before
+spending budget Ralph runs a one-shot self-test that must observe a denied read
+and a denied write actually fail; if the sandbox cannot start or the self-test
+fails open, Ralph fails closed and spends no budget. `ralph resume` and
+handed-off recovery sessions are sandboxed identically because both route
+through the same launch chain.
+
+**This defends against accident, not malice.** It stops a well-meaning backend
+from an errant `rm -rf` outside the worktree or an accidental `cat ~/.ssh/id_*`
+swept into a commit or an LLM context. It does **not** stop a determined
+exfiltrator: network egress stays fully open (the LLM API, `gh`/`git push`, and
+package registries need it), so a backend that *decides* to leak a secret over
+the network can. The read deny-list is the **famous credential paths, not a
+completeness guarantee** — a credential in an unanticipated path stays readable,
+and the self-test proves the listed denials bite, not that the list is
+exhaustive. Do not mistake this for protection you did not build.
+
+A few paths stay **readable on purpose** because the loop needs them:
+`~/.config/gh` (so `gh` and `git push` keep working) and the running backend's
+own auth store (its subscription token). One keychain file is a carve-out from
+the `~/Library/Keychains` denial: `login.keychain-db` stays readable because on
+a default macOS `gh` install the in-scope GitHub token lives there and cannot be
+separated from it at the filesystem layer; every other keychain stays denied,
+and the file is encrypted at rest so an accidental read yields ciphertext.
+These are in-scope credentials the loop cannot function without, so this boundary
+inherently cannot protect them; the *other* backend's auth store is denied
+because the running session never needs it.
+
+`caffeinate` remains the **outer** wrap of the launch chain
+(`caffeinate -im sandbox-exec -f <profile> <backend> …`) so its power assertion
+keeps working; the sandbox sits inside it and the backend innermost. The
+concrete filled-in profile is written only under the untracked `.git/ralph/`;
+tracked source holds only a universal template, so no home path, username, or
+secret is ever committed to this repository.
+
+`--unsafe-no-sandbox` (see [Run](#run)) loudly disables host isolation for a
+project incompatible with Seatbelt. It is separate from `--unsafe-allow-agents`
+and relaxes only host isolation. [ADR-0001](docs/adr/0001-host-isolation-via-seatbelt.md)
+records why a Seatbelt sandbox was chosen over a container or VM (the industry
+default for unattended full-auto) and why malice is deliberately out of scope.
 
 Ralph holds `/usr/bin/caffeinate -im` assertions for automated and generated
 manual sessions, preventing idle system and disk sleep while allowing display

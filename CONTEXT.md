@@ -51,7 +51,9 @@ _Avoid_: attack, exploit, threat (unqualified)
 
 **In-scope credential**:
 A credential the loop needs to do its job (the backend's own subscription
-token, `gh`'s GitHub access) and therefore cannot be protected by the sandbox.
+token, `gh`'s GitHub access — including `~/Library/Keychains/login.keychain-db`,
+the one keychain carved out of the keychain denial because `gh` keeps its token
+there) and therefore cannot be protected by the sandbox.
 _Avoid_: allowed secret
 
 **Profile template**:

@@ -6,9 +6,47 @@ set (register D7/D9)."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import shlex
+import sys
+import unittest
 
 from harness import RalphCliTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from ralph.cli import parser  # noqa: E402  (import after sys.path is extended)
+
+
+def _flag_help(subcommand: str, flag: str) -> str:
+    subparsers = next(
+        action
+        for action in parser()._subparsers._group_actions  # type: ignore[union-attr]
+        if hasattr(action, "choices")
+    )
+    subparser = subparsers.choices[subcommand]
+    return next(
+        action.help for action in subparser._actions if flag in action.option_strings
+    )
+
+
+class UnsafeNoSandboxHelpTextTest(unittest.TestCase):
+    """The opt-out's help text is a command surface: `run` and `resume` must
+    describe --unsafe-no-sandbox identically, so a copy that drifts (a dropped
+    'and', a diverging claim) is caught here rather than shipped."""
+
+    def test_run_and_resume_describe_the_flag_identically(self) -> None:
+        run_help = _flag_help("run", "--unsafe-no-sandbox")
+        resume_help = _flag_help("resume", "--unsafe-no-sandbox")
+        # Both must carry the grammatical, orthogonality-naming phrasing; a
+        # missing "and" (the historical drift) fails on both counts.
+        self.assertIn("Separate from and orthogonal to --unsafe-allow-agents", run_help)
+        self.assertIn(
+            "Separate from and orthogonal to --unsafe-allow-agents", resume_help
+        )
+        # Both must state the flag relaxes only host isolation and nothing else.
+        self.assertIn("relaxes only host isolation", run_help)
+        self.assertIn("relaxes only host isolation", resume_help)
 
 
 class UnsafeNoSandboxRunTest(RalphCliTestCase):
