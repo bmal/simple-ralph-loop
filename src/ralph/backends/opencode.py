@@ -56,9 +56,10 @@ from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
     PROTOCOL,
+    explicit_needs_input,
     extract_question,
     has_completion_marker,
-    needs_input_question,
+    inferred_needs_input,
 )
 from ..redaction import redact
 
@@ -670,9 +671,20 @@ def _consume_opencode_iteration(
             result.session_id,
             outcome="backend_contract_failure",
         ) from None
-    question = needs_input_question(final_text)
-    if question:
-        raise HandoffError("OpenCode requested operator input", result.session_id, question)
+    explicit = explicit_needs_input(final_text)
+    if explicit:
+        raise HandoffError("OpenCode requested operator input", result.session_id, explicit)
+    inferred = inferred_needs_input(final_text)
+    if inferred:
+        # An unmarked concluding question is a low-confidence signal; the loop must
+        # not take the irreversible operator-halt on a guess. Surface it and let the
+        # next iteration re-derive from the tracker.
+        print(
+            "ralph: warning: final message ended on an unmarked operator-directed "
+            "question; continuing to the next iteration (no <promise>NEEDS_INPUT</promise> "
+            f"marker and no question tool used):\n{redact(inferred)}",
+            file=sys.stderr,
+        )
     complete = has_completion_marker(final_text)
     return ("complete" if complete else "budget_exhausted"), result.session_id
 

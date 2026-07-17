@@ -148,16 +148,22 @@ class LoopProtocolTest(RalphCliTestCase):
 
         for path in self.calls.iterdir():
             path.unlink()
+        # An unmarked concluding question is only an *inferred* signal, so the
+        # loop warns and continues rather than paging the operator on a guess.
         question = "Implementation is ready.\n\nShould I remove the compatibility shim?"
         question_result = self.run_ralph(
             env={"FAKE_EVENTS": self._events(question), "FAKE_EXPORT": self._export(question)}
         )
-        self.assertEqual(question_result.returncode, 2)
+        self.assertEqual(question_result.returncode, 1, question_result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", question_result.stderr)
+        self.assertIn("unmarked operator-directed", question_result.stderr)
         self.assertIn("Should I remove the compatibility shim?", question_result.stderr)
 
     def test_concluding_question_survives_trailing_closing_prose(self) -> None:
-        # A genuine user-directed question is detected even when a courtesy
-        # sign-off follows it, on one line or on a following line.
+        # A genuine user-directed question is still detected by the inferred
+        # heuristic even when a courtesy sign-off follows it, on one line or on a
+        # following line. Because it is only an inferred signal (no marker, no
+        # question tool), the loop warns and continues instead of handing off.
         cases = [
             "Implementation is staged.\n\nShould I proceed? Please advise.",
             "The migration is ready.\n\nShould I open the PR now?\nThanks!",
@@ -167,8 +173,9 @@ class LoopProtocolTest(RalphCliTestCase):
             for text in cases:
                 with self.subTest(backend=backend, text=text):
                     result = self._run_backend_question(backend, text)
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+                    self.assertIn("unmarked operator-directed", result.stderr)
                     for path in self.calls.iterdir():
                         path.unlink()
 
@@ -315,12 +322,16 @@ class LoopProtocolTest(RalphCliTestCase):
 
         for path in self.calls.iterdir():
             path.unlink()
+        # An unmarked prose question is inferred-only: warn and continue, never
+        # hand off on the guess.
         prose = "Changes are ready.\n\nWould you like me to delete the old file?"
         prose_result = self.run_ralph(
             backend="claude",
             env={"FAKE_CLAUDE_EVENTS": self._claude_events(prose)},
         )
-        self.assertEqual(prose_result.returncode, 2)
+        self.assertEqual(prose_result.returncode, 1, prose_result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", prose_result.stderr)
+        self.assertIn("unmarked operator-directed", prose_result.stderr)
         self.assertIn("Would you like me to delete the old file?", prose_result.stderr)
 
         for path in self.calls.iterdir():
@@ -338,6 +349,103 @@ class LoopProtocolTest(RalphCliTestCase):
             json.loads((runs[-1] / "outcome.json").read_text())["outcome"],
             "backend_contract_failure",
         )
+
+    def test_needs_input_halt_matrix_separates_deliberate_from_inferred(self) -> None:
+        # The full needs-input matrix on representative final messages: the two
+        # deliberate channels (explicit marker, native question tool) hard-halt;
+        # the inferred concluding-question guess only warns and continues; clean
+        # and completion messages take their normal outcomes.
+        handoff_cases = [
+            # (a) explicit marker alone -> handoff, question captured.
+            (
+                "<promise>NEEDS_INPUT</promise>\nShould I target Python 3.13 or 3.14?",
+                "Should I target Python 3.13 or 3.14?",
+            ),
+            # (b) explicit marker + trailing courtesy sign-off -> handoff, the
+            # concrete question is still captured.
+            (
+                "<promise>NEEDS_INPUT</promise>\nShould I merge the branch now?\nThanks!",
+                "Should I merge the branch now?",
+            ),
+        ]
+        for backend in ("opencode", "claude"):
+            for text, expected in handoff_cases:
+                with self.subTest(case="explicit-marker", backend=backend, text=text):
+                    result = self._run_backend_question(backend, text)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+                    self.assertIn(expected, result.stderr)
+                    for path in self.calls.iterdir():
+                        path.unlink()
+
+            # (c) bare operator-directed concluding question, no marker -> warn
+            # and continue (budget_exhausted), never a handoff.
+            with self.subTest(case="inferred-question", backend=backend):
+                inferred = "Work is complete.\n\nShould I open the pull request next?"
+                result = self._run_backend_question(backend, inferred)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+                self.assertIn("unmarked operator-directed", result.stderr)
+                self.assertIn("Should I open the pull request next?", result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+            # (d) clean statement with no marker -> budget_exhausted, no warning.
+            with self.subTest(case="clean-statement", backend=backend):
+                clean = "Implemented the change and verified the tests pass."
+                result = self._run_backend_question(backend, clean)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+                self.assertNotIn("unmarked operator-directed", result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+            # (e) completion marker -> complete.
+            with self.subTest(case="completion", backend=backend):
+                done = "All acceptance criteria are met.\n<promise>COMPLETE</promise>"
+                result = self._run_backend_question(backend, done)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+        # (f) native question tool -> handoff, per backend's own tool channel.
+        opencode_question = {
+            "type": "tool_use",
+            "sessionID": "ses_question",
+            "part": {
+                "type": "tool",
+                "tool": "question",
+                "state": {"input": {"questions": [{"question": "Which format should I use?"}]}},
+            },
+        }
+        opencode_result = self.run_ralph(
+            env={
+                "FAKE_EVENTS": json.dumps(opencode_question),
+                "FAKE_EXPORT": self._export("unused"),
+            }
+        )
+        self.assertEqual(opencode_result.returncode, 2, opencode_result.stderr)
+        self.assertIn("native question tool", opencode_result.stderr)
+        self.assertIn("Which format should I use?", opencode_result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        events = self._claude_events("unused").splitlines()
+        assistant = json.loads(events[1])
+        assistant["message"]["content"] = [
+            {
+                "type": "tool_use",
+                "name": "AskUserQuestion",
+                "input": {"questions": [{"question": "Which migration path should I take?"}]},
+            }
+        ]
+        claude_result = self.run_ralph(
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": "\n".join([events[0], json.dumps(assistant)])},
+        )
+        self.assertEqual(claude_result.returncode, 2, claude_result.stderr)
+        self.assertIn("native question tool", claude_result.stderr)
+        self.assertIn("Which migration path should I take?", claude_result.stderr)
 
     def test_needs_input_marker_must_be_an_exact_standalone_line(self) -> None:
         padded = " <promise>NEEDS_INPUT</promise> \nImplementation finished."

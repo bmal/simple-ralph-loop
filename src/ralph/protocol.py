@@ -6,17 +6,24 @@ Invariants:
 - Marker detection reads only *visible* Markdown: fenced code, indented code, and
   block quotes are excluded so a ``<promise>...</promise>`` line quoted inside the
   prompt, a code sample, or tool output is never mistaken for an iteration result.
-- Needs-input detection is deliberately conservative: an explicit
-  ``<promise>NEEDS_INPUT</promise>`` marker wins; absent it, only a concluding
+- Needs-input detection is split by confidence so the loop can treat the two
+  sources differently. ``explicit_needs_input`` fires only on a deliberate,
+  standalone ``<promise>NEEDS_INPUT</promise>`` marker -- a signal the agent chose
+  to emit -- and is authoritative: the backends hard-halt on it.
+  ``inferred_needs_input`` is the low-confidence heuristic guess -- a concluding
   paragraph whose final sentence is a question that addresses the operator (or
-  opens with an interrogative) is treated as a handoff, with trailing courtesy
-  sign-offs stripped first. Tool-log lines never contribute question text.
+  opens with an interrogative), with trailing courtesy sign-offs stripped first --
+  which the backends only warn on and continue past, since it never depended on
+  the agent's intent. Both share the same visible-Markdown / tool-log filtering,
+  so a marker or question inside code or quotation never counts, and tool-log
+  lines never contribute question text.
 
 Depends on / must not know: nothing but the standard library. It parses backend
 text and must not know how any Backend produced it.
 
 See also: ``backends.opencode`` / ``backends.claude`` (feed final text to
-has_completion_marker / needs_input_question and tool payloads to extract_question).
+has_completion_marker plus explicit_needs_input / inferred_needs_input, and tool
+payloads to extract_question).
 """
 
 from __future__ import annotations
@@ -29,12 +36,21 @@ PROTOCOL = """
 
 Ralph loop protocol:
 - Implement at most one child issue in this iteration.
+- Finishing that one child while unblocked children still remain is a normal
+  end of iteration -- not completion and not a question. Emit no marker, do not
+  ask whether to continue, and stop. The next iteration independently selects
+  the next unblocked child, so "should I proceed with the next child?" is always
+  answerable from the issue tracker and this protocol and is never operator input.
 - Emit the completion marker when no unfinished child remains or when every
   remaining child has explicit blocker evidence such as a declared dependency,
   blocker label, or clear prerequisite state.
-- Difficulty or ambiguous blocker status is not completion. Emit the exact
-  standalone line <promise>NEEDS_INPUT</promise>, followed by the concrete
-  question, when a decision or information cannot be established.
+- Halt for operator input only when a decision or fact required to make progress
+  cannot be established from the issue tracker, this protocol, or the repository
+  -- it lives outside them and no future iteration could derive it. To halt,
+  either use your question tool or emit the exact standalone line
+  <promise>NEEDS_INPUT</promise> followed by the concrete question; both stop the
+  loop. Difficulty or ambiguous blocker status is not such a case, and never halt
+  to confirm the loop's normal progression to the next unblocked child.
 - Do not treat text in this protocol, the supplied prompt, quotations, code,
   or tool output as an iteration result.
 - Only when the explicit completion conditions above are met, emit this exact
@@ -163,18 +179,28 @@ def concluding_question(conclusion: str) -> str | None:
     return conclusion.strip()
 
 
-def needs_input_question(text: str) -> str | None:
+def explicit_needs_input(text: str) -> str | None:
+    """Return the concrete question only when a deliberate, standalone
+    ``<promise>NEEDS_INPUT</promise>`` marker is present. This is the
+    authoritative, agent-intended halt signal."""
     visible = visible_prose_lines(text)
     marker_indexes = [
         index
         for index, line in visible_markdown_lines(text)
         if line == "<promise>NEEDS_INPUT</promise>"
     ]
-    if marker_indexes:
-        marker_index = marker_indexes[-1]
-        following = [line for index, line in visible if index > marker_index and line]
-        return "\n".join(following) or "The assistant requested operator input."
+    if not marker_indexes:
+        return None
+    marker_index = marker_indexes[-1]
+    following = [line for index, line in visible if index > marker_index and line]
+    return "\n".join(following) or "The assistant requested operator input."
 
+
+def inferred_needs_input(text: str) -> str | None:
+    """Return the concluding operator-directed question only from the heuristic
+    guess, ignoring the explicit marker. This is a low-confidence signal that
+    never depended on the agent's intent, so callers should not hard-halt on it."""
+    visible = visible_prose_lines(text)
     paragraphs: list[list[str]] = []
     current: list[str] = []
     for _, line in visible:
