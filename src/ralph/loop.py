@@ -191,9 +191,9 @@ def run_protected(
     )
     (run_dir / "git-status.txt").write_text(status, encoding="utf-8")
     # Generate the host-isolation profile once per run (stable across
-    # iterations) and confine the backend under it (register D2/D6). #20 wraps
-    # OpenCode; the Claude wrap (#22) and the --unsafe-no-sandbox opt-out (#23)
-    # build on this shared launcher.
+    # iterations) and confine the backend under it (register D2/D6). Both
+    # backends are wrapped uniformly (#20 OpenCode, #22 Claude); the
+    # --unsafe-no-sandbox opt-out (#23) builds on this shared launcher.
     sandbox_profile = sandbox_profile_for(
         args.backend, run_dir, worktree, git_dir / "ralph", env
     )

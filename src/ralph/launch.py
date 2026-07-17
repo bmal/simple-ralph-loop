@@ -9,8 +9,8 @@ It is the seam #19 edits to land host isolation, so the sandbox wrap and the
 recovery commands that must reproduce its flags live together. ``session_argv`` is
 the single point the two Backend adapters and ``cli.resume`` assemble the wrapped
 argv, and ``sandbox_profile_for`` is the single place the per-run host-isolation
-profile is generated — OpenCode today, with the Claude wrap landing in #22 as the
-edit that drops that gate. ``run_sandbox_self_test`` is the one-shot proof (#21)
+profile is generated — both backends confined uniformly (#20 OpenCode, #22 Claude)
+through one backend-aware generator. ``run_sandbox_self_test`` is the one-shot proof (#21)
 that the generated profile actually bites — a denied read and a denied write must
 both fail — that the Loop runs once per run before spending budget.
 
@@ -253,13 +253,13 @@ def write_sandbox_profile(
 def sandbox_profile_for(
     backend: str, run_dir: Path, worktree: Path, ralph_dir: Path, env: dict[str, str]
 ) -> Path | None:
-    # The Launch chain decides which backends run confined, once per run. Only
-    # OpenCode is wrapped today (#20); the Claude wrap lands in #22 as the single
-    # edit that lifts this gate. Returning None means no wrap and no written
-    # profile, exactly as the loop's former `backend == "opencode"` branch did, so
-    # a Claude run still generates no `sandbox.sb`.
-    if backend != "opencode":
-        return None
+    # The Launch chain confines every backend under Ralph's own profile, once per
+    # run — Ralph proves the boundary rather than trusting a backend to sandbox
+    # itself (register D6). Both OpenCode (#20) and Claude (#22) route through the
+    # same backend-aware generator, so there is no per-backend fork here beyond the
+    # deny/allow inputs `build_sandbox_profile` already keys off the backend name.
+    # The `--unsafe-no-sandbox` opt-out that can turn the wrap off lands in #23 at
+    # the loop layer; when it does, it will short-circuit before this call.
     return write_sandbox_profile(run_dir, backend, worktree, ralph_dir, env)
 
 

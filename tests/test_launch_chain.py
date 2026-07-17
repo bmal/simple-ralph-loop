@@ -142,11 +142,39 @@ class LaunchChainTest(RalphCliTestCase):
         self.assertIn("host isolation self-test could not run", result.stderr)
         self.assertFalse((self.calls / "opencode").exists())
 
-    def test_claude_launch_is_not_yet_sandboxed(self) -> None:
-        # #20 wraps only OpenCode; the Claude wrap lands in #22. Guard the
-        # boundary so the Claude path is untouched until then.
+    def test_claude_launch_is_wrapped_by_sandbox_inside_caffeinate(self) -> None:
+        # #22 confines Claude through the same shared launcher as OpenCode:
+        # caffeinate -im sandbox-exec -f <profile> claude … (register D6/D13,
+        # caffeinate outermost, one code path, not a Claude-specific fork).
         result = self.run_ralph(backend="claude")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.calls / "sandbox-exec").exists())
-        self.assertFalse(sorted(self._ralph_state().glob("runs/*/sandbox.sb")))
+        caffeinate = (self.calls / "caffeinate").read_text()
+        wrap = next(
+            line for line in caffeinate.splitlines() if "sandbox-exec" in line
+        )
+        self.assertTrue(wrap.startswith("-im "), wrap)
+        sandbox = str(self.bin / "sandbox-exec")
+        profiles = sorted(self._ralph_state().glob("runs/*/sandbox.sb"))
+        self.assertEqual(len(profiles), 1, profiles)
+        profile = profiles[0].resolve()
+        self.assertIn(f"-im {sandbox} -f {profile} claude -p", wrap)
+        # sandbox-exec received the profile then the confined Claude command.
+        recorded = (self.calls / "sandbox-exec").read_text().splitlines()
+        launch_line = next(line for line in recorded if "claude -p" in line)
+        self.assertTrue(launch_line.startswith(f"-f {profile} claude -p"), launch_line)
+
+    def test_claude_run_profile_is_backend_aware(self) -> None:
+        # For a Claude run the same generator flips the backend-aware inputs
+        # (register D4/D6): the in-scope store is ~/.claude (a write root and left
+        # readable) and the out-of-scope store denied is OpenCode's auth file.
+        result = self.run_ralph(backend="claude")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = sorted(self._ralph_state().glob("runs/*/sandbox.sb"))[0].read_text()
+        self.assertIn(f'(allow file-write* (subpath "{self.home}/.claude"))', text)
+        self.assertIn(
+            f'(deny file-read* (literal "{self.home}/.local/share/opencode/auth.json"))',
+            text,
+        )
+        self.assertNotIn(f'(deny file-read* (subpath "{self.home}/.claude"))', text)

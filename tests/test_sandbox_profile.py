@@ -473,6 +473,105 @@ class SandboxRealProfileSmokeTest(unittest.TestCase):
         self.assertEqual(marker.read_text().strip(), "ok")
 
 
+@unittest.skipUnless(sys.platform == "darwin", "Seatbelt is macOS-only")
+class ClaudeSandboxRealProfileSmokeTest(unittest.TestCase):
+    """Make-or-break qualification that the *Claude-flavored* profile — the same
+    generator with the backend-aware inputs flipped (register D4/D6) — actually
+    confines a Claude-shaped session under the live `/usr/bin/sandbox-exec`. No
+    language model and no subscription spend: it drives plain Go-CLI / shell
+    commands under the profile (the wrap Ralph builds around `claude`), proving
+    the out-of-scope OpenCode store is denied, the in-scope `~/.claude` store
+    stays readable, and writes are confined to the sanctioned roots.
+
+    Nesting: Ralph never enables Claude Code's own Bash sandbox (the session runs
+    with `--dangerously-skip-permissions` and CLAUDE_SETTINGS leaves the inner
+    sandbox off), so there is no inner sandbox to compose with — Ralph's outer
+    Seatbelt profile proven here is the sole, authoritative confinement.
+    """
+
+    SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+    def setUp(self) -> None:
+        if not Path(self.SANDBOX_EXEC).is_file():
+            raise AssertionError(
+                "/usr/bin/sandbox-exec is required for the Claude host-isolation "
+                "smoke and must not be silently skipped on macOS"
+            )
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.worktree = base / "worktree"
+        self.worktree.mkdir()
+        self.ralph_dir = base / "ralph"
+        self.ralph_dir.mkdir()
+        # A dedicated session tmp under the temp base so the synthetic home — and
+        # the write probes under it — are genuinely outside every sanctioned write
+        # root (were session tmp the real TMPDIR the temp base would sit inside it
+        # and the "escape" write would be sanctioned, making the probe vacuous).
+        self.session_tmp = base / "session-tmp"
+        self.session_tmp.mkdir()
+        self.home = base / "home"
+        # The out-of-scope OpenCode store carries a leak marker so a fail-open
+        # deny would surface it; the in-scope ~/.claude store carries an in-scope
+        # marker that must stay readable (D4, backend-aware for a Claude run).
+        opencode_auth = self.home / ".local" / "share" / "opencode"
+        opencode_auth.mkdir(parents=True)
+        self.opencode_probe = opencode_auth / "auth.json"
+        self.opencode_probe.write_text("OPENCODE-LEAK\n", encoding="utf-8")
+        claude_store = self.home / ".claude"
+        claude_store.mkdir(parents=True)
+        self.claude_probe = claude_store / "in-scope.json"
+        self.claude_probe.write_text("CLAUDE-IN-SCOPE\n", encoding="utf-8")
+        self.profile = base / "sandbox.sb"
+        self.profile.write_text(
+            launch.build_sandbox_profile(
+                "claude", self.worktree, self.ralph_dir, self.session_tmp, self.home
+            ),
+            encoding="utf-8",
+        )
+
+    def _confined(self, *command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.SANDBOX_EXEC, "-f", str(self.profile), *command],
+            text=True,
+            capture_output=True,
+        )
+
+    def test_out_of_scope_opencode_store_read_actually_fails(self) -> None:
+        # Non-vacuous: the file exists and is readable outside the sandbox, so a
+        # fail-open profile would leak OPENCODE-LEAK.
+        self.assertIn("OPENCODE-LEAK", self.opencode_probe.read_text())
+        result = self._confined("cat", str(self.opencode_probe))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("OPENCODE-LEAK", result.stdout)
+        self.assertIn("not permitted", (result.stdout + result.stderr).lower())
+
+    def test_in_scope_claude_store_stays_readable(self) -> None:
+        # The running backend's own store is in-scope (the loop needs it), so the
+        # Claude-flavored profile must leave ~/.claude readable.
+        result = self._confined("cat", str(self.claude_probe))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CLAUDE-IN-SCOPE", result.stdout)
+
+    def test_out_of_worktree_write_actually_fails(self) -> None:
+        target = self.home / ".ralph-claude-escape-probe"
+        result = self._confined(
+            "sh", "-c", f'echo leak > {shlex.quote(str(target))} 2>&1; echo "rc=$?"'
+        )
+        self.assertNotIn("rc=0", result.stdout)
+        self.assertFalse(target.exists(), "write outside the worktree was not confined")
+
+    def test_claude_store_write_is_permitted(self) -> None:
+        # ~/.claude is the backend state root for a Claude run, so writes into it
+        # (the backend's own session state) are sanctioned.
+        marker = self.home / ".claude" / "written-inside.json"
+        result = self._confined(
+            "sh", "-c", f'echo ok > {shlex.quote(str(marker))}; echo "rc=$?"'
+        )
+        self.assertIn("rc=0", result.stdout)
+        self.assertEqual(marker.read_text().strip(), "ok")
+
+
 class _patched_environ:
     """Minimal context manager to set/remove environment variables for a
     deterministic pure-function assertion."""

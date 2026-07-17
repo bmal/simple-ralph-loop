@@ -484,9 +484,13 @@ def execute_iteration(
     timeout: float,
     sandbox_profile: Path | None = None,
 ) -> tuple[str, str | None]:
-    # sandbox_profile is carried for a uniform Backend interface but not consumed:
-    # the Claude host-isolation wrap lands in #22, so today Claude launches
-    # unwrapped and session_argv receives no profile.
+    # Confine the Claude session under Ralph's generated profile via the shared
+    # `session_argv` wrap (register D6/D13): `caffeinate -im sandbox-exec -f
+    # <profile> claude …`, caffeinate outermost. This is the exact OpenCode code
+    # path — one launcher, no Claude-specific fork — and Ralph's outer Seatbelt
+    # profile is authoritative: Ralph never enables Claude Code's own Bash sandbox
+    # (it runs with --dangerously-skip-permissions and CLAUDE_SETTINGS leaves the
+    # inner sandbox off), so the two do not fight and the outer profile is sole.
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = session_argv(
@@ -506,7 +510,8 @@ def execute_iteration(
             "--strict-mcp-config",
             "--settings",
             CLAUDE_SETTINGS,
-        ]
+        ],
+        sandbox_profile,
     )
     result = ClaudeEventResult(model)
     try:
