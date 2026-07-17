@@ -12,20 +12,19 @@ Invariants:
   ``MAX_ITERATION_TIMEOUT_SECONDS`` in ``process``); the backend limit only bites
   when Ralph's own timer is explicitly disabled.
 
-Depends on / must not know: ``errors`` only, at module load. ``clean_environment``
-imports ``backends.opencode.isolated_config`` lazily inside the function — the
-per-backend branch here is transitional (register E8 commit 1 keeps the dispatch;
-commit 2 dissolves it into each adapter's ``environment``), and the lazy import
-keeps this near-leaf module out of the ``backends`` import cycle. It must not know
-how a Backend consumes the environment beyond the two keys it sets.
+Depends on / must not know: ``errors`` only. ``clean_environment`` strips the ban
+list and sets nothing backend-specific: each adapter's ``environment`` layers its
+own routing keys on top (register E4/E10, activated in E8 commit 2), so this
+near-leaf module never imports the ``backends`` package and stays out of its import
+cycle. It must not know how a Backend consumes the environment.
 
 See also: ``redaction`` (derives its secret set from ``LLM_ENV_VARS``),
-``backends.opencode`` (owns ``isolated_config``), ``preflight``.
+``backends.opencode`` / ``backends.claude`` (layer their routing keys via
+``environment`` and own ``BACKEND_TIMEOUT_MS``'s consumers), ``preflight``.
 """
 
 from __future__ import annotations
 
-import json
 import os
 
 from .errors import RalphError
@@ -85,30 +84,12 @@ LLM_ENV_VARS = {
 }
 
 
-def clean_environment(model: str, backend: str) -> dict[str, str]:
-    from .backends.opencode import isolated_config
-
-    env = {key: value for key, value in os.environ.items() if key not in LLM_ENV_VARS}
-    ceiling = str(BACKEND_TIMEOUT_MS)
-    if backend == "opencode":
-        env.update(
-            {
-                "OPENCODE_CONFIG_CONTENT": json.dumps(isolated_config(model), separators=(",", ":")),
-                "OPENCODE_DISABLE_AUTOUPDATE": "true",
-                "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
-                "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": ceiling,
-            }
-        )
-    else:
-        env.update(
-            {
-                "API_TIMEOUT_MS": ceiling,
-                "BASH_DEFAULT_TIMEOUT_MS": ceiling,
-                "BASH_MAX_TIMEOUT_MS": ceiling,
-                "DISABLE_AUTOUPDATER": "1",
-            }
-        )
-    return env
+def clean_environment() -> dict[str, str]:
+    # The backend-agnostic sanitized base: os.environ with every LLM_ENV_VARS ban
+    # stripped so no metered-API credential or custom endpoint survives into the
+    # child. Each Backend adapter's ``environment`` layers its own routing and
+    # timeout keys on top of this dict.
+    return {key: value for key, value in os.environ.items() if key not in LLM_ENV_VARS}
 
 
 def reject_unsafe_environment() -> None:

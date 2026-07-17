@@ -6,9 +6,11 @@ power assertion and the ``sandbox-exec`` host-isolation profile and wrap that si
 in that order, outside every backend session — together with the loop-wide
 ``CaffeinateAssertion`` and the formatting of the resume/restart recovery commands.
 It is the seam #19 edits to land host isolation, so the sandbox wrap and the
-recovery commands that must reproduce its flags live together. Centralizing the
-final wrapped argv here is register E8 commit 2's job; until then the adapters and
-``cli.resume`` assemble the argv from these fragments at their own call sites.
+recovery commands that must reproduce its flags live together. ``session_argv`` is
+the single point the two Backend adapters and ``cli.resume`` assemble the wrapped
+argv, and ``sandbox_profile_for`` is the single place the per-run host-isolation
+profile is generated — OpenCode today, with the Claude wrap landing in #22 as the
+edit that drops that gate.
 
 Invariants:
 - ``caffeinate`` and ``sandbox-exec`` are always resolved by absolute path, never
@@ -200,6 +202,16 @@ def sandbox_wrap(profile: Path | None) -> list[str]:
     return [sandbox_exec_executable(), "-f", str(profile)]
 
 
+def session_argv(backend_args: list[str], sandbox_profile: Path | None = None) -> list[str]:
+    # The one place the wrapped Launch chain is assembled: the caffeinate power
+    # assertion outermost, the `sandbox-exec` host-isolation wrap next (empty when
+    # no profile is generated), the backend command innermost. Automated
+    # iterations and `ralph resume` alike route through here so #19's sandbox wrap
+    # lands as a single edit and the backend can never be launched unwrapped by an
+    # adapter assembling the chain on its own.
+    return [caffeinate_executable(), "-im", *sandbox_wrap(sandbox_profile), *backend_args]
+
+
 def write_sandbox_profile(
     run_dir: Path, backend: str, worktree: Path, ralph_dir: Path, env: dict[str, str]
 ) -> Path:
@@ -213,6 +225,19 @@ def write_sandbox_profile(
     path = run_dir / "sandbox.sb"
     path.write_text(profile_text, encoding="utf-8")
     return path
+
+
+def sandbox_profile_for(
+    backend: str, run_dir: Path, worktree: Path, ralph_dir: Path, env: dict[str, str]
+) -> Path | None:
+    # The Launch chain decides which backends run confined, once per run. Only
+    # OpenCode is wrapped today (#20); the Claude wrap lands in #22 as the single
+    # edit that lifts this gate. Returning None means no wrap and no written
+    # profile, exactly as the loop's former `backend == "opencode"` branch did, so
+    # a Claude run still generates no `sandbox.sb`.
+    if backend != "opencode":
+        return None
+    return write_sandbox_profile(run_dir, backend, worktree, ralph_dir, env)
 
 
 def shell_command(args: list[str], worktree: Path) -> str:

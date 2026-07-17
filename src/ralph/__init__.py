@@ -8,8 +8,9 @@ Module map — start here, then open only the module you need:
 - ``launch``       — the Launch chain: wrapped argv, the power-assertion seam and
                      ``CaffeinateAssertion``, host-isolation profile + sandbox wrap,
                      and recovery-command (resume/restart) formatting.
-- ``backends``     — the Backend package: per-backend default models and the
-                     transitional dispatch over the two adapters.
+- ``backends``     — the Backend package: per-backend default models, the five-name
+                     Backend Protocol, and the registry that resolves a name to its
+                     adapter (the one backend-name resolution).
 - ``backends.opencode`` — the OpenCode adapter: preflight, agent refusal, isolated
                      config, event accumulation, iteration incl. second-pass
                      verification, session persistence.

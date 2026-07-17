@@ -19,13 +19,15 @@ Invariants:
 - A stop Ralph itself caused (timeout/interrupt) is classified *before* any contract
   failure, so an interrupted session's error result is never misread as misbehavior.
 
-Depends on / must not know: ``errors``, ``launch`` (caffeinate), ``process``,
-``protocol``, ``redaction`` (functions only), ``gitcontext``, and ``preflight``. It
-must not know how the Loop schedules Iterations; the Loop must not know these
-helpers exist beyond the five Backend interface names.
+Depends on / must not know: ``environment`` (the sanitized base and the timeout
+ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
+``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``, and
+``preflight``. It must not know how the Loop schedules Iterations; the Loop must not
+know these helpers exist beyond the five Backend interface names.
 
-See also: ``backends`` (dispatch/registry), ``backends.opencode`` (twin adapter),
-``launch`` (the wrapped argv), ``protocol`` (marker detection).
+See also: ``backends`` (registry and the five-name Protocol), ``backends.opencode``
+(twin adapter), ``launch`` (``session_argv``, the wrapped argv), ``protocol``
+(marker detection).
 """
 
 from __future__ import annotations
@@ -38,9 +40,10 @@ import sys
 import threading
 from typing import Any
 
+from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import HandoffError, RalphError, raise_backend_contract_failure
 from ..gitcontext import command, write_json
-from ..launch import caffeinate_executable
+from ..launch import session_argv
 from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
@@ -141,6 +144,29 @@ AGENT_OPT_OUT_HINT = (
 )
 
 
+def validate_model(model: str) -> None:
+    if not model.startswith("claude-"):
+        raise RalphError("model must be a Claude subscription model")
+
+
+def environment(model: str) -> dict[str, str]:
+    # The sanitized base plus Claude's request and Bash-tool timeout ceilings and
+    # autoupdater suppression. The timeouts are pinned to the 32-bit ceiling so
+    # Ralph's own iteration timer always stays authoritative; the model is not
+    # consulted (Claude routing rides the proven subscription OAuth, not env).
+    ceiling = str(BACKEND_TIMEOUT_MS)
+    env = clean_environment()
+    env.update(
+        {
+            "API_TIMEOUT_MS": ceiling,
+            "BASH_DEFAULT_TIMEOUT_MS": ceiling,
+            "BASH_MAX_TIMEOUT_MS": ceiling,
+            "DISABLE_AUTOUPDATER": "1",
+        }
+    )
+    return env
+
+
 def claude_managed_root() -> Path:
     # System directory holding MDM-managed Claude configuration. Its default is
     # an absolute macOS path; RALPH_CLAUDE_MANAGED_ROOT is honored only as a test
@@ -236,7 +262,7 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
     raise RalphError(CUSTOMIZATION_REFUSAL + (AGENT_OPT_OUT_HINT if hint else ""))
 
 
-def claude_preflight(
+def preflight(
     worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = False
 ) -> None:
     common_preflight(worktree, slug, "claude", env)
@@ -401,35 +427,58 @@ class ClaudeEventResult:
         return list(dict.fromkeys(model for model in models if model != self.expected_model))
 
 
-def execute_claude_iteration(
-    worktree: Path,
-    run_dir: Path,
-    prompt: str,
-    model: str,
-    env: dict[str, str],
-    timeout: float,
-) -> tuple[str, str | None]:
-    stdout_path = run_dir / "stdout.ndjson"
-    stderr_path = run_dir / "stderr.log"
-    args = [
-        caffeinate_executable(),
-        "-im",
+def resume_argv(worktree: Path, model: str, session: str) -> list[str]:
+    # The interactive Claude command a handed-off session resumes into, minus the
+    # Launch chain wrap that ``launch.session_argv`` adds around it. The worktree is
+    # part of the interface but Claude keys off the process cwd, not a --dir flag.
+    return [
         "claude",
-        "-p",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
+        "--resume",
+        session,
         "--model",
         model,
+        "--dangerously-skip-permissions",
         "--setting-sources",
         "project",
         "--strict-mcp-config",
         "--settings",
         CLAUDE_SETTINGS,
     ]
+
+
+def execute_iteration(
+    worktree: Path,
+    run_dir: Path,
+    prompt: str,
+    model: str,
+    env: dict[str, str],
+    timeout: float,
+    sandbox_profile: Path | None = None,
+) -> tuple[str, str | None]:
+    # sandbox_profile is carried for a uniform Backend interface but not consumed:
+    # the Claude host-isolation wrap lands in #22, so today Claude launches
+    # unwrapped and session_argv receives no profile.
+    stdout_path = run_dir / "stdout.ndjson"
+    stderr_path = run_dir / "stderr.log"
+    args = session_argv(
+        [
+            "claude",
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+            "--model",
+            model,
+            "--setting-sources",
+            "project",
+            "--strict-mcp-config",
+            "--settings",
+            CLAUDE_SETTINGS,
+        ]
+    )
     result = ClaudeEventResult(model)
     try:
         process = subprocess.Popen(

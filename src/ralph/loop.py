@@ -11,17 +11,21 @@ Invariants:
   and an unexpected ``RalphError`` (recorded as ``backend_failure`` then re-raised).
 - ``print_handoff`` reproduces the exact remaining-budget restart command and, when
   a session exists, the resume command; every operator-facing string is redacted.
-- The per-iteration preflight branch and the sandbox-profile-for-opencode branch
-  are transitional dispatch (register E8 commit 1); the launch-chain seam and the
-  registry absorb them in commit 2.
+- The loop holds a resolved ``Backend`` and drives it only through the Backend
+  Protocol (here ``environment``, ``preflight``, and ``execute_iteration``); it never
+  names a concrete backend, so it cannot tell the two apart (register E2, user story
+  6). The
+  once-per-run host-isolation profile comes from ``launch.sandbox_profile_for``,
+  which owns the decision of which backends run confined.
 
-Depends on / must not know: ``environment``, ``redaction`` (functions only),
-``locking``, ``gitcontext``, ``launch``, ``errors``, and the ``backends`` package
-plus its two adapters (for the transitional preflight dispatch). It must not know
-how any Backend consumes the argv or produces its events.
+Depends on / must not know: ``redaction`` (functions only), ``locking``,
+``gitcontext``, ``launch``, ``errors``, and a resolved ``Backend`` (``cli`` resolves
+it through the registry and passes it in). It must not know which concrete Backend
+it holds, nor how that Backend consumes the argv or produces its events.
 
-See also: ``launch`` (owns the wrapped argv and recovery-command formatting),
-``cli`` (``run`` acquires the lock then calls ``run_locked``), ``backends``.
+See also: ``launch`` (owns the wrapped argv, the profile gate, and recovery-command
+formatting), ``cli`` (``run`` resolves the Backend, acquires the lock, then calls
+``run_locked``), ``backends`` (the registry and Protocol).
 """
 
 from __future__ import annotations
@@ -34,17 +38,14 @@ import sys
 from typing import Any
 import uuid
 
-from .backends import execute_iteration
-from .backends.claude import claude_preflight
-from .backends.opencode import opencode_preflight
-from .environment import clean_environment
+from .backends import Backend
 from .errors import HandoffError, RalphError, StartedIterationError
 from .gitcontext import command, write_json
 from .launch import (
     CaffeinateAssertion,
     resume_command,
     restart_command,
-    write_sandbox_profile,
+    sandbox_profile_for,
 )
 from .locking import secure_state_directory
 from .redaction import collect_secrets, redact, set_active_redactor
@@ -113,6 +114,7 @@ def print_handoff(
 
 
 def run_locked(
+    backend: Backend,
     args: argparse.Namespace,
     prompt_path: Path,
     prompt: str,
@@ -124,11 +126,12 @@ def run_locked(
 ) -> int:
     with CaffeinateAssertion(worktree) as assertion:
         return run_protected(
-            args, prompt_path, prompt, worktree, git_dir, branch, status, slug, assertion
+            backend, args, prompt_path, prompt, worktree, git_dir, branch, status, slug, assertion
         )
 
 
 def run_protected(
+    backend: Backend,
     args: argparse.Namespace,
     prompt_path: Path,
     prompt: str,
@@ -145,7 +148,7 @@ def run_protected(
     print(f"ralph: backend {args.backend}, model {args.model}", file=sys.stderr)
     if any(line and not line.startswith("##") for line in status.splitlines()):
         print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
-    env = clean_environment(args.model, args.backend)
+    env = backend.environment(args.model)
     # Redact subscription credentials from every readable and retained stream in
     # case backend output echoes an environment value.
     set_active_redactor(collect_secrets())
@@ -187,11 +190,9 @@ def run_protected(
     # iterations) and confine the backend under it (register D2/D6). #20 wraps
     # OpenCode; the Claude wrap (#22) and the --unsafe-no-sandbox opt-out with
     # its fail-closed self-test (#21/#23) build on this shared launcher.
-    sandbox_profile: Path | None = None
-    if args.backend == "opencode":
-        sandbox_profile = write_sandbox_profile(
-            run_dir, args.backend, worktree, git_dir / "ralph", env
-        )
+    sandbox_profile = sandbox_profile_for(
+        args.backend, run_dir, worktree, git_dir / "ralph", env
+    )
     started = datetime.now(timezone.utc).isoformat()
     iterations: list[dict[str, Any]] = []
     session_id: str | None = None
@@ -209,13 +210,9 @@ def run_protected(
             # Mark the boundary between fresh sessions so multi-iteration
             # console output is attributable to a specific iteration.
             print(f"ralph: iteration {number} of {args.iterations}", file=sys.stderr)
-            if args.backend == "claude":
-                claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
-            else:
-                opencode_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
+            backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
             iteration_started = datetime.now(timezone.utc).isoformat()
-            outcome, session_id = execute_iteration(
-                args.backend,
+            outcome, session_id = backend.execute_iteration(
                 worktree,
                 iteration_dir,
                 prompt,

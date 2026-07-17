@@ -21,13 +21,15 @@ Invariants:
   contract failure, so a truncated or error-closed stream is never misreported as
   backend misbehavior.
 
-Depends on / must not know: ``errors``, ``launch`` (caffeinate + sandbox wrap),
+Depends on / must not know: ``environment`` (the sanitized base and the timeout
+ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
 ``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``, and
-``preflight``. It must not know how the Loop schedules Iterations; the Loop must
-not know these helpers exist beyond the five Backend interface names.
+``preflight``. It must not know how the Loop schedules Iterations; the Loop must not
+know these helpers exist beyond the five Backend interface names.
 
-See also: ``backends`` (dispatch/registry), ``backends.claude`` (twin adapter),
-``launch`` (the wrapped argv), ``protocol`` (marker detection).
+See also: ``backends`` (registry and the five-name Protocol), ``backends.claude``
+(twin adapter), ``launch`` (``session_argv``, the wrapped argv), ``protocol``
+(marker detection).
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import threading
 import time
 from typing import Any
 
+from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import (
     HandoffError,
     RalphError,
@@ -48,7 +51,7 @@ from ..errors import (
     raise_backend_contract_failure,
 )
 from ..gitcontext import command, write_json
-from ..launch import caffeinate_executable, sandbox_wrap
+from ..launch import session_argv
 from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
@@ -61,6 +64,28 @@ from ..redaction import redact
 
 
 MIN_OPENCODE_VERSION = (1, 17, 20)
+
+
+def validate_model(model: str) -> None:
+    if not model.startswith("openai/") or model == "openai/":
+        raise RalphError("model must use the openai/ provider")
+
+
+def environment(model: str) -> dict[str, str]:
+    # The sanitized base plus OpenCode's routing keys: the isolated configuration
+    # pinned as inline content so no on-disk config can reroute the session, plugin
+    # and autoupdate suppression, and the Bash-tool timeout pinned to the 32-bit
+    # ceiling so Ralph's own iteration timer stays authoritative.
+    env = clean_environment()
+    env.update(
+        {
+            "OPENCODE_CONFIG_CONTENT": json.dumps(isolated_config(model), separators=(",", ":")),
+            "OPENCODE_DISABLE_AUTOUPDATE": "true",
+            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
+            "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": str(BACKEND_TIMEOUT_MS),
+        }
+    )
+    return env
 
 
 def isolated_config(model: str) -> dict[str, Any]:
@@ -145,7 +170,7 @@ def reject_opencode_agents(config: dict[str, Any], allow_agents: bool) -> None:
     )
 
 
-def opencode_preflight(
+def preflight(
     worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = False
 ) -> None:
     common_preflight(worktree, slug, "opencode", env)
@@ -421,7 +446,23 @@ def verify_session(
     return final_text
 
 
-def execute_opencode_iteration(
+def resume_argv(worktree: Path, model: str, session: str) -> list[str]:
+    # The interactive OpenCode command a handed-off session resumes into, minus the
+    # Launch chain wrap that ``launch.session_argv`` adds around it.
+    return [
+        "opencode",
+        "--pure",
+        "--model",
+        model,
+        "--auto",
+        "--session",
+        session,
+        "--dir",
+        str(worktree),
+    ]
+
+
+def execute_iteration(
     worktree: Path,
     run_dir: Path,
     prompt: str,
@@ -432,21 +473,21 @@ def execute_opencode_iteration(
 ) -> tuple[str, str | None]:
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
-    args = [
-        caffeinate_executable(),
-        "-im",
-        *sandbox_wrap(sandbox_profile),
-        "opencode",
-        "--pure",
-        "run",
-        "--model",
-        model,
-        "--format",
-        "json",
-        "--auto",
-        "--dir",
-        str(worktree),
-    ]
+    args = session_argv(
+        [
+            "opencode",
+            "--pure",
+            "run",
+            "--model",
+            model,
+            "--format",
+            "json",
+            "--auto",
+            "--dir",
+            str(worktree),
+        ],
+        sandbox_profile,
+    )
     result = EventResult(model)
     try:
         process = subprocess.Popen(

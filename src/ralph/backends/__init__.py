@@ -1,28 +1,33 @@
-"""The Backend package: per-backend default models and the transitional dispatch
-over the two Backend adapters.
+"""The Backend package: per-backend default models, the Backend Protocol contract,
+and the registry that resolves a backend name to its adapter module.
 
 Invariants:
 - ``DEFAULT_MODELS`` names the model each Backend runs when ``--model`` is omitted;
   the announced routing reflects it so a run always states what it will spend on.
-- ``execute_iteration`` and ``validate_model`` still branch on the backend name
-  here. This is deliberate for register E8 commit 1 (re-homing): the dispatch is
-  preserved, not activated. Commit 2 replaces these branches with a single registry
-  resolution and moves ``validate_model`` behind each adapter's Protocol contract.
+- ``resolve`` is the single place a backend name becomes a Backend: it maps the name
+  to the adapter module exactly once per invocation (register E1/E8). No
+  ``backend == ...`` dispatch selecting an adapter's behavior survives anywhere
+  else; the loop and cli drive the resolved Backend only through the five Protocol
+  names and so cannot tell the two backends apart (register E2, user story 6).
+- ``Backend`` pins those five names — ``preflight``, ``validate_model``,
+  ``execute_iteration``, ``resume_argv``, ``environment`` — for type-checkers only;
+  the adapters are plain modules, matched structurally with no runtime class or ABC
+  machinery (register E1).
 
-Depends on / must not know: ``errors`` and the two adapter modules. It must not
-grow backend-specific logic — that belongs in the adapters.
+Depends on / must not know: the two adapter modules (imported so the registry can
+name them). It must not grow backend-specific logic — that belongs in the adapters.
 
-See also: ``backends.opencode`` / ``backends.claude`` (the adapters), ``loop``
-and ``cli`` (dispatch through these functions).
+See also: ``backends.opencode`` / ``backends.claude`` (the adapters), ``loop`` and
+``cli`` (resolve once, then drive the Backend through the five names), ``launch``
+(the wrapped argv the adapters obtain).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Protocol
 
-from ..errors import RalphError
-from .claude import execute_claude_iteration
-from .opencode import execute_opencode_iteration
+from . import claude, opencode
 
 
 DEFAULT_MODELS = {
@@ -31,27 +36,35 @@ DEFAULT_MODELS = {
 }
 
 
-def execute_iteration(
-    backend: str,
-    worktree: Path,
-    run_dir: Path,
-    prompt: str,
-    model: str,
-    env: dict[str, str],
-    timeout: float,
-    sandbox_profile: Path | None = None,
-) -> tuple[str, str | None]:
-    if backend == "claude":
-        # The Claude wrap lands in #22; until then the shared profile is carried
-        # but only the OpenCode launch consumes it.
-        return execute_claude_iteration(worktree, run_dir, prompt, model, env, timeout)
-    return execute_opencode_iteration(
-        worktree, run_dir, prompt, model, env, timeout, sandbox_profile
-    )
+class Backend(Protocol):
+    """The five-name Backend interface (register E2). Everything else an adapter
+    does — event accumulation, iteration consumption, session persistence,
+    OpenCode's second-pass verification — is adapter-private and invisible here."""
+
+    def preflight(
+        self, worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = ...
+    ) -> None: ...
+
+    def validate_model(self, model: str) -> None: ...
+
+    def execute_iteration(
+        self,
+        worktree: Path,
+        run_dir: Path,
+        prompt: str,
+        model: str,
+        env: dict[str, str],
+        timeout: float,
+        sandbox_profile: Path | None = ...,
+    ) -> tuple[str, str | None]: ...
+
+    def resume_argv(self, worktree: Path, model: str, session: str) -> list[str]: ...
+
+    def environment(self, model: str) -> dict[str, str]: ...
 
 
-def validate_model(backend: str, model: str) -> None:
-    if backend == "opencode" and (not model.startswith("openai/") or model == "openai/"):
-        raise RalphError("model must use the openai/ provider")
-    if backend == "claude" and not model.startswith("claude-"):
-        raise RalphError("model must be a Claude subscription model")
+_BACKENDS: dict[str, Backend] = {"claude": claude, "opencode": opencode}
+
+
+def resolve(backend: str) -> Backend:
+    return _BACKENDS[backend]

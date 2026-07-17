@@ -12,20 +12,22 @@ Invariants:
 - ``resume`` re-establishes the full Trust boundary (sanitized environment,
   per-session OAuth/routing proof, isolated configuration, full-auto permissions,
   caffeinate) before ``exec``-ing the interactive backend, so recovery can never
-  inherit unsafe ambient routing. The per-backend argv here is transitional
-  dispatch (register E8 commit 1); the launch-chain seam absorbs it in commit 2.
+  inherit unsafe ambient routing. It resolves the Backend through the registry and
+  obtains its wrapped argv from ``launch.session_argv``, the one seam #19 edits.
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
 
-Depends on / must not know: the ``backends`` package (defaults, validation,
-per-backend preflight/settings), ``environment``, ``redaction`` (functions only),
-``gitcontext``, ``launch`` (caffeinate), ``locking``, ``loop``, ``process``
-(timeout ceiling), and ``errors``. It must not contain any Backend, Launch chain,
-or Loop mechanism beyond the transitional resume dispatch.
+Depends on / must not know: the ``backends`` package (defaults, the registry, and
+the resolved Backend's five interface names), ``redaction`` (functions only),
+``gitcontext``, ``launch`` (``session_argv``), ``locking``, ``loop``, ``process``
+(timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
+through the interface; it must not contain any Backend, Launch chain, or Loop
+mechanism of its own, nor branch on the backend name.
 
-See also: ``loop`` (the budgeted Iteration loop), ``backends`` (the adapters),
-``launch`` (recovery-command formatting), package docstring in ``ralph`` (the map).
+See also: ``loop`` (the budgeted Iteration loop), ``backends`` (the registry and
+adapters), ``launch`` (wrapped argv and recovery-command formatting), package
+docstring in ``ralph`` (the map).
 """
 
 from __future__ import annotations
@@ -38,13 +40,10 @@ import shutil
 import stat
 import sys
 
-from .backends import DEFAULT_MODELS, validate_model
-from .backends.claude import CLAUDE_SETTINGS, claude_preflight
-from .backends.opencode import opencode_preflight
-from .environment import clean_environment
+from .backends import DEFAULT_MODELS, resolve
 from .errors import RalphError
 from .gitcontext import command, git_context, read_prompt
-from .launch import caffeinate_executable
+from .launch import session_argv
 from .locking import WorktreeLock
 from .loop import run_locked
 from .process import MAX_ITERATION_TIMEOUT_SECONDS
@@ -61,13 +60,16 @@ def run(args: argparse.Namespace) -> int:
             f"timeout must not exceed {MAX_ITERATION_TIMEOUT_SECONDS} seconds so backend "
             "request and Bash limits stay subordinate to Ralph's timer"
         )
+    backend = resolve(args.backend)
     args.model = args.model or DEFAULT_MODELS[args.backend]
-    validate_model(args.backend, args.model)
+    backend.validate_model(args.model)
 
     prompt_path, prompt = read_prompt(args.prompt)
     worktree, git_dir, branch, status, slug = git_context(args.worktree)
     with WorktreeLock(git_dir, git_dir / "ralph" / "lock.json"):
-        return run_locked(args, prompt_path, prompt, worktree, git_dir, branch, status, slug)
+        return run_locked(
+            backend, args, prompt_path, prompt, worktree, git_dir, branch, status, slug
+        )
 
 
 def clean(args: argparse.Namespace) -> int:
@@ -103,48 +105,23 @@ def clean(args: argparse.Namespace) -> int:
 
 
 def resume(args: argparse.Namespace) -> int:
-    validate_model(args.backend, args.model)
+    backend = resolve(args.backend)
+    backend.validate_model(args.model)
     worktree, _git_dir, _branch, _status, slug = git_context(args.worktree)
     # Re-establish the exact sanitized child environment and re-prove the
     # subscription trust boundary (OAuth, effective routing, model availability,
     # customization isolation) before any resumed model work. reject_unsafe_-
     # environment inside preflight fails closed on a newly added API credential
     # or custom endpoint, so recovery cannot silently inherit unsafe routing.
-    env = clean_environment(args.model, args.backend)
+    env = backend.environment(args.model)
     set_active_redactor(collect_secrets())
-    if args.backend == "claude":
-        claude_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
-        backend_args = [
-            "claude",
-            "--resume",
-            args.session,
-            "--model",
-            args.model,
-            "--dangerously-skip-permissions",
-            "--setting-sources",
-            "project",
-            "--strict-mcp-config",
-            "--settings",
-            CLAUDE_SETTINGS,
-        ]
-    else:
-        opencode_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
-        backend_args = [
-            "opencode",
-            "--pure",
-            "--model",
-            args.model,
-            "--auto",
-            "--session",
-            args.session,
-            "--dir",
-            str(worktree),
-        ]
-    # caffeinate is launched by absolute path, exactly as automated iterations
-    # do; preflight has already proved it exists. Holding the -im assertion for
-    # the interactive session's whole lifetime replaces Ralph's own loop-level
-    # assertion once control passes to the operator.
-    argv = [caffeinate_executable(), "-im", *backend_args]
+    backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
+    # The Launch chain assembles the wrapped argv: caffeinate outermost, launched
+    # by absolute path exactly as automated iterations do (preflight has proved it
+    # exists). Holding the -im assertion for the interactive session's whole
+    # lifetime replaces Ralph's own loop-level assertion once control passes to the
+    # operator.
+    argv = session_argv(backend.resume_argv(worktree, args.model, args.session))
     print(
         "WARNING: Ralph is relaunching the backend session in dangerous full-auto mode; "
         "it may edit files and run commands without confirmation.",
