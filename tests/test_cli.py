@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import ralph  # noqa: E402  (import after sys.path is extended)
-from ralph import cli  # noqa: E402  (import after sys.path is extended)
+from ralph import errors, launch, locking, process  # noqa: E402  (moved homes, register E6)
 
 
 class RalphCliTest(unittest.TestCase):
@@ -1734,12 +1734,12 @@ class RalphCliTest(unittest.TestCase):
         self.assertEqual(len(outcome["iterations"]), 1)
 
     def test_timeout_upper_bound_keeps_backend_limits_subordinate(self) -> None:
-        over = self.run_ralph("--timeout", str(cli.MAX_ITERATION_TIMEOUT_SECONDS + 1))
+        over = self.run_ralph("--timeout", str(process.MAX_ITERATION_TIMEOUT_SECONDS + 1))
         self.assertNotEqual(over.returncode, 0)
         self.assertIn("must not exceed", over.stderr)
         self.assertFalse((self.calls / "opencode").exists())
 
-        at_max = self.run_ralph("--timeout", str(cli.MAX_ITERATION_TIMEOUT_SECONDS))
+        at_max = self.run_ralph("--timeout", str(process.MAX_ITERATION_TIMEOUT_SECONDS))
         self.assertEqual(at_max.returncode, 0, at_max.stderr)
         self.assertIn(
             "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=2147483647",
@@ -3120,7 +3120,7 @@ class WorktreeLockMetadataTest(unittest.TestCase):
             self.meta.write_text(json.dumps(value), encoding="utf-8")
 
     def test_absent_metadata_acquires_and_records_owner(self) -> None:
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
         lock.acquire()
         self.addCleanup(lock.release)
         self.assertTrue(lock.acquired)
@@ -3128,7 +3128,7 @@ class WorktreeLockMetadataTest(unittest.TestCase):
 
     def test_malformed_metadata_is_treated_as_stale_and_recovered(self) -> None:
         self._write_meta("{ not valid json")
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
         lock.acquire()
         self.addCleanup(lock.release)
         self.assertTrue(lock.acquired)
@@ -3138,22 +3138,22 @@ class WorktreeLockMetadataTest(unittest.TestCase):
         # The recorded PID is live (our own) but its identity does not match, as
         # happens when the OS reuses a dead owner's PID for an unrelated process.
         self._write_meta({"pid": os.getpid(), "identity": "not-the-real-identity"})
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
         lock.acquire()
         self.addCleanup(lock.release)
         self.assertTrue(lock.acquired)
 
     def test_inconsistent_pid_type_is_recovered(self) -> None:
         self._write_meta({"pid": "not-an-int", "identity": "whatever"})
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
         lock.acquire()
         self.addCleanup(lock.release)
         self.assertTrue(lock.acquired)
 
     def test_live_matching_owner_refuses_recovery(self) -> None:
-        self._write_meta({"pid": os.getpid(), "identity": cli.process_identity(os.getpid())})
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
-        with self.assertRaises(cli.RalphError) as caught:
+        self._write_meta({"pid": os.getpid(), "identity": process.process_identity(os.getpid())})
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(errors.RalphError) as caught:
             lock.acquire()
         self.assertIn("live matching owner", str(caught.exception))
         self.assertFalse(lock.acquired)
@@ -3163,8 +3163,8 @@ class WorktreeLockMetadataTest(unittest.TestCase):
         target = self.base / "outside.json"
         target.write_text("{}", encoding="utf-8")
         os.symlink(target, self.meta)
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
-        with self.assertRaises(cli.RalphError) as caught:
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(errors.RalphError) as caught:
             lock.acquire()
         self.assertIn("not a regular file", str(caught.exception))
         self.assertFalse(lock.acquired)
@@ -3173,20 +3173,20 @@ class WorktreeLockMetadataTest(unittest.TestCase):
         outside = self.base / "outside-root"
         outside.mkdir()
         os.symlink(outside, self.git_dir / "ralph")
-        lock = cli.WorktreeLock(self.git_dir, self.meta)
-        with self.assertRaises(cli.RalphError) as caught:
+        lock = locking.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(errors.RalphError) as caught:
             lock.acquire()
         self.assertIn("symlink", str(caught.exception))
         self.assertFalse(lock.acquired)
 
     def test_release_after_refused_recovery_leaves_lock_free(self) -> None:
-        self._write_meta({"pid": os.getpid(), "identity": cli.process_identity(os.getpid())})
-        first = cli.WorktreeLock(self.git_dir, self.meta)
-        with self.assertRaises(cli.RalphError):
+        self._write_meta({"pid": os.getpid(), "identity": process.process_identity(os.getpid())})
+        first = locking.WorktreeLock(self.git_dir, self.meta)
+        with self.assertRaises(errors.RalphError):
             first.acquire()
         # The exclusive flock was released, so a clean record can be recovered.
         self.meta.unlink()
-        second = cli.WorktreeLock(self.git_dir, self.meta)
+        second = locking.WorktreeLock(self.git_dir, self.meta)
         second.acquire()
         self.addCleanup(second.release)
         self.assertTrue(second.acquired)
@@ -3204,7 +3204,7 @@ class SandboxProfileTest(unittest.TestCase):
         self.session_tmp = Path("/private/var/session-tmp")
 
     def _opencode_profile(self) -> str:
-        return cli.build_sandbox_profile(
+        return launch.build_sandbox_profile(
             "opencode", self.worktree, self.ralph_dir, self.session_tmp, self.home
         )
 
@@ -3298,7 +3298,7 @@ class SandboxProfileTest(unittest.TestCase):
         # Regression anchor for #22: the same generator, backend-aware. For a
         # Claude run the in-scope store is ~/.claude (readable + write root) and
         # the out-of-scope store denied is the OpenCode auth file.
-        profile = cli.build_sandbox_profile(
+        profile = launch.build_sandbox_profile(
             "claude", self.worktree, self.ralph_dir, self.session_tmp, self.home
         )
         allowed = "\n".join(self._write_allow_lines(profile))
@@ -3329,7 +3329,7 @@ class SandboxProfileTest(unittest.TestCase):
 
     def test_profile_quotes_paths_with_spaces_and_metacharacters(self) -> None:
         worktree = Path('/work/pro"ject dir')
-        profile = cli.build_sandbox_profile(
+        profile = launch.build_sandbox_profile(
             "opencode", worktree, self.ralph_dir, self.session_tmp, self.home
         )
         # The double quote inside the path is backslash-escaped so the profile
@@ -3338,9 +3338,9 @@ class SandboxProfileTest(unittest.TestCase):
 
     def test_sandbox_exec_resolves_absolute_and_honors_override(self) -> None:
         with _patched_environ({}, remove=("RALPH_SANDBOX_EXEC",)):
-            self.assertEqual(cli.sandbox_exec_executable(), "/usr/bin/sandbox-exec")
+            self.assertEqual(launch.sandbox_exec_executable(), "/usr/bin/sandbox-exec")
         with _patched_environ({"RALPH_SANDBOX_EXEC": "/tmp/fake-sandbox-exec"}):
-            self.assertEqual(cli.sandbox_exec_executable(), "/tmp/fake-sandbox-exec")
+            self.assertEqual(launch.sandbox_exec_executable(), "/tmp/fake-sandbox-exec")
 
 
 @unittest.skipUnless(sys.platform == "darwin", "Seatbelt is macOS-only")
@@ -3377,7 +3377,7 @@ class SandboxRealProfileSmokeTest(unittest.TestCase):
         self.credential_probe.write_text("PROBE-LEAK\n", encoding="utf-8")
         self.profile = base / "sandbox.sb"
         self.profile.write_text(
-            cli.build_sandbox_profile(
+            launch.build_sandbox_profile(
                 "opencode", self.worktree, self.ralph_dir, self.session_tmp, self.home
             ),
             encoding="utf-8",
