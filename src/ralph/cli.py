@@ -11,16 +11,20 @@ Invariants:
   the worktree lock.
 - ``resume`` re-establishes the full Trust boundary (sanitized environment,
   per-session OAuth/routing proof, isolated configuration, full-auto permissions,
-  caffeinate) before ``exec``-ing the interactive backend, so recovery can never
-  inherit unsafe ambient routing. It resolves the Backend through the registry and
-  obtains its wrapped argv from ``launch.session_argv``, the one seam #19 edits.
+  caffeinate, and host isolation) before ``exec``-ing the interactive backend, so
+  recovery can never inherit unsafe ambient routing and is confined identically to
+  automated iterations (register D9). It resolves the Backend through the registry,
+  establishes the sandbox through ``launch.establish_sandbox`` (skipped only under
+  ``--unsafe-no-sandbox``), and obtains its wrapped argv from ``launch.session_argv``,
+  the one seam #19 edits.
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
 
 Depends on / must not know: the ``backends`` package (defaults, the registry, and
 the resolved Backend's five interface names), ``redaction`` (functions only),
-``gitcontext``, ``launch`` (``session_argv``), ``locking``, ``loop``, ``process``
+``gitcontext``, ``launch`` (``session_argv``, ``establish_sandbox``), ``locking``
+(the worktree lock and ``secure_state_directory``), ``loop``, ``process``
 (timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
 through the interface; it must not contain any Backend, Launch chain, or Loop
 mechanism of its own, nor branch on the backend name.
@@ -43,8 +47,8 @@ import sys
 from .backends import DEFAULT_MODELS, resolve
 from .errors import RalphError
 from .gitcontext import command, git_context, read_prompt
-from .launch import session_argv
-from .locking import WorktreeLock
+from .launch import establish_sandbox, session_argv
+from .locking import WorktreeLock, secure_state_directory
 from .loop import run_locked
 from .process import MAX_ITERATION_TIMEOUT_SECONDS
 from .redaction import collect_secrets, set_active_redactor
@@ -107,7 +111,7 @@ def clean(args: argparse.Namespace) -> int:
 def resume(args: argparse.Namespace) -> int:
     backend = resolve(args.backend)
     backend.validate_model(args.model)
-    worktree, _git_dir, _branch, _status, slug = git_context(args.worktree)
+    worktree, git_dir, _branch, _status, slug = git_context(args.worktree)
     # Re-establish the exact sanitized child environment and re-prove the
     # subscription trust boundary (OAuth, effective routing, model availability,
     # customization isolation) before any resumed model work. reject_unsafe_-
@@ -116,12 +120,27 @@ def resume(args: argparse.Namespace) -> int:
     env = backend.environment(args.model)
     set_active_redactor(collect_secrets())
     backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
-    # The Launch chain assembles the wrapped argv: caffeinate outermost, launched
-    # by absolute path exactly as automated iterations do (preflight has proved it
-    # exists). Holding the -im assertion for the interactive session's whole
-    # lifetime replaces Ralph's own loop-level assertion once control passes to the
-    # operator.
-    argv = session_argv(backend.resume_argv(worktree, args.model, args.session))
+    # Re-establish host isolation identically to automated iterations (register
+    # D9): the same generator and one-shot self-test, writing the concrete profile
+    # under the untracked .git/ralph (register D10), then wrapping it around the
+    # interactive argv via session_argv. --unsafe-no-sandbox relaxes only this,
+    # exactly as in `run`, so a session run unconfined resumes unconfined too.
+    sandbox_profile = establish_sandbox(
+        args.backend,
+        secure_state_directory(git_dir, "ralph", "resume"),
+        worktree,
+        git_dir / "ralph",
+        env,
+        no_sandbox=args.unsafe_no_sandbox,
+    )
+    # The Launch chain assembles the wrapped argv: caffeinate outermost, the
+    # sandbox-exec host-isolation wrap inside it, both launched by absolute path
+    # exactly as automated iterations do (preflight has proved caffeinate exists).
+    # Holding the -im assertion for the interactive session's whole lifetime
+    # replaces Ralph's own loop-level assertion once control passes to the operator.
+    argv = session_argv(
+        backend.resume_argv(worktree, args.model, args.session), sandbox_profile
+    )
     print(
         "WARNING: Ralph is relaunching the backend session in dangerous full-auto mode; "
         "it may edit files and run commands without confirmation.",
@@ -163,6 +182,16 @@ def parser() -> argparse.ArgumentParser:
             "agent isolation (unsafe)"
         ),
     )
+    run_parser.add_argument(
+        "--unsafe-no-sandbox",
+        action="store_true",
+        help=(
+            "disable host isolation: skip the Seatbelt sandbox wrap and its "
+            "self-test so the backend runs unconfined and may write outside the "
+            "worktree or read the operator's credentials (unsafe). Separate from "
+            "orthogonal to --unsafe-allow-agents; relaxes only host isolation"
+        ),
+    )
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")
     resume_parser = subcommands.add_parser(
@@ -180,6 +209,17 @@ def parser() -> argparse.ArgumentParser:
             ".claude/agents and the settings.json 'agent' key; OpenCode: the "
             "effective configuration's agent map); Ralph then cannot prove "
             "agent isolation (unsafe)"
+        ),
+    )
+    resume_parser.add_argument(
+        "--unsafe-no-sandbox",
+        action="store_true",
+        help=(
+            "disable host isolation: skip the Seatbelt sandbox wrap and its "
+            "self-test so the resumed backend runs unconfined and may write "
+            "outside the worktree or read the operator's credentials (unsafe). Separate "
+            "from and orthogonal to --unsafe-allow-agents; relaxes only host "
+            "isolation"
         ),
     )
     return result

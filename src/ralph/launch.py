@@ -58,6 +58,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 from typing import Callable
 
 from .errors import RalphError
@@ -128,6 +129,17 @@ SANDBOX_WRITE_PROBE = ".ralph-sandbox-selftest-write-probe"
 PROBE_BLOCKED = "blocked"
 PROBE_ALLOWED = "allowed"
 PROBE_UNAVAILABLE = "unavailable"
+
+# Loud stderr warning printed when `--unsafe-no-sandbox` relaxes host isolation
+# (register D7). It relaxes only host isolation: the sandbox wrap and its
+# self-test are skipped, so the backend runs unconfined and Ralph cannot prove
+# host isolation for the session. Every other guarantee — subscription-only
+# auth, customization isolation, redaction — is untouched.
+SANDBOX_DISABLED_WARNING = (
+    "WARNING: --unsafe-no-sandbox is set; Ralph is NOT proving host isolation for "
+    "this session. The backend runs unconfined and may write outside the worktree "
+    "or read the operator's credentials. No other guarantee is relaxed."
+)
 
 
 def caffeinate_executable() -> str:
@@ -246,7 +258,15 @@ def write_sandbox_profile(
     session_tmp = Path(env.get("TMPDIR") or "/tmp").resolve()
     profile_text = build_sandbox_profile(backend, worktree, ralph_dir, session_tmp, Path.home())
     path = run_dir / "sandbox.sb"
-    path.write_text(profile_text, encoding="utf-8")
+    try:
+        path.write_text(profile_text, encoding="utf-8")
+    except OSError as error:
+        # A profile that cannot be written means the boundary cannot be
+        # established: fail closed before any budget is spent (register D7)
+        # rather than launch the backend unconfined.
+        raise RalphError(
+            f"could not write the host-isolation sandbox profile: {error.strerror}"
+        ) from None
     return path
 
 
@@ -258,8 +278,9 @@ def sandbox_profile_for(
     # itself (register D6). Both OpenCode (#20) and Claude (#22) route through the
     # same backend-aware generator, so there is no per-backend fork here beyond the
     # deny/allow inputs `build_sandbox_profile` already keys off the backend name.
-    # The `--unsafe-no-sandbox` opt-out that can turn the wrap off lands in #23 at
-    # the loop layer; when it does, it will short-circuit before this call.
+    # The `--unsafe-no-sandbox` opt-out that can turn the wrap off is honored one
+    # level up in `establish_sandbox`, which short-circuits before ever calling
+    # this; a call here always means a confined session (register D7).
     return write_sandbox_profile(run_dir, backend, worktree, ralph_dir, env)
 
 
@@ -353,12 +374,45 @@ def run_sandbox_self_test(
             )
 
 
+def establish_sandbox(
+    backend: str,
+    run_dir: Path,
+    worktree: Path,
+    ralph_dir: Path,
+    env: dict[str, str],
+    *,
+    no_sandbox: bool,
+) -> Path | None:
+    # The single fail-closed gate that turns a session's host-isolation intent
+    # into a proven boundary, shared by automated iterations (`run`) and
+    # interactive recovery (`resume`) so both are confined identically (register
+    # D9). Absent the opt-out it generates the per-run profile and proves it
+    # actually bites via the one-shot self-test before any budget is spent
+    # (register D7/D8): a profile that cannot be built or written, or one that
+    # fails open, stops the session right here rather than launching unconfined.
+    # `--unsafe-no-sandbox` relaxes only host isolation (register D7): no profile,
+    # no self-test, and a loud warning that the boundary is unproven — every other
+    # guarantee (subscription-only auth, customization isolation, redaction) is
+    # untouched because this gate governs nothing else.
+    if no_sandbox:
+        print(SANDBOX_DISABLED_WARNING, file=sys.stderr)
+        return None
+    profile = sandbox_profile_for(backend, run_dir, worktree, ralph_dir, env)
+    run_sandbox_self_test(profile)
+    return profile
+
+
 def shell_command(args: list[str], worktree: Path) -> str:
     return f"cd {shlex.quote(str(worktree))} && {shlex.join(args)}"
 
 
 def resume_command(
-    backend: str, model: str, worktree: Path, session_id: str, allow_agents: bool = False
+    backend: str,
+    model: str,
+    worktree: Path,
+    session_id: str,
+    allow_agents: bool = False,
+    no_sandbox: bool = False,
 ) -> str:
     # A dedicated `ralph resume` re-establishes the full subscription trust
     # boundary (sanitized environment, per-session OAuth/routing proof, isolated
@@ -376,10 +430,15 @@ def resume_command(
         "--worktree",
         str(worktree),
     ]
-    # Reproduce the relaxed check so the handoff can re-prove the same boundary;
-    # without it resume would refuse the very agents the run was allowed.
+    # Reproduce each relaxed check so the handoff re-establishes the identical
+    # boundary; the two unsafe flags are orthogonal and reproduce independently
+    # (register D7). Without --unsafe-allow-agents resume would refuse the very
+    # agents the run allowed; without --unsafe-no-sandbox it would re-confine a
+    # session the operator deliberately ran unconfined. --session stays last.
     if allow_agents:
         args.append("--unsafe-allow-agents")
+    if no_sandbox:
+        args.append("--unsafe-no-sandbox")
     args += ["--session", session_id]
     return shell_command(args, worktree)
 
@@ -392,6 +451,7 @@ def restart_command(
     remaining: int,
     timeout: float,
     allow_agents: bool = False,
+    no_sandbox: bool = False,
 ) -> str:
     args = [
         "ralph",
@@ -408,8 +468,12 @@ def restart_command(
         "--timeout",
         str(timeout),
     ]
+    # Each unsafe flag reproduces independently so the replacement run re-proves
+    # the same relaxed boundary and nothing more (register D7).
     if allow_agents:
         args.append("--unsafe-allow-agents")
+    if no_sandbox:
+        args.append("--unsafe-no-sandbox")
     return shell_command(args, worktree)
 
 

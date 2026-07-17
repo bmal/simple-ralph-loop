@@ -14,12 +14,13 @@ Invariants:
 - The loop holds a resolved ``Backend`` and drives it only through the Backend
   Protocol (here ``environment``, ``preflight``, and ``execute_iteration``); it never
   names a concrete backend, so it cannot tell the two apart (register E2, user story
-  6). The
-  once-per-run host-isolation profile comes from ``launch.sandbox_profile_for``,
-  which owns the decision of which backends run confined; when a profile is
-  generated the loop runs ``launch.run_sandbox_self_test`` once, before the first
-  iteration, and stops fail-closed if the profile does not actually bite (register
-  D8).
+  6). Host isolation is established once per run through ``launch.establish_sandbox``,
+  the shared fail-closed gate that generates the profile and proves it bites via
+  the self-test before the first iteration (register D8) — or, under
+  ``--unsafe-no-sandbox``, returns no profile so the backend runs unconfined
+  (register D7). The loop threads ``args.unsafe_no_sandbox`` into that gate and
+  into ``print_handoff`` so recovery reproduces the opt-out, and governs nothing
+  else about host isolation.
 
 Depends on / must not know: ``redaction`` (functions only), ``locking``,
 ``gitcontext``, ``launch``, ``errors``, and a resolved ``Backend`` (``cli`` resolves
@@ -46,10 +47,9 @@ from .errors import HandoffError, RalphError, StartedIterationError
 from .gitcontext import command, write_json
 from .launch import (
     CaffeinateAssertion,
+    establish_sandbox,
     resume_command,
     restart_command,
-    run_sandbox_self_test,
-    sandbox_profile_for,
 )
 from .locking import secure_state_directory
 from .redaction import collect_secrets, redact, set_active_redactor
@@ -86,6 +86,7 @@ def print_handoff(
     run_id: str,
     timeout: float,
     allow_agents: bool = False,
+    no_sandbox: bool = False,
 ) -> None:
     terminal = sys.stderr.isatty()
     if terminal:
@@ -101,14 +102,15 @@ def print_handoff(
         # Without a session id there is nothing to resume; the operator handoff
         # still prints the remaining-budget command so the loop can continue.
         print(
-            f"manual resume: {resume_command(backend, model, worktree, session_id, allow_agents)}",
+            "manual resume: "
+            f"{resume_command(backend, model, worktree, session_id, allow_agents, no_sandbox)}",
             file=sys.stderr,
         )
     print(f"iterations remaining: {remaining}", file=sys.stderr)
     if remaining:
         print(
             "continue Ralph: "
-            f"{restart_command(backend, model, worktree, prompt_path, remaining, timeout, allow_agents)}",
+            f"{restart_command(backend, model, worktree, prompt_path, remaining, timeout, allow_agents, no_sandbox)}",
             file=sys.stderr,
         )
     else:
@@ -190,20 +192,21 @@ def run_protected(
         },
     )
     (run_dir / "git-status.txt").write_text(status, encoding="utf-8")
-    # Generate the host-isolation profile once per run (stable across
-    # iterations) and confine the backend under it (register D2/D6). Both
-    # backends are wrapped uniformly (#20 OpenCode, #22 Claude); the
-    # --unsafe-no-sandbox opt-out (#23) builds on this shared launcher.
-    sandbox_profile = sandbox_profile_for(
-        args.backend, run_dir, worktree, git_dir / "ralph", env
+    # Establish host isolation once per run (the profile is stable across
+    # iterations): generate the per-run profile and prove it actually bites via
+    # the one-shot self-test before any budget is spent, or stop fail-closed here
+    # (register D2/D6/D8) — exactly as the caffeinate startup assertion gates the
+    # whole loop. Both backends are wrapped uniformly (#20 OpenCode, #22 Claude);
+    # `--unsafe-no-sandbox` relaxes only this, returning no profile so the shared
+    # Launch chain runs the backend unconfined (register D7).
+    sandbox_profile = establish_sandbox(
+        args.backend,
+        run_dir,
+        worktree,
+        git_dir / "ralph",
+        env,
+        no_sandbox=args.unsafe_no_sandbox,
     )
-    if sandbox_profile is not None:
-        # Prove the profile actually bites before spending any budget (register
-        # D8): a denied read and a denied write must both fail under it, or the
-        # run stops fail-closed here — once per run, since the profile is stable
-        # across iterations, exactly as the caffeinate startup assertion gates
-        # the whole loop.
-        run_sandbox_self_test(sandbox_profile)
     started = datetime.now(timezone.utc).isoformat()
     iterations: list[dict[str, Any]] = []
     session_id: str | None = None
@@ -279,6 +282,7 @@ def run_protected(
             run_id=run_dir.name,
             timeout=args.timeout,
             allow_agents=args.unsafe_allow_agents,
+            no_sandbox=args.unsafe_no_sandbox,
         )
         return 2
     except StartedIterationError as error:
@@ -320,6 +324,7 @@ def run_protected(
             run_id=run_dir.name,
             timeout=args.timeout,
             allow_agents=args.unsafe_allow_agents,
+            no_sandbox=args.unsafe_no_sandbox,
         )
         return 2
     except RalphError:

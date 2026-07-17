@@ -3,7 +3,9 @@ interpolates, backend-aware store handling, and a real Seatbelt smoke test."""
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import io
 from pathlib import Path
 import os
 import shlex
@@ -312,6 +314,75 @@ class SandboxSelfTestDecisionTest(unittest.TestCase):
             with mock.patch.object(launch.subprocess, "run", fake_run):
                 launch.default_sandbox_probe(self.PROFILE, "read", home=home)
         self.assertIn(str(home / "Library" / "Keychains"), " ".join(captured[0]))
+
+
+class SandboxEstablishmentTest(unittest.TestCase):
+    """The shared fail-closed gate (register D7/D9): it generates and self-tests
+    the profile, fails closed when the profile cannot be written, and — under the
+    --unsafe-no-sandbox opt-out — returns no profile with a loud warning while
+    touching nothing else."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.run_dir = base / "run"
+        self.run_dir.mkdir()
+        self.worktree = base / "worktree"
+        self.worktree.mkdir()
+        self.ralph_dir = base / "ralph"
+        self.ralph_dir.mkdir()
+        self.env = {"TMPDIR": str(base / "tmp")}
+
+    def _establish(self, *, no_sandbox: bool) -> tuple[object, str]:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            profile = launch.establish_sandbox(
+                "opencode",
+                self.run_dir,
+                self.worktree,
+                self.ralph_dir,
+                self.env,
+                no_sandbox=no_sandbox,
+            )
+        return profile, stderr.getvalue()
+
+    def test_opt_out_returns_no_profile_and_warns_loudly(self) -> None:
+        with mock.patch.object(launch, "run_sandbox_self_test") as self_test:
+            profile, warning = self._establish(no_sandbox=True)
+        self.assertIsNone(profile)
+        # No profile file is written and the self-test never runs.
+        self.assertFalse((self.run_dir / "sandbox.sb").exists())
+        self_test.assert_not_called()
+        self.assertIn("--unsafe-no-sandbox is set", warning)
+        self.assertIn("NOT proving host isolation", warning)
+
+    def test_default_generates_the_profile_and_runs_the_self_test(self) -> None:
+        with mock.patch.object(launch, "run_sandbox_self_test") as self_test:
+            profile, warning = self._establish(no_sandbox=False)
+        self.assertEqual(profile, self.run_dir / "sandbox.sb")
+        self.assertTrue(profile.is_file())
+        # The generated profile is proven before the caller can use it.
+        self_test.assert_called_once_with(profile)
+        self.assertEqual(warning, "")
+
+    def test_fails_closed_when_the_profile_cannot_be_written(self) -> None:
+        # A run directory that does not exist makes the profile unwritable; the
+        # gate fails closed with a RalphError rather than returning an unusable
+        # (or absent) profile, so no budget is spent unconfined.
+        missing_run_dir = Path(self.temp.name) / "does-not-exist"
+        with mock.patch.object(launch, "run_sandbox_self_test") as self_test:
+            with self.assertRaises(RalphError) as caught:
+                launch.establish_sandbox(
+                    "opencode",
+                    missing_run_dir,
+                    self.worktree,
+                    self.ralph_dir,
+                    self.env,
+                    no_sandbox=False,
+                )
+        self.assertIn("sandbox profile", str(caught.exception))
+        self_test.assert_not_called()
 
 
 @unittest.skipUnless(sys.platform == "darwin", "Seatbelt is macOS-only")
