@@ -16,7 +16,10 @@ Invariants:
   names a concrete backend, so it cannot tell the two apart (register E2, user story
   6). The
   once-per-run host-isolation profile comes from ``launch.sandbox_profile_for``,
-  which owns the decision of which backends run confined.
+  which owns the decision of which backends run confined; when a profile is
+  generated the loop runs ``launch.run_sandbox_self_test`` once, before the first
+  iteration, and stops fail-closed if the profile does not actually bite (register
+  D8).
 
 Depends on / must not know: ``redaction`` (functions only), ``locking``,
 ``gitcontext``, ``launch``, ``errors``, and a resolved ``Backend`` (``cli`` resolves
@@ -45,6 +48,7 @@ from .launch import (
     CaffeinateAssertion,
     resume_command,
     restart_command,
+    run_sandbox_self_test,
     sandbox_profile_for,
 )
 from .locking import secure_state_directory
@@ -188,11 +192,18 @@ def run_protected(
     (run_dir / "git-status.txt").write_text(status, encoding="utf-8")
     # Generate the host-isolation profile once per run (stable across
     # iterations) and confine the backend under it (register D2/D6). #20 wraps
-    # OpenCode; the Claude wrap (#22) and the --unsafe-no-sandbox opt-out with
-    # its fail-closed self-test (#21/#23) build on this shared launcher.
+    # OpenCode; the Claude wrap (#22) and the --unsafe-no-sandbox opt-out (#23)
+    # build on this shared launcher.
     sandbox_profile = sandbox_profile_for(
         args.backend, run_dir, worktree, git_dir / "ralph", env
     )
+    if sandbox_profile is not None:
+        # Prove the profile actually bites before spending any budget (register
+        # D8): a denied read and a denied write must both fail under it, or the
+        # run stops fail-closed here — once per run, since the profile is stable
+        # across iterations, exactly as the caffeinate startup assertion gates
+        # the whole loop.
+        run_sandbox_self_test(sandbox_profile)
     started = datetime.now(timezone.utc).isoformat()
     iterations: list[dict[str, Any]] = []
     session_id: str | None = None

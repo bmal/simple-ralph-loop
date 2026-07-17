@@ -10,7 +10,9 @@ recovery commands that must reproduce its flags live together. ``session_argv`` 
 the single point the two Backend adapters and ``cli.resume`` assemble the wrapped
 argv, and ``sandbox_profile_for`` is the single place the per-run host-isolation
 profile is generated — OpenCode today, with the Claude wrap landing in #22 as the
-edit that drops that gate.
+edit that drops that gate. ``run_sandbox_self_test`` is the one-shot proof (#21)
+that the generated profile actually bites — a denied read and a denied write must
+both fail — that the Loop runs once per run before spending budget.
 
 Invariants:
 - ``caffeinate`` and ``sandbox-exec`` are always resolved by absolute path, never
@@ -28,6 +30,13 @@ Invariants:
   allowed back after the keychain deny so the allow wins (owner-amended D4).
 - The concrete filled-in profile is written only under the untracked ``.git/ralph``
   run directory (D10); tracked source holds only the universal generator.
+- ``run_sandbox_self_test`` fails closed before any budget is spent (register D8):
+  a denied read and a denied write must both be observed to fail under the
+  generated profile, or the run stops — a profile that permits either (parsed but
+  failed open) or a probe that cannot run at all is refused. The probe runner is
+  injectable, and ``default_sandbox_probe``'s ``home`` argument is an internal
+  test seam (the qualification smoke points the probes at a hermetic home); like
+  the ``RALPH_*`` overrides, production supplies neither.
 - Recovery commands route through ``ralph resume`` / ``ralph run`` so replayed
   recovery re-establishes the full Trust boundary rather than inheriting the
   operator's ambient environment; ``--unsafe-allow-agents`` is reproduced so resume
@@ -49,6 +58,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+from typing import Callable
 
 from .errors import RalphError
 
@@ -105,6 +115,19 @@ SANDBOX_DENY_READ_BROWSER_DIRS = (
 # accidental read yields ciphertext; deliberate securityd harvesting is malice,
 # which register D1 scopes out. Every other keychain stays denied.
 SANDBOX_LOGIN_KEYCHAIN = "Library/Keychains/login.keychain-db"
+
+# The self-test's write probe target: a file directly under the operator's home
+# root, which is never one of the four sanctioned write roots, so a profile that
+# bites refuses the create (register D8). Named distinctively so an accidental
+# leftover left by a fail-open profile is unmistakable.
+SANDBOX_WRITE_PROBE = ".ralph-sandbox-selftest-write-probe"
+
+# Self-test probe outcomes: the sandbox refused the operation (the profile bit),
+# permitted it (the profile parsed but failed open), or the probe could not be
+# run at all. Anything but BLOCKED stops the run fail-closed before budget.
+PROBE_BLOCKED = "blocked"
+PROBE_ALLOWED = "allowed"
+PROBE_UNAVAILABLE = "unavailable"
 
 
 def caffeinate_executable() -> str:
@@ -238,6 +261,96 @@ def sandbox_profile_for(
     if backend != "opencode":
         return None
     return write_sandbox_profile(run_dir, backend, worktree, ralph_dir, env)
+
+
+def _existing_denied_read_dir(home: Path) -> Path:
+    # The read probe must target a deny-listed directory that actually exists, or
+    # a fail-open profile (which would let the read through) is indistinguishable
+    # from a plain "no such file". Prefer whichever famous credential directory is
+    # present on this machine, so the probe is non-vacuous in essentially every
+    # real case; fall back to ~/Library/Keychains, which is denied wholesale
+    # (login.keychain-db is allowed back by exact path, but listing the directory
+    # still needs read on the directory itself) and is present on any macOS login
+    # account. In the vanishing case where none exist the read degrades to a plain
+    # failure, but the write probe still catches a fail-open profile.
+    keychains = home / "Library" / "Keychains"
+    for relative in SANDBOX_DENY_READ_DIRS + SANDBOX_DENY_READ_BROWSER_DIRS:
+        candidate = home / relative
+        if candidate.is_dir():
+            return candidate
+    return keychains
+
+
+def _sandbox_probe_command(kind: str, home: Path) -> list[str]:
+    # The concrete probe a self-test runs under the generated profile. Both are
+    # non-vacuous: outside the sandbox each operation genuinely succeeds, so a
+    # profile that failed open is distinguishable from one that bit.
+    if kind == "read":
+        # A denied read of an existing, deny-listed path (register D4).
+        return ["/bin/ls", "--", str(_existing_denied_read_dir(home))]
+    # A denied write outside the sanctioned roots (register D3): the home root is
+    # never a write root, so a profile that bites refuses the create.
+    return ["/bin/sh", "-c", f"printf x > {shlex.quote(str(home / SANDBOX_WRITE_PROBE))}"]
+
+
+def default_sandbox_probe(profile: Path, kind: str, home: Path | None = None) -> str:
+    # Run one self-test probe under the generated profile via `sandbox-exec -f
+    # <profile>` (register D8), resolved by absolute path exactly like the launch
+    # wrap so a PATH-shadowed launcher cannot answer for the boundary. Returns
+    # whether the sandbox refused the operation (PROBE_BLOCKED), permitted it
+    # (PROBE_ALLOWED — the profile failed open), or could not be run at all
+    # (PROBE_UNAVAILABLE). The `home` seam lets the qualification smoke point the
+    # probes at a hermetic synthetic home; production reads the operator's own.
+    home = home or Path.home()
+    command = _sandbox_probe_command(kind, home)
+    try:
+        result = subprocess.run(
+            [sandbox_exec_executable(), "-f", str(profile), *command],
+            capture_output=True,
+            text=True,
+            # A probe that cannot be launched, or hangs, must fail closed rather
+            # than stall the pre-loop gate: the probe itself is trivial (list a
+            # directory / attempt one write), so a generous ceiling only ever
+            # trips on a wedged launcher.
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return PROBE_UNAVAILABLE
+    permitted = result.returncode == 0
+    if kind == "write" and permitted:
+        # A fail-open profile actually created the probe file; remove it so a
+        # broken sandbox does not also litter the operator's home.
+        try:
+            (home / SANDBOX_WRITE_PROBE).unlink()
+        except OSError:
+            pass
+    return PROBE_ALLOWED if permitted else PROBE_BLOCKED
+
+
+def run_sandbox_self_test(
+    profile: Path, runner: Callable[[Path, str], str] | None = None
+) -> None:
+    # The one-shot proof that the generated profile actually bites before any
+    # budget is spent (register D8): a denied read and a denied write must both be
+    # observed to fail under the profile. If either is permitted (the profile
+    # parsed but failed open) or a probe cannot be run at all, the run stops
+    # fail-closed with a clear error, exactly as the caffeinate startup assertion
+    # does — Ralph never spends budget on an unproven sandbox. The probe runner is
+    # injectable so a test can feed a deterministic outcome without a real kernel;
+    # production uses `default_sandbox_probe`, which probes via `sandbox-exec`.
+    probe = runner or default_sandbox_probe
+    for kind in ("read", "write"):
+        outcome = probe(profile, kind)
+        if outcome == PROBE_ALLOWED:
+            raise RalphError(
+                f"host isolation self-test failed open: the sandbox permitted a denied "
+                f"{kind}, so Ralph cannot prove host isolation; refusing to spend budget"
+            )
+        if outcome != PROBE_BLOCKED:
+            raise RalphError(
+                f"host isolation self-test could not run its {kind} probe under "
+                "sandbox-exec; refusing to spend budget on an unproven sandbox"
+            )
 
 
 def shell_command(args: list[str], worktree: Path) -> str:

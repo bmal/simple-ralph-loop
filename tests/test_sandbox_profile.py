@@ -3,6 +3,7 @@ interpolates, backend-aware store handling, and a real Seatbelt smoke test."""
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 import os
 import shlex
@@ -11,10 +12,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ralph import launch  # noqa: E402  (import after sys.path is extended)
+from ralph.errors import RalphError  # noqa: E402
 
 
 class SandboxProfileTest(unittest.TestCase):
@@ -166,6 +169,216 @@ class SandboxProfileTest(unittest.TestCase):
             self.assertEqual(launch.sandbox_exec_executable(), "/usr/bin/sandbox-exec")
         with _patched_environ({"RALPH_SANDBOX_EXEC": "/tmp/fake-sandbox-exec"}):
             self.assertEqual(launch.sandbox_exec_executable(), "/tmp/fake-sandbox-exec")
+
+
+class SandboxSelfTestDecisionTest(unittest.TestCase):
+    """The self-test decision (register D8), driven through the injectable probe
+    runner so it is deterministic and depends on no host state. It proceeds only
+    when both a denied read and a denied write are observed to fail, and stops
+    fail-closed on any other outcome."""
+
+    PROFILE = Path("/work/project/.git/ralph/runs/run-1/sandbox.sb")
+
+    def _runner(self, outcomes: dict[str, str]):
+        # A fake probe runner: it records the (profile, kind) it was asked about
+        # and returns the canned outcome for that kind, missing kinds defaulting
+        # to a blocked (good) probe.
+        calls: list[tuple[Path, str]] = []
+
+        def runner(profile: Path, kind: str) -> str:
+            calls.append((profile, kind))
+            return outcomes.get(kind, launch.PROBE_BLOCKED)
+
+        return runner, calls
+
+    def test_proceeds_only_when_both_probes_are_blocked(self) -> None:
+        runner, calls = self._runner(
+            {"read": launch.PROBE_BLOCKED, "write": launch.PROBE_BLOCKED}
+        )
+        # No exception means the run is cleared to proceed.
+        launch.run_sandbox_self_test(self.PROFILE, runner=runner)
+        # Exactly one read probe and one write probe, both against the profile —
+        # the self-test runs once, not per probe kind more than once.
+        self.assertEqual(calls, [(self.PROFILE, "read"), (self.PROFILE, "write")])
+
+    def test_a_permitted_read_fails_closed_before_the_write_probe(self) -> None:
+        runner, calls = self._runner({"read": launch.PROBE_ALLOWED})
+        with self.assertRaises(RalphError) as caught:
+            launch.run_sandbox_self_test(self.PROFILE, runner=runner)
+        self.assertIn("failed open", str(caught.exception))
+        self.assertIn("read", str(caught.exception))
+        # It stops at the first fail-open probe and never reaches the write probe.
+        self.assertEqual(calls, [(self.PROFILE, "read")])
+
+    def test_a_permitted_write_fails_closed(self) -> None:
+        runner, _calls = self._runner({"write": launch.PROBE_ALLOWED})
+        with self.assertRaises(RalphError) as caught:
+            launch.run_sandbox_self_test(self.PROFILE, runner=runner)
+        self.assertIn("failed open", str(caught.exception))
+        self.assertIn("write", str(caught.exception))
+
+    def test_an_unrunnable_probe_fails_closed(self) -> None:
+        runner, _calls = self._runner({"read": launch.PROBE_UNAVAILABLE})
+        with self.assertRaises(RalphError) as caught:
+            launch.run_sandbox_self_test(self.PROFILE, runner=runner)
+        self.assertIn("could not run", str(caught.exception))
+
+    def test_default_probe_invokes_sandbox_exec_by_absolute_path(self) -> None:
+        # The real probe must launch `sandbox-exec -f <profile>` by absolute path
+        # (never a PATH lookup) and interpret a non-zero exit as a blocked probe.
+        captured: list[list[str]] = []
+
+        class _Completed:
+            returncode = 1
+
+        def fake_run(argv, **_kwargs):
+            captured.append(argv)
+            return _Completed()
+
+        with mock.patch.object(launch.subprocess, "run", fake_run), _patched_environ(
+            {"RALPH_SANDBOX_EXEC": "/opt/sbx"}
+        ):
+            outcome = launch.default_sandbox_probe(
+                self.PROFILE, "read", home=Path("/Users/tester")
+            )
+        self.assertEqual(outcome, launch.PROBE_BLOCKED)
+        argv = captured[0]
+        self.assertEqual(argv[:3], ["/opt/sbx", "-f", str(self.PROFILE)])
+        self.assertIn("/Users/tester/Library/Keychains", " ".join(argv))
+
+    def test_default_probe_reports_a_zero_exit_as_permitted(self) -> None:
+        class _Completed:
+            returncode = 0
+
+        with mock.patch.object(launch.subprocess, "run", lambda *a, **k: _Completed()):
+            outcome = launch.default_sandbox_probe(
+                self.PROFILE, "read", home=Path("/Users/tester")
+            )
+        self.assertEqual(outcome, launch.PROBE_ALLOWED)
+
+    def test_default_probe_reports_a_launch_failure_as_unavailable(self) -> None:
+        def boom(*_a, **_k):
+            raise FileNotFoundError("no sandbox-exec")
+
+        with mock.patch.object(launch.subprocess, "run", boom):
+            outcome = launch.default_sandbox_probe(
+                self.PROFILE, "write", home=Path("/Users/tester")
+            )
+        self.assertEqual(outcome, launch.PROBE_UNAVAILABLE)
+
+    def test_default_probe_treats_a_wedged_launcher_as_unavailable(self) -> None:
+        # A sandbox-exec that hangs must fail closed, not stall the pre-loop gate.
+        def hang(*_a, **_k):
+            raise subprocess.TimeoutExpired(cmd="sandbox-exec", timeout=30)
+
+        with mock.patch.object(launch.subprocess, "run", hang):
+            outcome = launch.default_sandbox_probe(
+                self.PROFILE, "read", home=Path("/Users/tester")
+            )
+        self.assertEqual(outcome, launch.PROBE_UNAVAILABLE)
+
+    def test_read_probe_targets_an_existing_denied_directory(self) -> None:
+        # The read probe is non-vacuous: it lists whichever famous credential
+        # directory actually exists, so a fail-open profile is distinguishable
+        # from a plain "no such file".
+        with tempfile.TemporaryDirectory() as name:
+            home = Path(name)
+            (home / ".ssh").mkdir()
+            captured: list[list[str]] = []
+
+            class _Completed:
+                returncode = 1
+
+            def fake_run(argv, **_kwargs):
+                captured.append(argv)
+                return _Completed()
+
+            with mock.patch.object(launch.subprocess, "run", fake_run):
+                launch.default_sandbox_probe(self.PROFILE, "read", home=home)
+        self.assertIn(str(home / ".ssh"), " ".join(captured[0]))
+
+    def test_read_probe_falls_back_to_keychains_when_none_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            home = Path(name)  # empty: no famous credential directory present
+            captured: list[list[str]] = []
+
+            class _Completed:
+                returncode = 1
+
+            def fake_run(argv, **_kwargs):
+                captured.append(argv)
+                return _Completed()
+
+            with mock.patch.object(launch.subprocess, "run", fake_run):
+                launch.default_sandbox_probe(self.PROFILE, "read", home=home)
+        self.assertIn(str(home / "Library" / "Keychains"), " ".join(captured[0]))
+
+
+@unittest.skipUnless(sys.platform == "darwin", "Seatbelt is macOS-only")
+class SandboxSelfTestSmokeTest(unittest.TestCase):
+    """Make-or-break qualification of the real self-test against the live
+    `/usr/bin/sandbox-exec` (register D8). No language model and no subscription
+    spend: it proves the real probe runner clears a correct profile and stops
+    fail-closed under a deliberately-open one."""
+
+    SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+    def setUp(self) -> None:
+        if not Path(self.SANDBOX_EXEC).is_file():
+            raise AssertionError(
+                "/usr/bin/sandbox-exec is required for the host-isolation self-test "
+                "smoke and must not be silently skipped on macOS"
+            )
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.worktree = base / "worktree"
+        self.worktree.mkdir()
+        self.ralph_dir = base / "ralph"
+        self.ralph_dir.mkdir()
+        # A dedicated session tmp under the temp base so the synthetic home — and
+        # thus the write probe target under it — is genuinely outside every
+        # sanctioned write root (were session tmp the real TMPDIR the temp base
+        # would sit inside it and the "escape" write would be sanctioned).
+        self.session_tmp = base / "session-tmp"
+        self.session_tmp.mkdir()
+        self.home = base / "home"
+        # The read probe lists ~/Library/Keychains; create it so the probe is
+        # non-vacuous — an open profile really returns its (empty) listing.
+        (self.home / "Library" / "Keychains").mkdir(parents=True)
+        self.probe = functools.partial(launch.default_sandbox_probe, home=self.home)
+        self.correct_profile = base / "sandbox.sb"
+        self.correct_profile.write_text(
+            launch.build_sandbox_profile(
+                "opencode", self.worktree, self.ralph_dir, self.session_tmp, self.home
+            ),
+            encoding="utf-8",
+        )
+        # A profile that parses cleanly but confines nothing — the fail-open case.
+        self.open_profile = base / "open.sb"
+        self.open_profile.write_text("(version 1)\n(allow default)\n", encoding="utf-8")
+
+    def test_self_test_clears_a_correct_profile(self) -> None:
+        # Both probes are refused by the real kernel, so the self-test raises
+        # nothing and the run would be cleared to proceed.
+        launch.run_sandbox_self_test(self.correct_profile, runner=self.probe)
+        # And it left no probe file behind under the synthetic home.
+        self.assertFalse((self.home / launch.SANDBOX_WRITE_PROBE).exists())
+
+    def test_self_test_fails_closed_under_a_deliberately_open_profile(self) -> None:
+        with self.assertRaises(RalphError) as caught:
+            launch.run_sandbox_self_test(self.open_profile, runner=self.probe)
+        self.assertIn("failed open", str(caught.exception))
+        # The write probe the open profile permitted is cleaned up, not littered.
+        self.assertFalse((self.home / launch.SANDBOX_WRITE_PROBE).exists())
+
+    def test_real_probes_distinguish_blocked_from_permitted(self) -> None:
+        # The runner itself, exercised directly, reports the kernel's verdict.
+        self.assertEqual(self.probe(self.correct_profile, "read"), launch.PROBE_BLOCKED)
+        self.assertEqual(self.probe(self.correct_profile, "write"), launch.PROBE_BLOCKED)
+        self.assertEqual(self.probe(self.open_profile, "read"), launch.PROBE_ALLOWED)
+        self.assertEqual(self.probe(self.open_profile, "write"), launch.PROBE_ALLOWED)
+        self.assertFalse((self.home / launch.SANDBOX_WRITE_PROBE).exists())
 
 
 @unittest.skipUnless(sys.platform == "darwin", "Seatbelt is macOS-only")

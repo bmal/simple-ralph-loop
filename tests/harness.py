@@ -86,6 +86,24 @@ class RalphCliTestCase(unittest.TestCase):
             printf '%s\\n' "$*" >> "$FAKE_CALLS/sandbox-exec"
             test "$1" = "-f"
             shift 2
+            # The one-shot host-isolation self-test (register D8) probes the
+            # profile through sandbox-exec too. This fake cannot enforce Seatbelt,
+            # so it *simulates* the kernel's verdict for a recognizable probe: a
+            # correct profile refuses the denied read (~/Library/Keychains) and
+            # the denied write (the self-test write probe), exiting non-zero,
+            # unless a test opts that probe open via FAKE_SELFTEST_ALLOW. Every
+            # other invocation is a real backend launch and is exec'd unchanged.
+            probe=""
+            case "$*" in
+              *.ralph-sandbox-selftest-write-probe*) probe=write ;;
+              *Library/Keychains*) probe=read ;;
+            esac
+            if test -n "$probe"; then
+              case " ${FAKE_SELFTEST_ALLOW:-} " in
+                *" $probe "*) exit 0 ;;
+              esac
+              exit 1
+            fi
             exec "$@"
             """,
         )
