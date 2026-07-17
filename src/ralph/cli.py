@@ -34,6 +34,52 @@ MAX_PROMPT_BYTES = 10 * 1024 * 1024
 # is an internal test seam that lets the suite substitute a fake; production
 # runs never set it and always use the system binary.
 DEFAULT_CAFFEINATE = "/usr/bin/caffeinate"
+# Absolute path to the macOS Seatbelt launcher. Resolved by absolute path (never
+# through PATH) so a shadowed `sandbox-exec` cannot silently replace the host
+# isolation boundary, exactly as DEFAULT_CAFFEINATE is treated. RALPH_SANDBOX_EXEC
+# is an internal test seam that lets the suite substitute a fake; production runs
+# never set it and always use the system binary.
+DEFAULT_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# Famous credential paths made unreadable to a backend session (register D4).
+# This is deliberately the well-known set, not a completeness guarantee: a
+# credential in an unanticipated path stays readable, and the README says so.
+# Directory trees denied wholesale, relative to the operator's home.
+SANDBOX_DENY_READ_DIRS = (
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".config/gcloud",
+)
+# Single credential files denied by exact path (denying a parent would also hide
+# in-scope siblings such as ~/.config/gh or ~/.docker/ contexts).
+SANDBOX_DENY_READ_FILES = (
+    ".netrc",
+    ".docker/config.json",
+    ".npmrc",
+    ".pypirc",
+)
+# Browser profile stores holding saved passwords, cookies, and sessions. Famous
+# paths only, consistent with the non-exhaustive framing above.
+SANDBOX_DENY_READ_BROWSER_DIRS = (
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/Arc",
+    "Library/Application Support/Vivaldi",
+    "Library/Safari",
+)
+# The macOS login keychain database. It is denied as part of ~/Library/Keychains
+# but allowed back by exact path (register D4, amended by the owner on
+# 2026-07-17): on a default macOS install gh stores its in-scope GitHub token in
+# this single file, and it cannot be separated from the operator's other keychain
+# secrets at the filesystem layer. The file is encrypted at rest, so an
+# accidental read yields ciphertext; deliberate securityd harvesting is malice,
+# which register D1 scopes out. Every other keychain stays denied.
+SANDBOX_LOGIN_KEYCHAIN = "Library/Keychains/login.keychain-db"
 # Host locations consulted to detect MDM-managed Claude configuration. Both are
 # absolute system paths in production; dedicated test seams (see
 # claude_managed_root / claude_profiles_executable) let the suite isolate the
@@ -229,6 +275,110 @@ def caffeinate_executable() -> str:
     # Always an absolute path so the sleep assertion cannot be satisfied by a
     # PATH-shadowed executable. RALPH_CAFFEINATE is honored only as a test seam.
     return os.environ.get("RALPH_CAFFEINATE") or DEFAULT_CAFFEINATE
+
+
+def sandbox_exec_executable() -> str:
+    # Always an absolute path so host isolation cannot be defeated by a
+    # PATH-shadowed `sandbox-exec`. RALPH_SANDBOX_EXEC is honored only as a test
+    # seam; production runs always use the system binary.
+    return os.environ.get("RALPH_SANDBOX_EXEC") or DEFAULT_SANDBOX_EXEC
+
+
+def _sandbox_quote(path: Path) -> str:
+    # Seatbelt profile strings are double-quoted; backslash-escape the two
+    # characters that would otherwise terminate or corrupt the string so a
+    # worktree path containing a space or a quote stays parseable. Only paths are
+    # ever interpolated — never a secret (register D10).
+    text = str(path)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_sandbox_profile(
+    backend: str,
+    worktree: Path,
+    ralph_dir: Path,
+    session_tmp: Path,
+    home: Path,
+) -> str:
+    # Produce the Seatbelt (`sandbox-exec`) profile text confining a backend
+    # session (register D2/D3/D4/D5/D10). Pure: it maps already-resolved absolute
+    # paths plus the backend name to policy text and consults nothing else, so no
+    # secret can be interpolated and the same inputs always yield the same
+    # profile. Reads stay permissive with a deny-list of famous credential paths;
+    # writes are an allow-list of the sanctioned roots; network egress is
+    # unrestricted. The deny-list is backend-aware: the *other* backend's auth
+    # store is denied while the running backend's own store stays readable (D4).
+    if backend == "claude":
+        backend_store = home / ".claude"
+        # The out-of-scope OpenCode credential is a single file; deny it exactly.
+        out_of_scope_deny = f'(deny file-read* (literal {_sandbox_quote(home / ".local/share/opencode/auth.json")}))'
+    else:
+        backend_store = home / ".local/share/opencode"
+        # The out-of-scope Claude store is a directory tree; deny it wholesale.
+        out_of_scope_deny = f'(deny file-read* (subpath {_sandbox_quote(home / ".claude")}))'
+
+    lines = [
+        "(version 1)",
+        ";; Ralph host isolation (register D2-D5/D10). Defends against accident,",
+        ";; not malice: reads are a deny-list of famous credential paths (not a",
+        ";; completeness guarantee) and network egress stays open by design.",
+        "(allow default)",
+        "",
+        ";; Writes: allow-list of the sanctioned roots only (D3); deny all else.",
+        "(deny file-write*)",
+    ]
+    for root in (worktree, ralph_dir, session_tmp, backend_store):
+        lines.append(f"(allow file-write* (subpath {_sandbox_quote(root)}))")
+    # Standard device nodes, not data locations: a `(deny file-write*)` policy
+    # otherwise blocks the /dev/null write that basic tooling (git included)
+    # depends on. These are the null and standard-output sinks, so allowing them
+    # widens no data-writable surface beyond the four sanctioned roots above.
+    lines.append(
+        '(allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))'
+    )
+    lines += [
+        "",
+        ";; Reads: deny-list of famous credential paths (D4). Not exhaustive.",
+    ]
+    for relative in SANDBOX_DENY_READ_DIRS + SANDBOX_DENY_READ_BROWSER_DIRS:
+        lines.append(f"(deny file-read* (subpath {_sandbox_quote(home / relative)}))")
+    for relative in SANDBOX_DENY_READ_FILES:
+        lines.append(f"(deny file-read* (literal {_sandbox_quote(home / relative)}))")
+    # Deny the whole keychain store, then allow the login keychain back (D4,
+    # owner-amended). The allow must follow the deny so it wins.
+    lines.append(f'(deny file-read* (subpath {_sandbox_quote(home / "Library/Keychains")}))')
+    lines.append(
+        f"(allow file-read* (literal {_sandbox_quote(home / SANDBOX_LOGIN_KEYCHAIN)}))"
+    )
+    lines.append(out_of_scope_deny)
+    return "\n".join(lines) + "\n"
+
+
+def sandbox_wrap(profile: Path | None) -> list[str]:
+    # The launch-chain fragment that confines a backend: `sandbox-exec -f
+    # <profile>`, inserted between caffeinate and the backend at the single argv
+    # point so the whole backend process (file tools and MCP included) is
+    # covered, not just its Bash calls (register D6). No profile means no wrap;
+    # the fail-closed decision and the --unsafe-no-sandbox opt-out live in the
+    # caller (see #21/#23).
+    if profile is None:
+        return []
+    return [sandbox_exec_executable(), "-f", str(profile)]
+
+
+def write_sandbox_profile(
+    run_dir: Path, backend: str, worktree: Path, ralph_dir: Path, env: dict[str, str]
+) -> Path:
+    # Generate the concrete profile once per run (it is stable across a run's
+    # iterations) and write it under the untracked .git/ralph run directory
+    # (register D10): tracked source holds only the universal generator, never a
+    # filled-in profile carrying the operator's home path. `ralph clean` removes
+    # the whole .git/ralph tree, so this file with it.
+    session_tmp = Path(env.get("TMPDIR") or "/tmp").resolve()
+    profile_text = build_sandbox_profile(backend, worktree, ralph_dir, session_tmp, Path.home())
+    path = run_dir / "sandbox.sb"
+    path.write_text(profile_text, encoding="utf-8")
+    return path
 
 
 def claude_managed_root() -> Path:
@@ -1497,12 +1647,14 @@ def execute_opencode_iteration(
     model: str,
     env: dict[str, str],
     timeout: float,
+    sandbox_profile: Path | None = None,
 ) -> tuple[str, str | None]:
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = [
         caffeinate_executable(),
         "-im",
+        *sandbox_wrap(sandbox_profile),
         "opencode",
         "--pure",
         "run",
@@ -1941,10 +2093,15 @@ def execute_iteration(
     model: str,
     env: dict[str, str],
     timeout: float,
+    sandbox_profile: Path | None = None,
 ) -> tuple[str, str | None]:
     if backend == "claude":
+        # The Claude wrap lands in #22; until then the shared profile is carried
+        # but only the OpenCode launch consumes it.
         return execute_claude_iteration(worktree, run_dir, prompt, model, env, timeout)
-    return execute_opencode_iteration(worktree, run_dir, prompt, model, env, timeout)
+    return execute_opencode_iteration(
+        worktree, run_dir, prompt, model, env, timeout, sandbox_profile
+    )
 
 
 def shell_command(args: list[str], worktree: Path) -> str:
@@ -2167,6 +2324,15 @@ def run_protected(
         },
     )
     (run_dir / "git-status.txt").write_text(status, encoding="utf-8")
+    # Generate the host-isolation profile once per run (stable across
+    # iterations) and confine the backend under it (register D2/D6). #20 wraps
+    # OpenCode; the Claude wrap (#22) and the --unsafe-no-sandbox opt-out with
+    # its fail-closed self-test (#21/#23) build on this shared launcher.
+    sandbox_profile: Path | None = None
+    if args.backend == "opencode":
+        sandbox_profile = write_sandbox_profile(
+            run_dir, args.backend, worktree, git_dir / "ralph", env
+        )
     started = datetime.now(timezone.utc).isoformat()
     iterations: list[dict[str, Any]] = []
     session_id: str | None = None
@@ -2190,7 +2356,14 @@ def run_protected(
                 opencode_preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
             iteration_started = datetime.now(timezone.utc).isoformat()
             outcome, session_id = execute_iteration(
-                args.backend, worktree, iteration_dir, prompt, args.model, env, args.timeout
+                args.backend,
+                worktree,
+                iteration_dir,
+                prompt,
+                args.model,
+                env,
+                args.timeout,
+                sandbox_profile,
             )
             iterations.append(
                 {

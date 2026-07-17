@@ -80,6 +80,19 @@ class RalphCliTest(unittest.TestCase):
             esac
             """,
         )
+        # Stand-in for `/usr/bin/sandbox-exec`: records the wrap arguments
+        # (including the -f <profile> path) so tests can assert the launch chain,
+        # then drops `-f <profile>` and execs the confined command. Production
+        # uses the real Seatbelt launcher; this only proves argv construction.
+        self._script(
+            "sandbox-exec",
+            """
+            printf '%s\\n' "$*" >> "$FAKE_CALLS/sandbox-exec"
+            test "$1" = "-f"
+            shift 2
+            exec "$@"
+            """,
+        )
         self._script(
             "caffeinate",
             """
@@ -427,6 +440,9 @@ class RalphCliTest(unittest.TestCase):
                 # Absolute path to the fake caffeinate: production uses
                 # /usr/bin/caffeinate, and this test-only seam substitutes it.
                 "RALPH_CAFFEINATE": str(self.bin / "caffeinate"),
+                # Absolute path to the fake sandbox-exec: production uses
+                # /usr/bin/sandbox-exec, and this test-only seam substitutes it.
+                "RALPH_SANDBOX_EXEC": str(self.bin / "sandbox-exec"),
                 # Redirect every host-state lookup at isolated stand-ins so
                 # managed-configuration and home-directory checks are
                 # deterministic (see setUp).
@@ -752,11 +768,15 @@ class RalphCliTest(unittest.TestCase):
                 self.assertIn("timeout must be zero or positive", invalid.stderr)
 
     def test_timeout_gracefully_escalates_and_hands_off_a_started_session(self) -> None:
+        # The deadline is small only to force a timeout quickly; it must still
+        # comfortably exceed the cold-start of the launch chain (caffeinate ->
+        # sandbox-exec -> backend) so the started session's metadata is captured
+        # before the timer fires. The 30s backend sleep dwarfs it either way.
         result = self.run_ralph(
             "--iterations",
             "2",
             "--timeout",
-            "0.1",
+            "0.5",
             env={
                 "FAKE_EVENTS": self._events("Partial work"),
                 "FAKE_SLEEP": "30",
@@ -768,7 +788,7 @@ class RalphCliTest(unittest.TestCase):
         self.assertIn("iteration timed out", result.stderr)
         self.assertIn("--session ses_1", result.stderr)
         self.assertIn("iterations remaining: 1", result.stderr)
-        self.assertIn("--timeout 0.1", result.stderr)
+        self.assertIn("--timeout 0.5", result.stderr)
         self.assertEqual((self.calls / "signals").read_text(), "INTTERM")
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         outcome = json.loads((run_dir / "outcome.json").read_text())
@@ -848,9 +868,13 @@ class RalphCliTest(unittest.TestCase):
         self.assertIsNone(outcome["iterations"][0]["session_id"])
 
     def test_opencode_session_verification_obeys_the_iteration_deadline(self) -> None:
+        # The run emits its session immediately; the export verification then
+        # sleeps past the deadline. The budget must clear the launch chain's
+        # cold-start (now caffeinate -> sandbox-exec -> backend) so the session
+        # is captured before the export step times out.
         result = self.run_ralph(
             "--timeout",
-            "0.1",
+            "0.5",
             env={"FAKE_EXPORT_SLEEP": "30"},
         )
 
@@ -1604,6 +1628,89 @@ class RalphCliTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-im", (self.calls / "caffeinate").read_text())
+
+    def _ralph_state(self) -> Path:
+        return self.repo / ".git" / "ralph"
+
+    def test_opencode_launch_is_wrapped_by_sandbox_inside_caffeinate(self) -> None:
+        # The backend runs as a child of sandbox-exec, which itself runs as a
+        # child of caffeinate: caffeinate -im sandbox-exec -f <profile> opencode …
+        # (register D6/D13, caffeinate outermost).
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        caffeinate = (self.calls / "caffeinate").read_text()
+        wrap = next(
+            line for line in caffeinate.splitlines() if "sandbox-exec" in line
+        )
+        self.assertTrue(wrap.startswith("-im "), wrap)
+        sandbox = str(self.bin / "sandbox-exec")
+        profiles = sorted(self._ralph_state().glob("runs/*/sandbox.sb"))
+        self.assertEqual(len(profiles), 1, profiles)
+        # The launch chain records the run directory's resolved path.
+        profile = profiles[0].resolve()
+        self.assertIn(f"-im {sandbox} -f {profile} opencode", wrap)
+        # sandbox-exec received the profile then the confined backend command.
+        recorded = (self.calls / "sandbox-exec").read_text().strip()
+        self.assertTrue(recorded.startswith(f"-f {profile} opencode --pure run"), recorded)
+
+    def test_sandbox_profile_is_written_under_ralph_state_and_confines_reads_and_writes(self) -> None:
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profile = sorted(self._ralph_state().glob("runs/*/sandbox.sb"))[0]
+        self.assertFalse(profile.is_symlink())
+        text = profile.read_text()
+        # The concrete profile carries the resolved worktree write root, the
+        # famous read denials, and the owner-amended keychain rule.
+        self.assertIn(f'(allow file-write* (subpath "{self.repo.resolve()}"))', text)
+        self.assertIn(f'(deny file-read* (subpath "{self.home}/.ssh"))', text)
+        self.assertIn(
+            f'(allow file-read* (literal "{self.home}/Library/Keychains/login.keychain-db"))',
+            text,
+        )
+        # It denies the out-of-scope Claude store for an OpenCode run.
+        self.assertIn(f'(deny file-read* (subpath "{self.home}/.claude"))', text)
+
+    def test_ralph_clean_removes_the_generated_sandbox_profile(self) -> None:
+        self.run_ralph()
+        self.assertTrue(sorted(self._ralph_state().glob("runs/*/sandbox.sb")))
+
+        result = self.clean_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self._ralph_state().exists())
+
+    def test_absolute_sandbox_exec_is_not_path_shadowed(self) -> None:
+        # A hostile sandbox-exec earlier on PATH must never be consulted: host
+        # isolation is resolved by absolute path only.
+        system = self.base / "system"
+        system.mkdir()
+        good = system / "sandbox-exec"
+        good.write_text((self.bin / "sandbox-exec").read_text(), encoding="utf-8")
+        good.chmod(0o755)
+        self._script(
+            "sandbox-exec",
+            """
+            printf 'shadow\\n' >> "$FAKE_CALLS/sandbox-exec-shadow"
+            exit 13
+            """,
+        )
+
+        result = self.run_ralph(env={"RALPH_SANDBOX_EXEC": str(good)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.calls / "sandbox-exec-shadow").exists())
+        self.assertIn(str(good), (self.calls / "caffeinate").read_text())
+
+    def test_claude_launch_is_not_yet_sandboxed(self) -> None:
+        # #20 wraps only OpenCode; the Claude wrap lands in #22. Guard the
+        # boundary so the Claude path is untouched until then.
+        result = self.run_ralph(backend="claude")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.calls / "sandbox-exec").exists())
+        self.assertFalse(sorted(self._ralph_state().glob("runs/*/sandbox.sb")))
 
     def test_lost_loop_caffeinate_assertion_stops_safely(self) -> None:
         result = self._run_guarded(
@@ -3083,6 +3190,275 @@ class WorktreeLockMetadataTest(unittest.TestCase):
         second.acquire()
         self.addCleanup(second.release)
         self.assertTrue(second.acquired)
+
+
+class SandboxProfileTest(unittest.TestCase):
+    """The pure Seatbelt profile generator (register D3/D4/D10) and the
+    absolute-path `sandbox-exec` resolver. These assert external behavior —
+    profile policy text and the resolved launcher — with no host state."""
+
+    def setUp(self) -> None:
+        self.home = Path("/Users/tester")
+        self.worktree = Path("/work/project")
+        self.ralph_dir = Path("/work/project/.git/ralph")
+        self.session_tmp = Path("/private/var/session-tmp")
+
+    def _opencode_profile(self) -> str:
+        return cli.build_sandbox_profile(
+            "opencode", self.worktree, self.ralph_dir, self.session_tmp, self.home
+        )
+
+    def _deny_read_lines(self, profile: str) -> list[str]:
+        return [
+            line for line in profile.splitlines() if line.strip().startswith("(deny file-read*")
+        ]
+
+    def _write_allow_lines(self, profile: str) -> list[str]:
+        return [
+            line for line in profile.splitlines() if line.strip().startswith("(allow file-write*")
+        ]
+
+    def test_profile_leaves_reads_permissive_and_network_open_by_default(self) -> None:
+        # Reads are a deny-list and the network is unrestricted (D4/D5): the
+        # policy opens with a broad default and narrows only writes and the
+        # famous read paths, never egress.
+        profile = self._opencode_profile()
+        self.assertIn("(allow default)", profile)
+        self.assertNotIn("file-write*", profile.split("(deny file-write*)")[0])
+
+    def test_opencode_profile_denies_every_famous_credential_read(self) -> None:
+        profile = self._opencode_profile()
+        denied = "\n".join(self._deny_read_lines(profile))
+        for relative in (
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".config/gcloud",
+            ".azure",
+            ".kube",
+            ".netrc",
+            ".docker/config.json",
+            ".npmrc",
+            ".pypirc",
+        ):
+            self.assertIn(str(self.home / relative), denied, relative)
+        # Browser profiles under Application Support are denied (famous paths,
+        # not a completeness guarantee).
+        self.assertIn(str(self.home / "Library" / "Application Support" / "Google" / "Chrome"), denied)
+        self.assertIn(str(self.home / "Library" / "Application Support" / "Firefox"), denied)
+
+    def test_opencode_profile_denies_keychains_but_permits_the_login_keychain(self) -> None:
+        # Owner decision (2026-07-17, amends D4): the login keychain database
+        # stays readable because gh's in-scope GitHub token lives there on a
+        # default macOS install; every other keychain stays denied.
+        profile = self._opencode_profile()
+        self.assertIn(
+            f'(deny file-read* (subpath "{self.home}/Library/Keychains"))', profile
+        )
+        self.assertIn(
+            f'(allow file-read* (literal "{self.home}/Library/Keychains/login.keychain-db"))',
+            profile,
+        )
+        # The allow-back must come after the deny so it wins (Seatbelt: last
+        # matching rule).
+        self.assertLess(
+            profile.index('(deny file-read* (subpath "%s/Library/Keychains"))' % self.home),
+            profile.index("login.keychain-db"),
+        )
+
+    def test_opencode_profile_denies_the_out_of_scope_claude_store(self) -> None:
+        profile = self._opencode_profile()
+        self.assertIn(f'(deny file-read* (subpath "{self.home}/.claude"))', profile)
+
+    def test_opencode_profile_keeps_gh_and_its_own_store_readable(self) -> None:
+        # In-scope credentials the loop needs (D4): gh's config and the running
+        # backend's own store are never denied, so they fall through to the
+        # permissive read default.
+        profile = self._opencode_profile()
+        denied = "\n".join(self._deny_read_lines(profile))
+        self.assertNotIn(str(self.home / ".config" / "gh"), denied)
+        self.assertNotIn(str(self.home / ".local" / "share" / "opencode"), denied)
+
+    def test_write_allow_list_is_exactly_the_four_sanctioned_roots(self) -> None:
+        profile = self._opencode_profile()
+        self.assertIn("(deny file-write*)", profile)
+        allowed = "\n".join(self._write_allow_lines(profile))
+        for root in (
+            self.worktree,
+            self.ralph_dir,
+            self.session_tmp,
+            self.home / ".local" / "share" / "opencode",
+        ):
+            self.assertIn(f'(subpath "{root}")', allowed, str(root))
+        # An out-of-worktree path is not among the sanctioned write roots.
+        self.assertNotIn(str(self.home / "Documents"), allowed)
+        self.assertNotIn('(subpath "/")', allowed)
+
+    def test_claude_run_flips_the_backend_aware_store_and_deny(self) -> None:
+        # Regression anchor for #22: the same generator, backend-aware. For a
+        # Claude run the in-scope store is ~/.claude (readable + write root) and
+        # the out-of-scope store denied is the OpenCode auth file.
+        profile = cli.build_sandbox_profile(
+            "claude", self.worktree, self.ralph_dir, self.session_tmp, self.home
+        )
+        allowed = "\n".join(self._write_allow_lines(profile))
+        self.assertIn(f'(subpath "{self.home}/.claude")', allowed)
+        denied = "\n".join(self._deny_read_lines(profile))
+        self.assertIn(
+            f'(literal "{self.home}/.local/share/opencode/auth.json")', denied
+        )
+        self.assertNotIn(f'(subpath "{self.home}/.claude")', denied)
+
+    def test_profile_interpolates_only_paths_and_never_a_secret(self) -> None:
+        # The generator's only inputs are paths and the backend name; it never
+        # consults the environment, so no token can be interpolated (D10). Prove
+        # it by planting secrets in the environment and generating.
+        secret = "sk-super-secret-token-value"
+        with _patched_environ(
+            {
+                "ANTHROPIC_API_KEY": secret,
+                "GH_TOKEN": secret,
+                "OPENAI_API_KEY": secret,
+            }
+        ):
+            profile = self._opencode_profile()
+        self.assertNotIn(secret, profile)
+        # Every home path present is a sanctioned, hard-coded policy path — no
+        # operator-specific value leaks in beyond the paths we interpolate.
+        self.assertNotIn("token", profile.lower())
+
+    def test_profile_quotes_paths_with_spaces_and_metacharacters(self) -> None:
+        worktree = Path('/work/pro"ject dir')
+        profile = cli.build_sandbox_profile(
+            "opencode", worktree, self.ralph_dir, self.session_tmp, self.home
+        )
+        # The double quote inside the path is backslash-escaped so the profile
+        # stays parseable rather than terminating the string early.
+        self.assertIn('(subpath "/work/pro\\"ject dir")', profile)
+
+    def test_sandbox_exec_resolves_absolute_and_honors_override(self) -> None:
+        with _patched_environ({}, remove=("RALPH_SANDBOX_EXEC",)):
+            self.assertEqual(cli.sandbox_exec_executable(), "/usr/bin/sandbox-exec")
+        with _patched_environ({"RALPH_SANDBOX_EXEC": "/tmp/fake-sandbox-exec"}):
+            self.assertEqual(cli.sandbox_exec_executable(), "/tmp/fake-sandbox-exec")
+
+
+@unittest.skipUnless(sys.platform == "darwin", "Seatbelt is macOS-only")
+class SandboxRealProfileSmokeTest(unittest.TestCase):
+    """Make-or-break qualification against the real `/usr/bin/sandbox-exec`
+    (register D2/D7). No language model and no subscription spend: it proves a
+    Go-CLI TLS operation succeeds under the generated profile while a denied read
+    and an out-of-worktree write actually fail. Requires network (a public
+    GitHub HTTPS handshake) exactly as the parent program's smoke specifies."""
+
+    SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+    def setUp(self) -> None:
+        if not Path(self.SANDBOX_EXEC).is_file():
+            raise AssertionError(
+                "/usr/bin/sandbox-exec is required for the host-isolation smoke "
+                "and must not be silently skipped on macOS"
+            )
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.worktree = base / "worktree"
+        self.worktree.mkdir()
+        self.ralph_dir = base / "ralph"
+        self.ralph_dir.mkdir()
+        self.session_tmp = Path(os.environ.get("TMPDIR") or "/tmp").resolve()
+        # Generate the profile against a synthetic home carrying a real, readable
+        # credential file at a denied path (~/.ssh). This keeps the smoke
+        # hermetic — it never touches the operator's real ~/.ssh — while proving
+        # the deny rule bites a file that genuinely exists (see the read smoke).
+        self.home = base / "home"
+        (self.home / ".ssh").mkdir(parents=True)
+        self.credential_probe = self.home / ".ssh" / "id_probe"
+        self.credential_probe.write_text("PROBE-LEAK\n", encoding="utf-8")
+        self.profile = base / "sandbox.sb"
+        self.profile.write_text(
+            cli.build_sandbox_profile(
+                "opencode", self.worktree, self.ralph_dir, self.session_tmp, self.home
+            ),
+            encoding="utf-8",
+        )
+
+    def _confined(self, *command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.SANDBOX_EXEC, "-f", str(self.profile), *command],
+            text=True,
+            capture_output=True,
+        )
+
+    def test_go_cli_tls_handshake_succeeds_under_the_profile(self) -> None:
+        if shutil.which("git") is None:
+            raise AssertionError("git is required for the TLS smoke")
+        # A public HTTPS ls-remote needs no credential and no SSH, so it isolates
+        # the make-or-break question: does Go/libcurl TLS work under Seatbelt.
+        result = self._confined(
+            "git",
+            "ls-remote",
+            "https://github.com/bmal/simple-ralph-loop.git",
+            "HEAD",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HEAD", result.stdout)
+
+    def test_denied_credential_read_actually_fails(self) -> None:
+        # Non-vacuous by construction: the probe exists and is readable outside
+        # the sandbox, so a profile that failed open would leak PROBE-LEAK.
+        self.assertIn("PROBE-LEAK", self.credential_probe.read_text())
+        result = self._confined("cat", str(self.credential_probe))
+        # Under the profile the read is refused (operation not permitted), never
+        # a plain "no such file": the deny rule bites a file that is really there.
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("PROBE-LEAK", result.stdout)
+        self.assertIn("not permitted", (result.stdout + result.stderr).lower())
+
+    def test_out_of_worktree_write_actually_fails(self) -> None:
+        target = Path.home() / ".ralph-sandbox-escape-probe"
+        self.addCleanup(lambda: target.exists() and target.unlink())
+        result = self._confined(
+            "sh", "-c", f'echo leak > {shlex.quote(str(target))} 2>&1; echo "rc=$?"'
+        )
+        self.assertNotIn("rc=0", result.stdout)
+        self.assertFalse(target.exists(), "write outside the worktree was not confined")
+
+    def test_sanctioned_worktree_write_is_permitted(self) -> None:
+        # The confinement is a boundary, not a wall: writes inside the worktree —
+        # the work the loop exists to do — still succeed.
+        marker = self.worktree / "written-inside.txt"
+        result = self._confined(
+            "sh", "-c", f'echo ok > {shlex.quote(str(marker))}; echo "rc=$?"'
+        )
+        self.assertIn("rc=0", result.stdout)
+        self.assertEqual(marker.read_text().strip(), "ok")
+
+
+class _patched_environ:
+    """Minimal context manager to set/remove environment variables for a
+    deterministic pure-function assertion."""
+
+    def __init__(self, values: dict[str, str], remove: tuple[str, ...] = ()) -> None:
+        self._values = values
+        self._remove = remove
+        self._saved: dict[str, str | None] = {}
+
+    def __enter__(self) -> "_patched_environ":
+        for key, value in self._values.items():
+            self._saved[key] = os.environ.get(key)
+            os.environ[key] = value
+        for key in self._remove:
+            self._saved[key] = os.environ.get(key)
+            os.environ.pop(key, None)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 if __name__ == "__main__":
