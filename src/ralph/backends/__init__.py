@@ -5,10 +5,12 @@ Invariants:
 - ``DEFAULT_MODELS`` names the model each Backend runs when ``--model`` is omitted;
   the announced routing reflects it so a run always states what it will spend on.
 - ``resolve`` is the single place a backend name becomes a Backend: it maps the name
-  to the adapter module exactly once per invocation (register E1/E8). No
-  ``backend == ...`` dispatch selecting an adapter's behavior survives anywhere
-  else; the loop and cli drive the resolved Backend only through the five Protocol
-  names and so cannot tell the two backends apart (register E2, user story 6).
+  to the adapter module exactly once per invocation (register E1/E8). The loop and
+  cli carry no ``backend == ...`` dispatch -- they drive the resolved Backend only
+  through the five Protocol names and so cannot tell the two backends apart
+  (register E2, user story 6). The only backend-name branching left anywhere is
+  ``launch``'s host-isolation policy (which credential store to deny, which backend
+  is wrapped today); that selects Launch-chain policy, never an adapter's behavior.
 - ``Backend`` pins those five names — ``preflight``, ``validate_model``,
   ``execute_iteration``, ``resume_argv``, ``environment`` — for type-checkers only;
   the adapters are plain modules, matched structurally with no runtime class or ABC
