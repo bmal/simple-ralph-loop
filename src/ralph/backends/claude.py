@@ -130,6 +130,18 @@ UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
     }
 )
 CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running Ralph"
+# Appended to every Claude iteration prompt. The Task tool defaults to background
+# execution, but a subagent that finishes after the turn has ended forces the CLI
+# to emit a second `system` init, which breaks Ralph's single-turn stream contract
+# and halts the run (the accept() guard rejects `background_tasks_changed`). This
+# steers the model to the supported path -- synchronous subagents -- so the guard
+# stays a backstop rather than the common case.
+SUBAGENT_DIRECTIVE = (
+    "\n\nRun every subagent (the Task tool) synchronously: do not pass "
+    "run_in_background, and let each Task return its result within the turn that "
+    "launched it. A background subagent that finishes after the turn has ended "
+    "breaks Ralph's stream contract and halts the run.\n"
+)
 # Appended to the refusal only when a Claude agent vector — the `.claude/agents`
 # directory or the settings.json `agent` key — is the *sole* blocker, so the
 # operator can discover the supported opt-out from the failure itself. It is
@@ -317,6 +329,22 @@ class ClaudeEventResult:
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
+        if event_type == "system" and event.get("subtype") == "background_tasks_changed":
+            # A subagent launched with run_in_background finishes asynchronously,
+            # after the turn's terminal result, and forces the CLI to emit a fresh
+            # `system` init to deliver its completion -- a second init that breaks
+            # the single-turn contract this class enforces (one init, one result,
+            # nothing after). `background_tasks_changed` is the earliest and
+            # unambiguous fingerprint of a background launch: it fires when the
+            # task is registered, and synchronous subagents (which return inline
+            # as a tool result) never emit it. Fail here so the halt names the
+            # real cause instead of the downstream "duplicate initialization
+            # metadata", and so the wasted iteration stops at registration rather
+            # than at the end of the turn.
+            raise RalphError(
+                "Claude launched a background subagent; Ralph requires subagents "
+                "to run synchronously (do not pass run_in_background)"
+            )
         if event_type == "system" and event.get("subtype") == "init":
             self._accept_init(event)
             return
@@ -540,7 +568,7 @@ def _consume_claude_iteration(
     thread.start()
     message = {
         "type": "user",
-        "message": {"role": "user", "content": prompt + PROTOCOL},
+        "message": {"role": "user", "content": prompt + PROTOCOL + SUBAGENT_DIRECTIVE},
         "parent_tool_use_id": None,
     }
     try:

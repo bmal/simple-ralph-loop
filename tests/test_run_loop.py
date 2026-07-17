@@ -131,6 +131,72 @@ class RunLoopTest(RalphCliTestCase):
         self.assertEqual(claude_calls.count("--version"), 2)
         self.assertEqual(claude_calls.count("auth status"), 2)
 
+    def test_background_subagent_halts_with_a_synchronous_directive(self) -> None:
+        # A subagent launched with run_in_background emits background_tasks_changed
+        # and later forces a second init; Ralph must halt at the background launch
+        # with a message that names the real cause, not the downstream duplicate
+        # init, and the iteration prompt must steer the model away from it.
+        events = self._claude_events("Working.").splitlines()
+        background = json.dumps(
+            {
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "session_id": "claude-session-1",
+                "tasks": [{"task_id": "t1", "task_type": "local_agent", "description": "survey"}],
+            }
+        )
+        events.insert(2, background)  # after init and the assistant turn, before result
+
+        result = self.run_ralph(
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": "\n".join(events)},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("run synchronously", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertIn("background subagent", outcome["iterations"][0]["reason"])
+        composed = json.loads((self.calls / "claude-stdin").read_text())
+        self.assertIn("do not pass run_in_background", composed["message"]["content"])
+
+    def test_synchronous_subagent_events_pass_through_the_background_guard(self) -> None:
+        # Synchronous subagents emit task_started and task_notification but never
+        # background_tasks_changed; those events must pass through untouched so a
+        # legitimate synchronous-agent iteration completes normally.
+        events = self._claude_events("Work complete.\n<promise>COMPLETE</promise>").splitlines()
+        started = json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_started",
+                "session_id": "claude-session-1",
+                "task_id": "t1",
+            }
+        )
+        notification = json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "session_id": "claude-session-1",
+                "task_id": "t1",
+                "status": "completed",
+            }
+        )
+        events.insert(1, started)  # after init
+        events.insert(-1, notification)  # before the terminal result
+
+        result = self.run_ralph(
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": "\n".join(events)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Work complete.", result.stdout)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertEqual(json.loads((run_dir / "outcome.json").read_text())["outcome"], "complete")
+
     def test_between_iteration_auth_and_customization_mutation_stops_before_next_session(self) -> None:
         sequence = self._sequence(["First child complete.", "must not run"])
         mutation = self.base / "credentials-mutated"
