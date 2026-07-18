@@ -123,10 +123,22 @@ SANDBOX_DENY_READ_BROWSER_DIRS = (
 SANDBOX_LOGIN_KEYCHAIN = "Library/Keychains/login.keychain-db"
 
 # The self-test's write probe target: a file directly under the operator's home
-# root, which is never one of the four sanctioned write roots, so a profile that
-# bites refuses the create (register D8). Named distinctively so an accidental
-# leftover left by a fail-open profile is unmistakable.
+# root, which is never one of the sanctioned write roots, so a profile that bites
+# refuses the create (register D8). Named distinctively so an accidental leftover
+# left by a fail-open profile is unmistakable.
 SANDBOX_WRITE_PROBE = ".ralph-sandbox-selftest-write-probe"
+
+# World-writable scratch roots the backend may write to unconditionally (register
+# D3, amended). By convention these hold no operator work product or secrets —
+# they are shared, sticky-bit temp — and the confined backend runs as the
+# operator's own uid, so it can already write here anyway. Allow-listing them is
+# what keeps a wrapped session usable: Claude Code creates its per-session working
+# directory under `/private/tmp/claude-<uid>/…` (NOT under $TMPDIR), so without
+# these roots every Bash call the backend makes fails EPERM on its first mkdir.
+# `/tmp` is a symlink to `/private/tmp`; both are listed so the rule matches
+# whichever spelling a tool uses. $TMPDIR (the darwin per-user temp) is a
+# separate valueless scratch root and is allowed via `session_tmp`.
+SANDBOX_WORLD_WRITABLE_TMP_ROOTS = (Path("/private/tmp"), Path("/tmp"))
 
 # Self-test probe outcomes: the sandbox refused the operation (the profile bit),
 # permitted it (the profile parsed but failed open), or the probe could not be
@@ -201,9 +213,12 @@ def build_sandbox_profile(
         "(allow default)",
         "",
         ";; Writes: allow-list of the sanctioned roots only (D3); deny all else.",
+        ";; The four per-run roots plus the world-writable temp roots, which hold",
+        ";; no operator work product and are where the backend's own harness (e.g.",
+        ";; Claude Code under /private/tmp/claude-<uid>) creates its session dir.",
         "(deny file-write*)",
     ]
-    for root in (worktree, ralph_dir, session_tmp, backend_store):
+    for root in (worktree, ralph_dir, session_tmp, backend_store, *SANDBOX_WORLD_WRITABLE_TMP_ROOTS):
         lines.append(f"(allow file-write* (subpath {_sandbox_quote(root)}))")
     # Standard device nodes, not data locations: a `(deny file-write*)` policy
     # otherwise blocks the /dev/null write that basic tooling (git included)

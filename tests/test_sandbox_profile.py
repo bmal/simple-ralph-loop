@@ -114,7 +114,7 @@ class SandboxProfileTest(unittest.TestCase):
         # ~/.config/git/config (not a secret) is never swept up with it.
         self.assertNotIn(str(self.home / ".config" / "git" / "config"), denied)
 
-    def test_write_allow_list_is_exactly_the_four_sanctioned_roots(self) -> None:
+    def test_write_allow_list_is_exactly_the_sanctioned_roots(self) -> None:
         profile = self._opencode_profile()
         self.assertIn("(deny file-write*)", profile)
         allowed = "\n".join(self._write_allow_lines(profile))
@@ -125,9 +125,25 @@ class SandboxProfileTest(unittest.TestCase):
             self.home / ".local" / "share" / "opencode",
         ):
             self.assertIn(f'(subpath "{root}")', allowed, str(root))
+        # The world-writable temp roots are sanctioned too: they hold no operator
+        # work product and are where a wrapped backend's own harness creates its
+        # per-session scratch (register D3, amended).
+        self.assertIn('(subpath "/private/tmp")', allowed)
+        self.assertIn('(subpath "/tmp")', allowed)
         # An out-of-worktree path is not among the sanctioned write roots.
         self.assertNotIn(str(self.home / "Documents"), allowed)
         self.assertNotIn('(subpath "/")', allowed)
+
+    def test_write_allow_list_covers_temp_roots_for_the_claude_backend_too(self) -> None:
+        # Regression anchor: the Claude harness creates its per-session working
+        # directory under /private/tmp/claude-<uid>/…, so the temp roots must be
+        # sanctioned write roots for a Claude run or its first Bash mkdir EPERMs.
+        profile = launch.build_sandbox_profile(
+            "claude", self.worktree, self.ralph_dir, self.session_tmp, self.home
+        )
+        allowed = "\n".join(self._write_allow_lines(profile))
+        self.assertIn('(subpath "/private/tmp")', allowed)
+        self.assertIn('(subpath "/tmp")', allowed)
 
     def test_claude_run_flips_the_backend_aware_store_and_deny(self) -> None:
         # Regression anchor for #22: the same generator, backend-aware. For a
@@ -646,6 +662,22 @@ class ClaudeSandboxRealProfileSmokeTest(unittest.TestCase):
         )
         self.assertIn("rc=0", result.stdout)
         self.assertEqual(marker.read_text().strip(), "ok")
+
+    def test_claude_session_scratch_under_private_tmp_is_permitted(self) -> None:
+        # Regression for the wrapped-Claude EPERM: Claude Code creates its
+        # per-session working directory under /private/tmp/claude-<uid>/… — not
+        # under $TMPDIR — and confines every Bash call to it. Before the temp
+        # roots were sanctioned, that first mkdir failed "operation not permitted"
+        # and the whole run died on iteration 1. It must now succeed.
+        session_dir = (
+            Path("/private/tmp") / f"claude-{os.getuid()}" / f"ralph-regress-{os.getpid()}"
+        )
+        self.addCleanup(lambda: shutil.rmtree(session_dir.parent, ignore_errors=True))
+        result = self._confined(
+            "sh", "-c", f'mkdir -p {shlex.quote(str(session_dir))}; echo "rc=$?"'
+        )
+        self.assertIn("rc=0", result.stdout)
+        self.assertTrue(session_dir.is_dir())
 
 
 class _patched_environ:
