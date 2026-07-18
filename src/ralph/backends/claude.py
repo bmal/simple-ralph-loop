@@ -308,6 +308,30 @@ def preflight(
         raise RalphError("Claude must use first-party subscription OAuth authentication")
 
 
+def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> str:
+    # Turn a Claude Code synthetic error message into an operator-facing halt
+    # reason. The human-readable error text lives in the message content; the
+    # machine-readable cause lives in the event's top-level `error` field.
+    detail = " ".join(
+        part["text"]
+        for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+        if isinstance(part, dict)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    ).strip()
+    if event.get("error") == "authentication_failed" or "authenticat" in detail.lower():
+        # A revoked/expired subscription token is the recoverable case: tell the
+        # operator exactly how to re-authenticate. The printed handoff already
+        # follows with the manual-resume command for this same session.
+        return (
+            "Claude authentication failed (subscription OAuth token was revoked or "
+            "expired); re-authenticate by running `claude` and using /login, then resume"
+        )
+    if detail:
+        return f"Claude returned a synthetic error instead of a model response: {detail}"
+    return "Claude returned a synthetic error instead of a model response"
+
+
 class ClaudeEventResult:
     def __init__(self, model: str) -> None:
         self.expected_model = model
@@ -398,6 +422,15 @@ class ClaudeEventResult:
             raise RalphError("Claude assistant event omitted required metadata")
         model = message["model"]
         if not model.startswith("claude-"):
+            # Claude Code carries a hard API failure in a synthetic assistant
+            # message (model "<synthetic>") instead of a real model turn. The
+            # common case is a revoked or expired subscription OAuth token -- a
+            # 401 authentication_failed that only surfaces here, after preflight
+            # already passed -- so name that cause and the one-line fix rather
+            # than the misleading "model fallback" text. Any other synthetic
+            # error still fails closed, just with its own message attached.
+            if model == "<synthetic>":
+                raise RalphError(synthetic_error_reason(event, message))
             raise RalphError("Claude used a non-subscription model fallback")
         self.assistant_models.append(model)
         content = message.get("content")

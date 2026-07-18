@@ -311,6 +311,34 @@ class LoopProtocolTest(RalphCliTestCase):
         self.assertIn("ralph resume --backend claude", result.stderr)
         self.assertIn("--session claude-session-1", result.stderr)
 
+    def test_claude_revoked_token_hands_off_with_login_guidance(self) -> None:
+        # Claude Code retries a 401 and then delivers the failure as a synthetic
+        # assistant message (model "<synthetic>"). Ralph must name the auth cause
+        # and how to re-authenticate rather than reporting a "model fallback",
+        # and must checkpoint the session so the same run can be resumed.
+        events = self._claude_events("unused").splitlines()
+        assistant = json.loads(events[1])
+        assistant["error"] = "authentication_failed"
+        assistant["message"]["model"] = "<synthetic>"
+        assistant["message"]["content"] = [
+            {"type": "text", "text": "Failed to authenticate. API Error: 401 OAuth access token has been revoked."}
+        ]
+        result = self.run_ralph(
+            backend="claude",
+            env={"FAKE_CLAUDE_EVENTS": "\n".join([events[0], json.dumps(assistant)])},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertNotIn("non-subscription model fallback", result.stderr)
+        self.assertIn("Claude authentication failed", result.stderr)
+        self.assertIn("/login", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        outcome = json.loads((run_dir / "outcome.json").read_text())
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertEqual(outcome["iterations"][0]["reason"].startswith("Claude authentication failed"), True)
+
     def test_claude_marker_prose_question_and_malformed_stream_handoff(self) -> None:
         marker = "<promise>NEEDS_INPUT</promise>\nShould Claude continue with option B?"
         marker_result = self.run_ralph(
