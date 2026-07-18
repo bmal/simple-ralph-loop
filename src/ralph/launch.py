@@ -89,12 +89,17 @@ SANDBOX_DENY_READ_DIRS = (
     ".config/gcloud",
 )
 # Single credential files denied by exact path (denying a parent would also hide
-# in-scope siblings such as ~/.config/gh or ~/.docker/ contexts).
+# in-scope siblings such as ~/.config/gh, ~/.config/git/config, or ~/.docker/
+# contexts). `.git-credentials` and its XDG twin are git's `store` helper's
+# plaintext token files: famous, and squarely in the loop's own git/gh domain,
+# so an accidental read of one is the exact accident register D1 scopes in.
 SANDBOX_DENY_READ_FILES = (
     ".netrc",
     ".docker/config.json",
     ".npmrc",
     ".pypirc",
+    ".git-credentials",
+    ".config/git/credentials",
 )
 # Browser profile stores holding saved passwords, cookies, and sessions. Famous
 # paths only, consistent with the non-exhaustive framing above.

@@ -70,6 +70,8 @@ class SandboxProfileTest(unittest.TestCase):
             ".docker/config.json",
             ".npmrc",
             ".pypirc",
+            ".git-credentials",
+            ".config/git/credentials",
         ):
             self.assertIn(str(self.home / relative), denied, relative)
         # Browser profiles under Application Support are denied (famous paths,
@@ -108,6 +110,9 @@ class SandboxProfileTest(unittest.TestCase):
         denied = "\n".join(self._deny_read_lines(profile))
         self.assertNotIn(str(self.home / ".config" / "gh"), denied)
         self.assertNotIn(str(self.home / ".local" / "share" / "opencode"), denied)
+        # The XDG git *credentials* file is denied by exact path, so the sibling
+        # ~/.config/git/config (not a secret) is never swept up with it.
+        self.assertNotIn(str(self.home / ".config" / "git" / "config"), denied)
 
     def test_write_allow_list_is_exactly_the_four_sanctioned_roots(self) -> None:
         profile = self._opencode_profile()

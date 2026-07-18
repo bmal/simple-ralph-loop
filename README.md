@@ -160,8 +160,9 @@ guarantee alongside subscription-only auth and customization isolation. The
 policy is a **write allow-list** (the worktree, the resolved `.git/ralph` state,
 the session tmp, and the running backend's own state directory) and a **read
 deny-list** (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.azure`,
-`~/.kube`, `~/.netrc`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`, browser
-profiles, `~/Library/Keychains`, and the *other* backend's auth store). Before
+`~/.kube`, `~/.netrc`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`,
+`~/.git-credentials` and `~/.config/git/credentials`, browser profiles,
+`~/Library/Keychains`, and the *other* backend's auth store). Before
 spending budget Ralph runs a one-shot self-test that must observe a denied read
 and a denied write actually fail; if the sandbox cannot start or the self-test
 fails open, Ralph fails closed and spends no budget. `ralph resume` and
