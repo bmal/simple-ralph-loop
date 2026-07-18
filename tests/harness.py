@@ -115,12 +115,11 @@ class RalphCliTestCase(unittest.TestCase):
             shift
             if test "${1:-}" = "-w"; then
               test "${FAKE_CAFFEINATE_FAIL:-0}" = "0" || exit 9
-              if test -n "${FAKE_CAFFEINATE_DIE:-}"; then
-                # Survive the startup probe, then exit unexpectedly to model a
-                # loop-wide assertion that is lost mid-run.
-                sleep "$FAKE_CAFFEINATE_DIE"
-                exit 0
-              fi
+              # Publish our own pid so a test can model a loop-wide assertion
+              # lost mid-run by killing it on command (FAKE_KILL_CAFFEINATE in
+              # the backend). Dying on command rather than on a wall-clock timer
+              # keeps that scenario deterministic under CI scheduling latency.
+              printf '%s\\n' "$$" > "$FAKE_CALLS/caffeinate-pid"
               while kill -0 "$2" 2>/dev/null; do sleep 0.02; done
               exit 0
             fi
@@ -176,6 +175,20 @@ class RalphCliTestCase(unittest.TestCase):
                   printf '%s\\n' "${FAKE_EVENTS}"
                 fi
                 env | sort > "$FAKE_CALLS/env"
+                if test -n "${FAKE_KILL_CAFFEINATE:-}"; then
+                  # Model the loop-wide power assertion dying mid-iteration by
+                  # killing it while this iteration is still running. We only
+                  # send the signal -- never wait for the process to vanish: its
+                  # parent (ralph) reaps it lazily via poll() at the next
+                  # boundary, so it lingers as a zombie until then and a
+                  # `kill -0` wait here would deadlock the iteration. Ralph's
+                  # ensure_alive() therefore observes it dead only after this
+                  # iteration's evidence is already retained.
+                  caffeinate_pid=$(cat "$FAKE_CALLS/caffeinate-pid" 2>/dev/null || true)
+                  if test -n "$caffeinate_pid"; then
+                    kill -KILL "$caffeinate_pid" 2>/dev/null || true
+                  fi
+                fi
                 if test -n "${FAKE_RAW_STDOUT_FILE:-}"; then
                   cat "$FAKE_RAW_STDOUT_FILE"
                   exit 0

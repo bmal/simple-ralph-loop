@@ -285,10 +285,9 @@ class TimeoutAndProcessControlTest(RalphCliTestCase):
             "--iterations",
             "2",
             env={
-                "FAKE_CAFFEINATE_DIE": "0.3",
+                "FAKE_KILL_CAFFEINATE": "1",
                 "FAKE_EVENTS": self._events("Partial work"),
                 "FAKE_EXPORT": self._export("Partial work"),
-                "FAKE_SLEEP": "0.6",
             },
         )
 
