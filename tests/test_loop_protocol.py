@@ -290,6 +290,46 @@ class LoopProtocolTest(RalphCliTestCase):
         self.assertIn("OpenCode session failed", not_started.stderr)
         self.assertNotIn("RALPH NEEDS OPERATOR", not_started.stderr)
 
+    def test_opencode_structured_backend_error_is_redacted_and_handed_off(self) -> None:
+        token = "oauth-secret-value"
+        error = json.dumps(
+            {
+                "type": "error",
+                "sessionID": "ses_auth_failure",
+                "error": {
+                    "name": "ProviderAuthError",
+                    "data": {
+                        "providerID": "openai",
+                        "message": f"OpenAI API key is missing ({token}).",
+                    },
+                },
+            }
+        )
+
+        result = self.run_ralph(
+            env={
+                "CLAUDE_CODE_OAUTH_TOKEN": token,
+                "FAKE_EVENTS": error,
+                "FAKE_EXIT": "1",
+            }
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "OpenCode ProviderAuthError: OpenAI API key is missing ([redacted]).",
+            result.stderr,
+        )
+        self.assertNotIn("see retained stderr", result.stderr)
+        self.assertNotIn(token, result.stdout + result.stderr)
+        self.assertIn("--session ses_auth_failure", result.stderr)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        retained_stdout = (run_dir / "stdout.ndjson").read_text()
+        self.assertNotIn(token, retained_stdout)
+        self.assertIn("[redacted]", retained_stdout)
+        outcome_text = (run_dir / "outcome.json").read_text()
+        self.assertNotIn(token, outcome_text)
+        self.assertEqual(json.loads(outcome_text)["outcome"], "backend_failure")
+
     def test_claude_native_question_hands_off_with_full_auto_resume(self) -> None:
         events = self._claude_events("unused").splitlines()
         assistant = json.loads(events[1])

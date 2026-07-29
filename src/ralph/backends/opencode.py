@@ -74,15 +74,17 @@ def validate_model(model: str) -> None:
 
 def environment(model: str) -> dict[str, str]:
     # The sanitized base plus OpenCode's routing keys: the isolated configuration
-    # pinned as inline content so no on-disk config can reroute the session, plugin
-    # and autoupdate suppression, and the Bash-tool timeout pinned to the 32-bit
-    # ceiling so Ralph's own iteration timer stays authoritative.
+    # pinned as inline content so no on-disk config can reroute the session,
+    # external-plugin and autoupdate suppression, and the Bash-tool timeout pinned
+    # to the 32-bit ceiling so Ralph's own iteration timer stays authoritative.
     env = clean_environment()
+    # OpenAI subscription OAuth is implemented by OpenCode's built-in Codex auth
+    # plugin, so an ambient opt-out must not survive into the isolated session.
+    env.pop("OPENCODE_DISABLE_DEFAULT_PLUGINS", None)
     env.update(
         {
             "OPENCODE_CONFIG_CONTENT": json.dumps(isolated_config(model), separators=(",", ":")),
             "OPENCODE_DISABLE_AUTOUPDATE": "true",
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
             "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": str(BACKEND_TIMEOUT_MS),
         }
     )
@@ -206,12 +208,24 @@ class EventResult:
         self.parts: dict[str, tuple[str, str]] = {}
         self.printed: dict[str, str] = {}
         self.question: str | None = None
+        self.backend_error: str | None = None
 
     def accept(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
         if isinstance(event.get("sessionID"), str):
             self._session(event["sessionID"])
+        if event.get("type") == "error":
+            error = event.get("error")
+            if isinstance(error, dict):
+                name = error.get("name")
+                data = error.get("data")
+                message = data.get("message") if isinstance(data, dict) else None
+                if isinstance(name, str) and isinstance(message, str):
+                    self.backend_error = redact(f"OpenCode {name}: {message}")
+                    return
+            self.backend_error = "OpenCode reported a backend error"
+            return
         direct_part = event.get("part")
         if event.get("type") == "text" and isinstance(direct_part, dict):
             self._accept_text_part(direct_part, trusted=True)
@@ -635,6 +649,14 @@ def _consume_opencode_iteration(
     raise_if_controlled_stop(controller, "OpenCode", result.session_id)
     if result.printed:
         print()
+    if result.backend_error:
+        if result.session_id:
+            raise HandoffError(
+                result.backend_error,
+                result.session_id,
+                outcome="backend_failure",
+            )
+        raise StartedIterationError(result.backend_error, "backend_failure")
     if returncode:
         if result.session_id:
             raise HandoffError(

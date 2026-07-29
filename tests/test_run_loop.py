@@ -10,7 +10,9 @@ from harness import RalphCliTestCase
 
 class RunLoopTest(RalphCliTestCase):
     def test_exact_completion_runs_safely_and_retains_evidence(self) -> None:
-        result = self.run_ralph()
+        # An ambient opt-out must not disable OpenCode's built-in OAuth plugin in
+        # the isolated child environment.
+        result = self.run_ralph(env={"OPENCODE_DISABLE_DEFAULT_PLUGINS": "true"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Work complete.", result.stdout)
@@ -31,6 +33,7 @@ class RunLoopTest(RalphCliTestCase):
         self.assertIn("-im", (self.calls / "caffeinate").read_text())
         child_env = (self.calls / "env").read_text()
         self.assertIn("OPENCODE_DISABLE_AUTOUPDATE=true", child_env)
+        self.assertNotIn("OPENCODE_DISABLE_DEFAULT_PLUGINS=", child_env)
         self.assertNotIn("OPENAI_API_KEY=", child_env)
 
     def test_run_announces_backend_and_resolved_model(self) -> None:
