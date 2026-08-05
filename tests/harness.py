@@ -154,12 +154,22 @@ class RalphCliTestCase(unittest.TestCase):
                 if test -n "${FAKE_EXPORT_SLEEP:-}"; then
                   sleep "$FAKE_EXPORT_SLEEP"
                 fi
-                if test -n "${FAKE_SEQUENCE_DIR:-}"; then
-                  session_id=${3}
-                  cat "$FAKE_SEQUENCE_DIR/export-$session_id"
-                else
-                  printf '%s\\n' "${FAKE_EXPORT}"
+                emit_export() {
+                  if test -n "${FAKE_SEQUENCE_DIR:-}"; then
+                    cat "$FAKE_SEQUENCE_DIR/export-$1"
+                  else
+                    printf '%s\\n' "${FAKE_EXPORT}"
+                  fi
+                }
+                if test -n "${FAKE_EXPORT_PIPE_TRUNCATION:-}" && test -p /dev/fd/1; then
+                  # Model the real CLI: the export is one large write followed by
+                  # an immediate exit, so a pipe keeps only the prefix that had
+                  # landed -- and the command still exits 0. A regular file keeps
+                  # the whole payload, which is what Ralph must capture into.
+                  emit_export "${3}" | head -c "$FAKE_EXPORT_PIPE_TRUNCATION"
+                  exit 0
                 fi
+                emit_export "${3}"
                 ;;
               *" run "*)
                 if test -n "${FAKE_SEQUENCE_DIR:-}"; then

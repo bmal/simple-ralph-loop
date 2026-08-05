@@ -4,8 +4,24 @@ fallback recording, and agent-map handling under the opt-out flag."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from harness import RalphCliTestCase
+
+
+# Every file Ralph may leave in a run directory. All of them are written through
+# `redact`, so anything else appearing there is unscrubbed backend output.
+RETAINED_RUN_ARTIFACTS = {
+    "git-status-final.txt",
+    "git-status.txt",
+    "options.json",
+    "outcome.json",
+    "prompt.txt",
+    "sandbox.sb",
+    "session.json",
+    "stderr.log",
+    "stdout.ndjson",
+}
 
 
 class OpencodePreflightTest(RalphCliTestCase):
@@ -56,6 +72,48 @@ class OpencodePreflightTest(RalphCliTestCase):
             session["ralph_verification"]["fallback_models"],
             ["openai/gpt-5.5-codex"],
         )
+
+    def test_opencode_session_export_survives_a_cli_that_exits_before_its_write_lands(self) -> None:
+        # OpenCode writes the whole session at once and exits without waiting
+        # for the write to land, so an export past the pipe buffer arrives
+        # truncated under a zero exit status. Capturing to a pipe would
+        # therefore reject a delivered iteration as a contract failure; Ralph
+        # captures to a file.
+        final = "Work complete.\n<promise>COMPLETE</promise>"
+        completed = self.run_ralph(
+            env={
+                "FAKE_EVENTS": self._events(final),
+                "FAKE_EXPORT": self._export(final),
+                "FAKE_EXPORT_PIPE_TRUNCATION": "40",
+            }
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_dir = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())[-1]
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["ralph_verification"]["initial_model"], "openai/gpt-5.6-sol")
+        self._assert_only_retained_artifacts(run_dir)
+
+    def test_opencode_names_an_unparsable_export_apart_from_the_metadata_contract(self) -> None:
+        # A payload that is not JSON at all is a broken read or a broken export,
+        # not a session whose routing metadata Ralph refuses; conflating the two
+        # sends the operator hunting through metadata that was never in question.
+        rejected = self.run_ralph(env={"FAKE_EXPORT": "Exporting session: ses_1"})
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("session export was not valid JSON", rejected.stderr)
+        self.assertNotIn("omitted required metadata", rejected.stderr)
+        # The failure path is where a leaked capture would be likeliest, and it
+        # is the path with no session.json to hold the export redacted.
+        run_dir = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())[-1]
+        self._assert_only_retained_artifacts(run_dir)
+
+    def _assert_only_retained_artifacts(self, run_dir: Path) -> None:
+        # Every retained run artifact is written through `redact`; the raw
+        # session export is not, so it must never reach the run directory under
+        # any name at all.
+        retained = {path.name for path in run_dir.iterdir()}
+        # Guards against a vacuous subset check on an unwritten run directory.
+        self.assertIn("outcome.json", retained)
+        self.assertLessEqual(retained, RETAINED_RUN_ARTIFACTS)
 
     def test_opencode_rejects_later_streamed_provider_substitution(self) -> None:
         events = [

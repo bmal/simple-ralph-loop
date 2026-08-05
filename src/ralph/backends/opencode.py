@@ -16,7 +16,13 @@ Invariants:
   or an alternate/malformed provider route fails closed. After the run, a
   second-pass ``export`` re-verifies the persisted session's routing and final text
   independently — this verification is internal to the adapter and invisible to the
-  Loop (register E2).
+  Loop (register E2). That export is captured to an unlinked temporary file,
+  never a pipe: OpenCode writes the whole session at once and exits without
+  waiting for the write to land, so a session past the pipe buffer would be read
+  truncated under a zero exit status and a delivered iteration would be rejected
+  as a contract failure. Unlinked because the capture is raw backend output: no
+  crash may leave it behind as the one retained artifact that never went through
+  ``redact``.
 - A stop Ralph itself caused (timeout/interrupt) is classified *before* any
   contract failure, so a truncated or error-closed stream is never misreported as
   backend misbehavior.
@@ -39,6 +45,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -347,6 +354,65 @@ class EventResult:
         return "".join(text for owner, text in self.parts.values() if owner == message_id)
 
 
+def export_session(
+    worktree: Path,
+    session_id: str,
+    env: dict[str, str],
+    timeout: float | None,
+) -> str:
+    # An unlinked temporary file, never a pipe and never a named artifact: the
+    # export is raw backend output, so it must not be reachable by name the way
+    # every redacted `write_json` artifact is, and no crash can leave it behind.
+    try:
+        handle = tempfile.TemporaryFile()
+    except OSError as error:
+        raise RalphError(f"cannot capture the OpenCode session export: {error.strerror}") from None
+    with handle:
+        try:
+            process = subprocess.Popen(
+                ["opencode", "--pure", "export", session_id],
+                cwd=worktree,
+                env=env,
+                stdout=handle,
+                # Nothing reads this export's stderr, and a pipe is the very
+                # hazard being avoided, so there is no drain obligation at all.
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise RalphError(f"cannot run opencode: {error.strerror}") from None
+        controller = ProcessController(process, timeout or 0)
+        controller.start()
+        try:
+            try:
+                process.communicate(timeout=controller.remaining())
+            except subprocess.TimeoutExpired:
+                controller.timed_out = True
+                controller.stop_gracefully()
+                process.communicate()
+            if controller.timed_out:
+                raise TimeoutError
+            if controller.interrupted:
+                raise HandoffError(
+                    "OpenCode iteration interrupted by user",
+                    session_id,
+                    outcome="interrupted",
+                )
+        finally:
+            if process.poll() is None or controller.group_alive():
+                controller.stop_gracefully()
+            controller.finish()
+        if process.returncode:
+            raise RalphError("opencode session export failed")
+        try:
+            handle.seek(0)
+            return handle.read().decode("utf-8")
+        except UnicodeDecodeError:
+            raise RalphError("OpenCode session export contained invalid UTF-8") from None
+        except OSError as error:
+            raise RalphError(f"cannot read the OpenCode session export: {error.strerror}") from None
+
+
 def verify_session(
     worktree: Path,
     run_dir: Path,
@@ -359,55 +425,16 @@ def verify_session(
     if timeout is not None and timeout <= 0:
         raise TimeoutError
     deadline = time.monotonic() + timeout if timeout is not None else None
-    args = ["opencode", "--pure", "export", session_id]
+    exported = export_session(worktree, session_id, env, timeout)
     try:
-        process = subprocess.Popen(
-            args,
-            cwd=worktree,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            text=True,
-            encoding="utf-8",
-        )
-    except OSError as error:
-        raise RalphError(f"cannot run opencode: {error.strerror}") from None
-    controller = ProcessController(process, timeout or 0)
-    controller.start()
+        data = json.loads(exported)
+    except json.JSONDecodeError:
+        # Kept apart from the metadata contract below: a payload that is not JSON
+        # at all is a broken read or a broken export, not OpenCode reporting a
+        # session Ralph refuses to accept, and conflating the two sends the
+        # operator hunting through routing metadata that was never in question.
+        raise RalphError("OpenCode session export was not valid JSON") from None
     try:
-        try:
-            try:
-                stdout, stderr = process.communicate(timeout=controller.remaining())
-            except subprocess.TimeoutExpired:
-                controller.timed_out = True
-                controller.stop_gracefully()
-                stdout, stderr = process.communicate()
-        except UnicodeDecodeError:
-            controller.force_kill()
-            raise RalphError("OpenCode session export contained invalid UTF-8") from None
-        if controller.timed_out:
-            raise TimeoutError
-        if controller.interrupted:
-            raise HandoffError(
-                "OpenCode iteration interrupted by user",
-                session_id,
-                outcome="interrupted",
-            )
-    finally:
-        if process.poll() is None or controller.group_alive():
-            controller.stop_gracefully()
-        controller.finish()
-    exported = subprocess.CompletedProcess(
-        args=args,
-        returncode=process.returncode,
-        stdout=stdout,
-        stderr=stderr,
-    )
-    if exported.returncode:
-        raise RalphError("opencode session export failed")
-    try:
-        data = json.loads(exported.stdout)
         messages = data["messages"]
         if not isinstance(messages, list):
             raise TypeError
@@ -437,7 +464,7 @@ def verify_session(
             for part in parts
             if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
         )
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError):
         raise RalphError("OpenCode session export omitted required metadata") from None
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError

@@ -48,7 +48,9 @@ GROUP_SETTLE_SECONDS = 0.05
 
 
 class ProcessController:
-    def __init__(self, process: subprocess.Popen[str], timeout: float) -> None:
+    def __init__(
+        self, process: subprocess.Popen[str] | subprocess.Popen[bytes], timeout: float
+    ) -> None:
         self.process = process
         # The child is started in its own session (start_new_session=True), so it
         # leads a process group whose id equals its pid. Capturing the group id
