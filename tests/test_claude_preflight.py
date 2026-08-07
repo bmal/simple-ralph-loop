@@ -272,26 +272,29 @@ class ClaudePreflightTest(RalphCliTestCase):
         self.assertIn("Claude session failed", failed.stderr)
 
     def test_real_claude_init_contract_is_accepted(self) -> None:
-        # Mirror the init event a real subscription Claude Code 2.1.211 session
+        # Mirror the init event a real subscription Claude Code 2.1.224 session
         # emits: `apiKeySource` is "none" (no metered API key; billing rides the
         # OAuth login preflight proved), the tools list is the full built-in
         # harness set, and unknown informational fields are present. Regression
         # for a live run refused with "did not use subscription OAuth" because
-        # the parser demanded a fictional "oauth" value the CLI never reports.
+        # the parser demanded a fictional "oauth" value the CLI never reports,
+        # and for the 2.1.223 -> 2.1.224 upgrade that halted every run with
+        # "unknown or external tool" when the CLI added `Artifact` and
+        # `ListAgents` to the built-in set.
         event_lines = self._claude_events("<promise>COMPLETE</promise>").splitlines()
         init = json.loads(event_lines[0])
         init["tools"] = [
-            "Task", "Bash", "CronCreate", "CronDelete", "CronList", "DesignSync",
-            "Edit", "EnterWorktree", "ExitWorktree", "Monitor", "NotebookEdit",
-            "PushNotification", "Read", "RemoteTrigger", "ReportFindings",
-            "ScheduleWakeup", "SendMessage", "Skill", "TaskCreate", "TaskGet",
-            "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "ToolSearch",
-            "WebFetch", "WebSearch", "Workflow", "Write",
+            "Task", "Artifact", "Bash", "CronCreate", "CronDelete", "CronList",
+            "DesignSync", "Edit", "EnterWorktree", "ExitWorktree", "ListAgents",
+            "Monitor", "NotebookEdit", "PushNotification", "Read", "RemoteTrigger",
+            "ReportFindings", "ScheduleWakeup", "SendMessage", "Skill", "TaskCreate",
+            "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
+            "ToolSearch", "WebFetch", "WebSearch", "Workflow", "Write",
         ]
         init["slash_commands"] = ["init", "review"]
         init["agents"] = ["claude", "Explore", "general-purpose"]
-        init["capabilities"] = ["interrupt_receipt_v1"]
-        init["claude_code_version"] = "2.1.211"
+        init["capabilities"] = ["interrupt_receipt_v1", "msg_lifecycle_v1"]
+        init["claude_code_version"] = "2.1.224"
         event_lines[0] = json.dumps(init)
         result = self.run_ralph(
             backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}

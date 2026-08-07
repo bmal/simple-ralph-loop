@@ -64,11 +64,14 @@ MIN_CLAUDE_VERSION = (2, 1, 208)
 DEFAULT_CLAUDE_MANAGED_ROOT = "/Library/Application Support/ClaudeCode"
 DEFAULT_CLAUDE_PROFILES = "/usr/bin/profiles"
 # Built-in tool names a subscription Claude Code >= 2.1.208 session may report
-# in its init event (observed against 2.1.211). MCP tools are namespaced
+# in its init event (observed against 2.1.224). MCP tools are namespaced
 # `mcp__server__tool` and plugin tools carry their own names, so anything
-# outside this set still fails the subset assertion closed.
+# outside this set still fails the subset assertion closed. A Claude Code
+# upgrade that ships a new built-in halts every run until its name is added
+# here, so keep this set current with the newest supported CLI.
 CLAUDE_BUILTIN_TOOLS = {
     "Agent",
+    "Artifact",
     "AskUserQuestion",
     "Bash",
     "CronCreate",
@@ -83,6 +86,7 @@ CLAUDE_BUILTIN_TOOLS = {
     "Glob",
     "Grep",
     "LSP",
+    "ListAgents",
     "Monitor",
     "NotebookEdit",
     "PushNotification",
