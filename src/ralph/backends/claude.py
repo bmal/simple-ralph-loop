@@ -12,12 +12,20 @@ Invariants:
   resumable handoff.
 - The stream is read to EOF and may carry multiple turns. A second (or later) init
   is admitted only in a session that registered a background task
-  (``background_tasks_changed``); an unexplained duplicate init stays the hard
-  ``Claude emitted duplicate initialization metadata`` failure it is today. Results
-  are flushed at EOF in turn order — a ``result`` does *not* close a turn. The i-th
-  result belongs to the i-th turn; Ralph asserts equal counts and that each result
-  agrees with its turn's last message from the Backend itself, failing closed
-  otherwise. The Iteration's outcome is judged on the final turn.
+  (``background_tasks_changed``) while at least one turn was open — no turn, no
+  cause, so such a registration licenses nothing; an unexplained duplicate init
+  stays the hard ``Claude emitted duplicate initialization metadata`` failure it is
+  today. Results are flushed at EOF in turn order — a ``result`` does *not* close a
+  turn. The i-th result belongs to the i-th turn; Ralph asserts equal counts and
+  that each result agrees with its turn's last message from the Backend itself,
+  failing closed otherwise. The Iteration's outcome is judged on that final
+  message; a session that goes on after a result is the signature of a build that
+  flushes per turn instead, and fails closed naming that cause.
+- Marker semantics are per *message*, not per turn: the message the Iteration is
+  judged on decides completion and the needs-input halt, and a needs-input marker
+  in any other message of the Backend's own — an earlier turn's or an earlier
+  message of the final turn's — is one the Backend withdrew, so it warns on stderr
+  and continues rather than costing the Iteration.
 - ``parent_tool_use_id`` distinguishes the Backend's own messages (``None``) from a
   background subagent's (the launching tool-use id). Only the Backend's own messages
   assemble a turn's response and are scanned for completion/needs-input markers, so a
@@ -343,6 +351,28 @@ def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> st
     return "Claude returned a synthetic error instead of a model response"
 
 
+def event_after_result_reason(event: Any) -> str:
+    # Name the cause an operator can act on. F2's "results are flushed at EOF, in
+    # turn order" is the observation the whole turn attribution rests on, and it
+    # was taken from one Claude Code build; a session that *continues* after a
+    # result -- a fresh init, or a background registration once results have begun
+    # -- is the recognizable signature of a build that closes each turn with its
+    # own result instead. That is a CLI stream-shape change, not a misbehaving
+    # Backend, and blaming the Backend points the operator away from the fix.
+    # Every other event after a result stays the ordinary contract violation.
+    if (
+        isinstance(event, dict)
+        and event.get("type") == "system"
+        and event.get("subtype") in {"init", "background_tasks_changed"}
+    ):
+        return (
+            "Claude continued the session after a result, so this Claude Code build "
+            "flushes a result per turn instead of at end of stream; Ralph cannot "
+            "attribute turns in that shape"
+        )
+    return "Claude emitted an event after the terminal result"
+
+
 class ClaudeTurn:
     # One turn of a Claude session: the model its init reported, and the text of
     # each of the Backend's own (non-subagent) assistant messages in order. The
@@ -374,6 +404,16 @@ class ClaudeEventResult:
         # at EOF in turn order, so the last one is the final turn's.
         return self.results[-1] if self.results else None
 
+    @property
+    def superseded_texts(self) -> list[str]:
+        # Every message the Backend itself sent except the one the Iteration is
+        # judged on -- its last message of the final turn, which the F3 agreement
+        # check ties to `final_text`. Flattening the turns is what makes a marker
+        # the Backend spoke past *within* a turn as visible as one it spoke past
+        # across turns; both are the same withdrawal.
+        spoken = [text for turn in self.turns for text in turn.parent_texts]
+        return spoken[:-1]
+
     def accept(self, event: Any) -> None:
         if self.results:
             # Results are flushed at EOF in turn order. Once every turn's result
@@ -386,7 +426,7 @@ class ClaudeEventResult:
             results_complete = len(self.results) >= len(self.turns)
             is_result = isinstance(event, dict) and event.get("type") == "result"
             if results_complete or not is_result:
-                raise RalphError("Claude emitted an event after the terminal result")
+                raise RalphError(event_after_result_reason(event))
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
@@ -397,8 +437,12 @@ class ClaudeEventResult:
             # the later init: a duplicate init is admitted only in a session that
             # recorded a background task here, and an unexplained one still fails
             # closed. Synchronous subagents return inline as a tool result and
-            # never emit this, so they never flip the gate.
-            self.background_seen = True
+            # never emit this, so they never flip the gate. Neither does a
+            # registration arriving before the first init: F1 licenses the
+            # relaxation by observed *cause*, and no turn existed yet to launch
+            # anything, so such an event explains no later init.
+            if self.turns:
+                self.background_seen = True
             return
         if event_type == "system" and event.get("subtype") == "init":
             self._accept_init(event)
@@ -785,20 +829,23 @@ def _consume_claude_iteration(
     if explicit:
         # The final parent turn is authoritative for a needs-input halt.
         raise HandoffError("Claude requested operator input", result.session_id, explicit)
-    # A NEEDS_INPUT marker an earlier turn raised but the final turn withdrew is
-    # not a halt: the Backend itself took the question back (Probe B showed it
-    # re-emitting or dropping the marker per turn), so warn and continue rather
-    # than cost the Iteration -- mirroring the explicit-versus-inferred split.
+    # A NEEDS_INPUT marker the Backend raised in any message other than the one
+    # the Iteration is judged on is not a halt: the Backend itself took the
+    # question back (Probe B showed it re-emitting or dropping the marker per
+    # turn), so warn and continue rather than cost the Iteration -- mirroring the
+    # explicit-versus-inferred split. The withdrawal is per *message*: a marker
+    # spoken past within the final turn is the same withdrawal as one spoken past
+    # across turns, and neither may vanish silently.
     withdrawn: str | None = None
-    for earlier in result.results[:-1]:
-        withdrawn = explicit_needs_input(earlier)
+    for superseded in result.superseded_texts:
+        withdrawn = explicit_needs_input(superseded)
         if withdrawn:
             break
     if withdrawn:
         print(
-            "ralph: warning: an earlier turn requested operator input but the final "
-            "turn withdrew it; continuing to the next iteration:\n"
-            f"{redact(withdrawn)}",
+            "ralph: warning: the backend requested operator input earlier in the "
+            "session but its final message withdrew it; continuing to the next "
+            f"iteration:\n{redact(withdrawn)}",
             file=sys.stderr,
         )
     inferred = inferred_needs_input(final)

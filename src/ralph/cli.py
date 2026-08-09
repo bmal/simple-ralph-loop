@@ -4,11 +4,14 @@ commands.
 Invariants:
 - ``run`` validates the iteration budget (1..100), the timeout (finite, zero or
   positive, at most ``MAX_ITERATION_TIMEOUT_SECONDS``), the interactive-only label
-  (non-empty after stripping), and the model before any budget is spent, resolves
-  the default model per backend, then acquires the worktree lock and hands off to
-  the Loop. The Loop resolves the concrete interactive-only children via ``gh`` and
-  publishes the Loop protocol once the trust boundary is proven, not ``run``: the
-  resolution rides the ``gh`` dependency preflight proves and so cannot precede it.
+  (non-empty after stripping, and free of the line breaks that would let it
+  fabricate a bullet of its own where it interpolates into the Loop protocol — a
+  GitHub label can hold neither), and the model before any budget is spent,
+  resolves the default model per backend, then acquires the worktree lock and
+  hands off to the Loop. The Loop resolves the concrete interactive-only children
+  via ``gh`` and publishes the Loop protocol once the trust boundary is proven,
+  not ``run``: the resolution rides the ``gh`` dependency preflight proves and so
+  cannot precede it.
   ``resume`` takes no label: recovery is already the interactive session the label
   exists to demand.
 - ``clean`` removes only a real ``.git/ralph`` state directory, never following a
@@ -74,6 +77,13 @@ def run(args: argparse.Namespace) -> int:
     interactive_label = args.interactive_label.strip()
     if not interactive_label:
         raise RalphError("--interactive-label must not be empty or whitespace")
+    if "\n" in interactive_label or "\r" in interactive_label:
+        # The label interpolates raw into the Loop protocol's Markdown, so a line
+        # break would let a typo fabricate a protocol bullet of its own. A GitHub
+        # label can hold neither character, so nothing legitimate is refused.
+        raise RalphError(
+            "--interactive-label must not contain a newline or carriage return"
+        )
     # Carry the stripped label as the value the Loop resolves and publishes; the
     # concrete blocked children can only be resolved once preflight has proven the
     # shared gh dependency, so the Loop builds and publishes the protocol, not run.

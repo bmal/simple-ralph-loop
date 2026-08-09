@@ -116,9 +116,9 @@ verbatim in the `resume` and `run` commands it prints for a handed-off session
 so a recovered session re-establishes the identical relaxed boundary.
 
 Ralph snapshots the prompt once, starts a fresh session per iteration, and
-stops early only when the final turn's assistant output contains the exact
-standalone line `<promise>COMPLETE</promise>`. Exhausting the budget without that
-marker is an incomplete, non-zero result.
+stops early only when the final turn's last message from the backend itself
+contains the exact standalone line `<promise>COMPLETE</promise>`. Exhausting the
+budget without that marker is an incomplete, non-zero result.
 
 Some child issues embed an owner decision and must be worked interactively. The
 Loop protocol Ralph appends to every prompt names a configurable label — set with
@@ -147,15 +147,20 @@ reads the session to end of stream and accepts these multi-turn streams instead
 of ending the run: every turn's init re-proves the full trust boundary
 (subscription-only auth, full-auto mode, no external MCP servers, plugins, or
 unknown tools, and the same session id), the turns' results are attributed in
-order, and the iteration is judged on the final turn — a completion claim an
-earlier turn made but that later work superseded does not stop the run early. A
-second init is admitted only in a session that registered a background task; an
-unexplained duplicate init still fails closed. A subagent's own messages stay in
-the retained stream evidence but never count as the Backend's answer or as a
-completion/needs-input marker. The honest limit: the only bound on a background
-subagent that never drains is `--timeout` — Ralph adds no separate idle
-detection, so a wedged background task can hold an iteration open until the
-timeout fires. Resuming a handed-off session that still held a background task
+order, and the iteration is judged on the final turn's last message from the
+backend itself — a completion claim superseded by anything the backend said
+afterwards, in that turn or an earlier one, does not stop the run early, and a
+needs-input marker it superseded the same way warns on stderr and continues
+instead of halting. A second init is admitted only in a session that registered
+a background task while a turn was open; an unexplained duplicate init, and one
+explained only by a registration that preceded every turn, still fail closed. If
+a session instead goes on *after* a result — a shape no observed Claude Code
+build produces — Ralph fails closed naming that per-turn result flush as the
+cause. A subagent's own messages stay in the retained stream evidence but never
+count as the Backend's answer or as a completion/needs-input marker. The honest
+limit: the only bound on a background subagent that never drains is `--timeout`
+— Ralph adds no separate idle detection, so a wedged background task can hold an
+iteration open until the timeout fires. Resuming a handed-off session that still held a background task
 replays that task's notification as a leading turn, harmless in the interactive
 `ralph resume` (which is why headless resume is not attempted).
 

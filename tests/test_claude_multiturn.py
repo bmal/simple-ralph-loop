@@ -116,6 +116,49 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("duplicate initialization metadata", result.stderr)
 
+    def test_a_registration_before_the_first_init_licenses_nothing(self) -> None:
+        # F1 licenses the relaxation by *observed cause*: a background task some
+        # turn launched. A registration arriving before any turn exists is not
+        # one -- no turn could have made it -- so it must not license the later
+        # duplicate init in a session that never launched anything.
+        events = [
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_result_event("Turn two.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("duplicate initialization metadata", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+
+    def test_a_registration_after_the_first_init_licenses_a_later_init_as_today(self) -> None:
+        # The other side of the same edge: once a turn is open the registration
+        # licenses exactly as before, including with a drained (empty) task list.
+        drained = self._claude_background_event("claude-session-1")
+        drained["tasks"] = []
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            drained,
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "Done.\n<promise>COMPLETE</promise>", "claude-session-1"
+            ),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_result_event(
+                "Done.\n<promise>COMPLETE</promise>", "claude-session-1"
+            ),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
     def test_a_result_count_that_does_not_match_the_turn_count_fails_closed(self) -> None:
         # Two turns but one result: the stream ended mid-session, so Ralph must not
         # judge a partial iteration.
@@ -239,6 +282,149 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertIn("withdrew it", result.stderr)
         _, outcome = self._read_outcome()
         self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+    def test_needs_input_withdrawn_inside_the_final_turn_warns_and_continues(self) -> None:
+        # The withdrawal F7 forgives is per *message*, not per turn: a marker the
+        # Backend emitted in the final turn and then spoke past reaches neither
+        # the halt nor the warning under a turn-granular scan, so a genuine
+        # operator question is discarded silently. Built explicitly rather than
+        # through _claude_multiturn_events because the shape is deliberately one
+        # the well-formed builder cannot express: two Backend messages in a turn.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "<promise>NEEDS_INPUT</promise>\nWhich option, A or B?", "claude-session-1"
+            ),
+            self._claude_assistant_event(
+                "Meanwhile I tidied the imports.", "claude-session-1"
+            ),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_result_event("Meanwhile I tidied the imports.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("withdrew it", result.stderr)
+        self.assertIn("Which option, A or B?", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+    def test_needs_input_withdrawn_inside_an_earlier_turn_warns_and_continues(self) -> None:
+        # The same generalisation from the other side: the marker is in a
+        # non-final message of a turn that is not the final one either, so no
+        # result ever carries it.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "<promise>NEEDS_INPUT</promise>\nWhich option, A or B?", "claude-session-1"
+            ),
+            self._claude_assistant_event("Turn one, second thoughts.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two done.", "claude-session-1"),
+            self._claude_result_event("Turn one, second thoughts.", "claude-session-1"),
+            self._claude_result_event("Turn two done.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("withdrew it", result.stderr)
+        self.assertIn("Which option, A or B?", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+    def test_the_withdrawn_marker_warning_does_not_blame_an_earlier_turn(self) -> None:
+        # The scan is per message now, so the warning must not tell the operator
+        # the marker came from an earlier *turn* -- it may have come from an
+        # earlier message of the very turn the Iteration was judged on.
+        withdrawn = self._claude_multiturn_events(
+            [
+                {"text": "<promise>NEEDS_INPUT</promise>\nShould I pick option A?"},
+                {"text": "Resolved it from the tracker; option A it is."},
+            ]
+        )
+        result = self._run(withdrawn)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("withdrew it", result.stderr)
+        self.assertNotIn("earlier turn", result.stderr)
+
+    def test_completion_in_a_non_final_message_of_the_final_turn_does_not_complete(self) -> None:
+        # The COMPLETE half is untouched by the needs-input generalisation: a
+        # completion claim the Backend spoke past inside its final turn is still
+        # superseded, exactly as one superseded across turns is.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "Done early.\n<promise>COMPLETE</promise>", "claude-session-1"
+            ),
+            self._claude_assistant_event("Actually more remained.", "claude-session-1"),
+            self._claude_result_event("Actually more remained.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+    def test_a_session_that_continues_after_a_result_names_the_per_turn_flush(self) -> None:
+        # F2's "results are flushed at EOF, in turn order" is the load-bearing
+        # observation, taken from one Claude Code build. A build that closes each
+        # turn with its own result must still fail closed -- but the operator who
+        # meets this after an overnight run has to be pointed at the stream-shape
+        # change, not at a misbehaving backend. Both continuation signatures are
+        # asserted: a background registration and a fresh init.
+        continued = {
+            "background registration": self._claude_background_event("claude-session-1"),
+            "fresh init": self._claude_init_event("claude-session-1"),
+        }
+        for signature, event in continued.items():
+            with self.subTest(signature=signature):
+                events = [
+                    self._claude_init_event("claude-session-1"),
+                    self._claude_assistant_event("Turn one.", "claude-session-1"),
+                    self._claude_result_event("Turn one.", "claude-session-1"),
+                    event,
+                    self._claude_assistant_event("Turn two.", "claude-session-1"),
+                    self._claude_result_event("Turn two.", "claude-session-1"),
+                ]
+                result = self._run(self._claude_stream(events))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("a result per turn", result.stderr)
+                self.assertNotIn("event after the terminal result", result.stderr)
+                # Behaviour is unchanged: still fail closed, still a consuming
+                # resumable handoff with a working resume command.
+                _, outcome = self._read_outcome()
+                self.assertEqual(outcome["outcome"], "backend_contract_failure")
+                self.assertIn("manual resume:", result.stderr)
+                self.assertIn("--session claude-session-1", result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_other_events_after_the_terminal_result_keep_the_original_message(self) -> None:
+        # Only a *continuing* session gets the new diagnostic; a second result or
+        # a trailing assistant message is still an ordinary contract violation.
+        trailing = {
+            "second result": self._claude_result_event("Turn one.", "claude-session-1"),
+            "trailing assistant": self._claude_assistant_event(
+                "Turn one.", "claude-session-1"
+            ),
+        }
+        for signature, event in trailing.items():
+            with self.subTest(signature=signature):
+                events = [
+                    self._claude_init_event("claude-session-1"),
+                    self._claude_assistant_event("Turn one.", "claude-session-1"),
+                    self._claude_result_event("Turn one.", "claude-session-1"),
+                    event,
+                ]
+                result = self._run(self._claude_stream(events))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("event after the terminal result", result.stderr)
+                self.assertNotIn("a result per turn", result.stderr)
+                for path in self.calls.iterdir():
+                    path.unlink()
 
     def test_model_usage_is_unioned_across_results(self) -> None:
         events = [
