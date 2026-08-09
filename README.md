@@ -140,7 +140,8 @@ replays that task's notification as a leading turn, harmless in the interactive
 `ralph resume` (which is why headless resume is not attempted).
 
 Questions, timeout, interruption, backend failure, or malformed output stop the
-loop and hand off for manual recovery; no iteration is retried automatically.
+loop and hand off for manual recovery; Ralph spends exactly one session per
+iteration and never restarts one itself.
 Ralph prints a `ralph resume` command for the
 affected backend session and, when budget remains, a complete command for
 starting a new Ralph invocation. `ralph resume` re-establishes the same

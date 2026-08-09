@@ -454,7 +454,7 @@ class RalphCliTestCase(unittest.TestCase):
 
     def _claude_sequence(self, streams: list[str]) -> Path:
         # One stdout stream per `claude -p` call, so a test can give consecutive
-        # iterations different behaviour (a lost iteration, then its replacement).
+        # iterations different behaviour across a multi-iteration run.
         sequence = self.base / "claude-sequence"
         sequence.mkdir()
         for index, events in enumerate(streams, 1):

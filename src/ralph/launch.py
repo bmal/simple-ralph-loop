@@ -488,7 +488,7 @@ def restart_command(
         "--timeout",
         str(timeout),
     ]
-    # Each unsafe flag reproduces independently so the replacement run re-proves
+    # Each unsafe flag reproduces independently so the continuation run re-proves
     # the same relaxed boundary and nothing more (register D7).
     if allow_agents:
         args.append("--unsafe-allow-agents")

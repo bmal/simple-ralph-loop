@@ -106,6 +106,13 @@ class RunLoopTest(RalphCliTestCase):
         self.assertIn("explicit blocker evidence", composed_prompts[0])
         self.assertIn("<promise>NEEDS_INPUT</promise>", composed_prompts[0])
         self.assertEqual((self.calls / "auth-count").read_text().strip(), "3")
+        # Each consumed iteration retains exactly one outcome entry, numbered in
+        # order, and none carries a retry marker: the loop spends one session per
+        # slot and never restarts a slot itself.
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        recorded = json.loads((run_dir / "outcome.json").read_text())["iterations"]
+        self.assertEqual([entry["number"] for entry in recorded], [1, 2, 3])
+        self.assertTrue(all("retried" not in entry for entry in recorded))
 
     def test_each_fresh_session_reproves_backend_trust(self) -> None:
         sequence = self._sequence(["First child complete.", "Second child complete."])

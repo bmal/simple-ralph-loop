@@ -59,7 +59,6 @@ from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import (
     HandoffError,
     RalphError,
-    RetryableIterationError,
     raise_backend_contract_failure,
 )
 from ..gitcontext import command, write_json
@@ -154,17 +153,6 @@ UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
     }
 )
 CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running Ralph"
-# DEAD as of the multi-turn parser (#31): the background launch it corrected is now
-# a supported multi-turn path, not a lost iteration, so nothing produces the
-# retryable failure this text rode. Retained only until #32 removes the whole
-# replacement-attempt machinery (RetryableIterationError and the Loop allowance).
-SUBAGENT_CORRECTION = (
-    "\n\nIMPORTANT -- the previous iteration was killed mid-turn and its work was "
-    "lost because it launched a background subagent. The Agent/Task tool defaults "
-    "to run_in_background: true, so every launch must set run_in_background: "
-    "false explicitly. If you cannot guarantee that, do not use subagents at all "
-    "this iteration; do the work yourself.\n"
-)
 # Appended to the refusal only when a Claude agent vector — the `.claude/agents`
 # directory or the settings.json `agent` key — is the *sole* blocker, so the
 # operator can discover the supported opt-out from the failure itself. It is
@@ -178,15 +166,6 @@ AGENT_OPT_OUT_HINT = (
     "settings.json 'agent' key for this run (unsafe: Ralph then cannot prove "
     "Claude subagent isolation)"
 )
-
-
-class BackgroundSubagentLaunch(RalphError):
-    # DEAD as of the multi-turn parser (#31): `accept` no longer raises this at a
-    # `background_tasks_changed` -- it records the registration and admits the
-    # later init instead -- so nothing constructs this type and the consume loop's
-    # handler for it is unreachable. Retained only until #32 removes it with the
-    # rest of the replacement-attempt machinery.
-    pass
 
 
 def validate_model(model: str) -> None:
@@ -747,14 +726,6 @@ def _consume_claude_iteration(
                 # event is an artifact of the stop, not a contract violation,
                 # so report the timeout or interruption instead.
                 raise_if_controlled_stop(controller, "Claude", result.session_id)
-                if isinstance(error, BackgroundSubagentLaunch) and result.session_id:
-                    # DEAD as of the multi-turn parser (#31): nothing raises
-                    # BackgroundSubagentLaunch any more, so this branch is
-                    # unreachable. Retained until #32 removes the replacement
-                    # machinery it feeds.
-                    raise RetryableIterationError(
-                        str(error), result.session_id, SUBAGENT_CORRECTION
-                    ) from None
                 if result.session_id:
                     raise HandoffError(
                         str(error),
