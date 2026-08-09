@@ -11,6 +11,10 @@ Invariants:
 - ``git_context`` refuses a detached HEAD and requires a GitHub ``origin``; a
   worktree's git-dir and branch are resolved by absolute path so downstream state
   lands under the worktree's private Git directory.
+- ``interactive_only_issues`` resolves the open issues carrying the configured
+  interactive-only label through ``gh`` and this one subprocess helper; a non-zero
+  exit or non-numeric-array output fails closed with its own message, and a
+  well-formed empty listing yields an empty list rather than an error.
 - ``write_json`` scrubs through ``redact`` before writing, so no retained artifact
   can carry a subscription credential echoed by the backend.
 
@@ -103,6 +107,40 @@ def git_context(worktree_text: str | None) -> tuple[Path, Path, str, str, str]:
     remote = command(["git", "remote", "get-url", "origin"], cwd=top).stdout.strip()
     status = command(["git", "status", "--porcelain=v1", "--branch"], cwd=top).stdout
     return top, git_dir, branch, status, github_slug(remote)
+
+
+def interactive_only_issues(
+    slug: str, label: str, worktree: Path, env: dict[str, str]
+) -> list[int]:
+    """Resolve the numbers of the open issues carrying ``label`` -- the children
+    reserved for an interactive operator session -- so the Loop protocol can name
+    the concrete interactive-only work rather than leaving the Backend to apply the
+    rule from memory. Rides the same ``gh`` dependency preflight has already proven and
+    this one subprocess helper. A non-zero exit or output that is not a JSON array
+    of issue numbers fails the run closed with its own message, consistent with
+    every other preflight proof; a well-formed empty listing is returned as an
+    empty list rather than an error. Numbers are returned sorted so the injected
+    prompt and the retained artifact are deterministic."""
+    result = command(
+        ["gh", "issue", "list", "--repo", slug, "--label", label, "--state", "open",
+         "--json", "number"],
+        cwd=worktree,
+        env=env,
+        allow_failure=True,
+    )
+    if result.returncode:
+        raise RalphError(
+            f"gh could not list the open issues labelled '{label}' "
+            "(the interactive-only children)"
+        )
+    try:
+        numbers = sorted(int(issue["number"]) for issue in json.loads(result.stdout))
+    except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+        raise RalphError(
+            f"gh returned malformed output for the open issues labelled '{label}' "
+            "(the interactive-only children)"
+        ) from None
+    return numbers
 
 
 def write_json(path: Path, value: Any) -> None:

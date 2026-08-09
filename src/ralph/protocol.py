@@ -4,13 +4,16 @@ Invariants:
 - The protocol text appended to every prompt and the parser that reads its markers
   back out live together so the contract and its detection can never drift apart.
 - The protocol is built once per run from the configured interactive-only label
-  (``build_protocol``) rather than being a bare constant, so the label rule and the
-  markers it references stay in this one module. The built text is published for the
-  whole run through ``set_active_protocol`` and read back by the backends through
-  ``active_protocol`` -- import the *functions*, never the ``_ACTIVE_PROTOCOL``
-  global, exactly as ``redaction`` is used: a caller that captured the old binding
-  would keep appending a stale label. ``active_protocol`` always holds the default
-  label's protocol until ``run`` overrides it, so it is never unset.
+  and the concrete children Ralph resolved as carrying it (``build_protocol``)
+  rather than being a bare constant, so the label rule, the resolved facts, and the
+  markers they reference stay in this one module. The built text is published for
+  the whole run through ``set_active_protocol`` and read back by the backends
+  through ``active_protocol`` -- import the *functions*, never the
+  ``_ACTIVE_PROTOCOL`` global, exactly as ``redaction`` is used: a caller that
+  captured the old binding would keep appending a stale label. ``active_protocol``
+  always holds the default label's protocol until the loop overrides it -- once the
+  trust boundary is proven and the concrete blocked children are resolved, before
+  the first session -- so it is never unset.
 - Marker detection reads only *visible* Markdown: fenced code, indented code, and
   block quotes are excluded so a ``<promise>...</promise>`` line quoted inside the
   prompt, a code sample, or tool output is never mistaken for an iteration result.
@@ -46,10 +49,37 @@ from typing import Any
 DEFAULT_INTERACTIVE_LABEL = "may-ask-owner"
 
 
-def build_protocol(interactive_label: str) -> str:
+def build_protocol(
+    interactive_label: str, interactive_only_issues: list[int] | None = None
+) -> str:
     """Return the Loop protocol text for a run, naming ``interactive_label`` as the
     label that reserves a child for an interactive operator session. Built once per
-    run so the label rule and the markers it references stay in this one module."""
+    run so the label rule and the markers it references stay in this one module.
+
+    ``interactive_only_issues`` are the concrete open children Ralph resolved as
+    carrying the label (see ``gitcontext.interactive_only_issues``); their numbers
+    are injected so the Backend is given the facts, not only the rule. ``None`` means
+    the run has not resolved them yet -- the safe default before the trust boundary
+    is proven -- and omits the concrete line; a list (including an empty one) states
+    the resolved children explicitly, an empty result set as such rather than
+    omitted. The injected list is advisory: Ralph cannot observe which child the
+    Backend selects, so only the resulting needs-input halt is enforced."""
+    if interactive_only_issues is None:
+        resolved = ""
+    elif interactive_only_issues:
+        rendered = ", ".join(f"#{number}" for number in interactive_only_issues)
+        resolved = (
+            f"\n- Resolved at the start of this run, the open children carrying "
+            f"`{interactive_label}` are: {rendered}. Treat exactly these as blocked "
+            f"for this iteration and do not select any of them. This resolved list "
+            f"is advisory -- Ralph cannot observe which child you select -- so honour "
+            f"it; only the resulting needs-input halt is enforced."
+        )
+    else:
+        resolved = (
+            f"\n- Resolved at the start of this run, no open child currently carries "
+            f"`{interactive_label}`, so none is blocked on that basis."
+        )
     return f"""
 
 Ralph loop protocol:
@@ -57,7 +87,7 @@ Ralph loop protocol:
 - A child issue labelled `{interactive_label}` is reserved for an interactive
   session with the operator and is blocked for this iteration: do not select it,
   and never guess the decision it embeds. Select the next unblocked child that
-  does not carry `{interactive_label}` instead.
+  does not carry `{interactive_label}` instead.{resolved}
 - When every remaining actionable child is labelled `{interactive_label}`, do not
   emit <promise>COMPLETE</promise> -- work remains and is waiting on the operator.
   Emit <promise>NEEDS_INPUT</promise> naming those `{interactive_label}` children
@@ -86,7 +116,8 @@ Ralph loop protocol:
 
 # The protocol built for the current run, published here for the whole process so
 # the backends append the run's configured label. Defaults to the built-in label's
-# protocol so it is never unset; ``run`` overrides it once per run. Import
+# protocol so it is never unset; the loop overrides it once per run, after preflight
+# proves gh and the concrete blocked children are resolved. Import
 # ``active_protocol`` / ``set_active_protocol``, never this global (see Invariants).
 _ACTIVE_PROTOCOL = build_protocol(DEFAULT_INTERACTIVE_LABEL)
 

@@ -717,6 +717,104 @@ class InteractiveLabelTest(RalphCliTestCase):
                 for path in self.calls.iterdir():
                     path.unlink()
 
+    def test_resolved_blocked_issue_numbers_reach_both_backends_prompts(self) -> None:
+        # #34: Ralph resolves the concrete open issues carrying the label via gh
+        # and injects their numbers into the composed prompt, so the backend is
+        # given the facts rather than a rule it must apply from memory.
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self.run_ralph(
+                    backend=backend,
+                    env={"FAKE_GH_ISSUE_LIST": '[{"number":41},{"number":12}]'},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                composed = self._composed_prompt(backend)
+                flat = " ".join(composed.split())
+                # Both concrete numbers appear, sorted, alongside the label rule.
+                self.assertIn("#12", composed)
+                self.assertIn("#41", composed)
+                self.assertIn("#12, #41", flat)
+                self.assertIn("may-ask-owner", composed)
+                # The honest limit is stated where the facts are injected.
+                self.assertIn("advisory", flat)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_empty_resolution_still_composes_a_valid_prompt_stating_none(self) -> None:
+        # An empty result set is stated as empty rather than omitted or malformed;
+        # the rule from #33 is still present and the run completes normally.
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self.run_ralph(backend=backend)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                composed = self._composed_prompt(backend)
+                flat = " ".join(composed.split())
+                self.assertIn("no open child currently carries", flat)
+                self.assertNotIn("#", composed.split("Ralph loop protocol:")[1])
+                # The rule itself is unchanged and still present.
+                self.assertIn("reserved for an interactive session", flat)
+                self.assertIn("blocked for this iteration", flat)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_gh_issue_list_failure_fails_the_run_closed_before_budget(self) -> None:
+        # A non-zero gh exit for the issue-list query fails closed before any
+        # backend session, with a message naming what was being queried.
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self.run_ralph(
+                    backend=backend, env={"FAKE_GH_ISSUE_LIST_FAIL": "1"}
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("interactive-only children", result.stderr)
+                self.assertIn("may-ask-owner", result.stderr)
+                # Fail closed before budget: no backend session was started.
+                self.assertFalse((self.calls / "stdin").exists())
+                self.assertFalse((self.calls / "claude-stdin").exists())
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_malformed_gh_output_fails_closed_with_its_own_message(self) -> None:
+        # Malformed output is not treated as an empty set: it fails closed with a
+        # distinct message before any session runs.
+        result = self.run_ralph(
+            env={"FAKE_GH_ISSUE_LIST_MALFORMED": "not-json-at-all"}
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("malformed", result.stderr)
+        self.assertIn("interactive-only children", result.stderr)
+        self.assertFalse((self.calls / "stdin").exists())
+
+    def test_resolution_happens_once_per_run_and_is_recorded(self) -> None:
+        # The resolution rides one gh query per run, not one per Iteration, and the
+        # retained run artifacts record what was resolved.
+        sequence = self._sequence(["First child, still working.", "Second child, still working."])
+        result = self.run_ralph(
+            "--iterations",
+            "2",
+            env={
+                "FAKE_SEQUENCE_DIR": str(sequence),
+                "FAKE_GH_ISSUE_LIST": '[{"number":7},{"number":9}]',
+            },
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # Two iterations ran (each re-proves auth) but the label list was resolved
+        # exactly once.
+        gh_calls = (self.calls / "gh").read_text().splitlines()
+        self.assertEqual(sum(line.startswith("issue list") for line in gh_calls), 1)
+        self.assertEqual(sum(line.startswith("auth status") for line in gh_calls), 2)
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        recorded = json.loads((run_dir / "interactive-only.json").read_text())
+        self.assertEqual(recorded["label"], "may-ask-owner")
+        self.assertEqual(recorded["issues"], [7, 9])
+
+    def test_custom_label_is_passed_to_the_gh_query(self) -> None:
+        # The configured label, not the default, is what gh is asked to resolve.
+        result = self.run_ralph("--interactive-label", "owner-decides")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        gh_calls = (self.calls / "gh").read_text()
+        self.assertIn("issue list --repo example/project --label owner-decides", gh_calls)
+
     def test_resume_does_not_accept_the_interactive_label_option(self) -> None:
         result = self.resume_ralph(
             "claude",

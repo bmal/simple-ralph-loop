@@ -4,7 +4,9 @@ in fresh full-auto coding-agent sessions against a finite Iteration budget.
 Module map — start here, then open only the module you need:
 
 - ``cli``          — argument parsing and the run/clean/resume commands; ``main``.
-- ``loop``         — the budgeted Iteration loop, handoff printing, outcome recording.
+- ``loop``         — the budgeted Iteration loop, handoff printing, outcome
+                     recording, and the once-per-run resolution of the concrete
+                     interactive-only children (after preflight proves ``gh``).
 - ``launch``       — the Launch chain: wrapped argv, the power-assertion seam and
                      ``CaffeinateAssertion``, host-isolation profile + sandbox wrap,
                      and recovery-command (resume/restart) formatting.
@@ -18,11 +20,13 @@ Module map — start here, then open only the module you need:
                      Claude constants and host paths, event accumulation, iteration,
                      session persistence.
 - ``protocol``     — the Loop protocol text (built once per run from the
-                     interactive-only label) and completion/needs-input detection.
+                     interactive-only label and the concrete children Ralph
+                     resolved as carrying it) and completion/needs-input detection.
 - ``process``      — process-group control, timeouts, controlled-stop classification,
                      process identity.
 - ``locking``      — Git-private state directories, the worktree lock, lock metadata.
-- ``gitcontext``   — the subprocess helper, prompt reading, git/GitHub context,
+- ``gitcontext``   — the subprocess helper, prompt reading, git/GitHub context
+                     (incl. resolving the interactive-only issues via ``gh``),
                      redacted JSON artifact writing.
 - ``environment``  — the sanitized session environment, banned LLM env vars, the
                      unsafe-environment refusal.

@@ -72,6 +72,19 @@ class RalphCliTestCase(unittest.TestCase):
             case "$1 $2" in
               "auth status") exit 0 ;;
               "repo view") printf '%s\\n' '{"url":"https://github.com/example/project"}' ;;
+              "issue list")
+                # Resolving the interactive-only children (#34). A test opts a
+                # non-zero exit in with FAKE_GH_ISSUE_LIST_FAIL and malformed
+                # output in with FAKE_GH_ISSUE_LIST_MALFORMED; otherwise the
+                # listing is FAKE_GH_ISSUE_LIST, defaulting to the well-formed
+                # empty array gh returns when no issue carries the label.
+                test "${FAKE_GH_ISSUE_LIST_FAIL:-0}" = "0" || exit 1
+                if test -n "${FAKE_GH_ISSUE_LIST_MALFORMED:-}"; then
+                  printf '%s\\n' "${FAKE_GH_ISSUE_LIST_MALFORMED}"
+                else
+                  printf '%s\\n' "${FAKE_GH_ISSUE_LIST:-[]}"
+                fi
+                ;;
               *) exit 2 ;;
             esac
             """,

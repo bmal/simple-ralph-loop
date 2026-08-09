@@ -126,12 +126,19 @@ Loop protocol Ralph appends to every prompt names a configurable label — set w
 the backend to treat a child carrying it as blocked for this iteration: select the
 next unblocked child that does not carry it, and when only labelled children
 remain, halt with `<promise>NEEDS_INPUT</promise>` naming them rather than claiming
-completion. The honest limit: this selection is *advisory*. Ralph cannot observe
-which child the backend actually picks, so it cannot enforce the choice — the same
-class of prompt-level control that steering the backend away from background
-subagents used to be. What *is* mechanical is the escalation: the needs-input
-marker is detected and halts the run. `ralph resume` takes no label, because
-recovery is already the interactive session the label exists to demand.
+completion. So the backend is given facts rather than a rule to apply from memory,
+Ralph resolves the concrete open issues carrying the label — once per run, through
+the same `gh` dependency preflight already proves, before the first session spends
+budget — and injects their numbers into the prompt. A failed or malformed query
+fails the run closed, like every other preflight proof; an empty result set is
+stated as empty rather than omitted. The honest limit: this selection is
+*advisory*. Ralph cannot observe which child the backend actually picks, so it
+cannot enforce the choice — the same class of prompt-level control that steering
+the backend away from background subagents used to be. Injecting the concrete
+numbers narrows the gap but does not close it. What *is* mechanical is the
+escalation: the needs-input marker is detected and halts the run. `ralph resume`
+takes no label, because recovery is already the interactive session the label
+exists to demand.
 
 A Claude session may run across several turns. Claude Code's Agent/Task subagent
 tool defaults to background execution, and a subagent that finishes after the

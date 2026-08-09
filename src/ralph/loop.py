@@ -26,11 +26,21 @@ Invariants:
   (register D7). The loop threads ``args.unsafe_no_sandbox`` into that gate and
   into ``print_handoff`` so recovery reproduces the opt-out, and governs nothing
   else about host isolation.
+- The concrete interactive-only children are resolved once per run, after the first
+  iteration's preflight has proven the shared ``gh`` dependency and before that
+  session spends budget: the loop asks ``gitcontext.interactive_only_issues`` for
+  the open issues carrying the configured label, publishes the Loop protocol
+  enriched with their numbers through ``set_active_protocol``, and retains the
+  resolved set under ``interactive-only.json``. A failed or malformed query fails
+  the run closed like any other preflight proof. The resolution is advisory --
+  Ralph cannot observe which child the Backend selects -- so only the resulting
+  needs-input halt is mechanical.
 
 Depends on / must not know: ``redaction`` (functions only), ``locking``,
-``gitcontext``, ``launch``, ``errors``, and a resolved ``Backend`` (``cli`` resolves
-it through the registry and passes it in). It must not know which concrete Backend
-it holds, nor how that Backend consumes the argv or produces its events.
+``gitcontext``, ``protocol`` (``build_protocol`` / ``set_active_protocol``),
+``launch``, ``errors``, and a resolved ``Backend`` (``cli`` resolves it through the
+registry and passes it in). It must not know which concrete Backend it holds, nor
+how that Backend consumes the argv or produces its events.
 
 See also: ``launch`` (owns the wrapped argv, the profile gate, and recovery-command
 formatting), ``cli`` (``run`` resolves the Backend, acquires the lock, then calls
@@ -53,7 +63,7 @@ from .errors import (
     RalphError,
     StartedIterationError,
 )
-from .gitcontext import command, write_json
+from .gitcontext import command, interactive_only_issues, write_json
 from .launch import (
     CaffeinateAssertion,
     establish_sandbox,
@@ -61,6 +71,7 @@ from .launch import (
     restart_command,
 )
 from .locking import secure_state_directory
+from .protocol import build_protocol, set_active_protocol
 from .redaction import collect_secrets, redact, set_active_redactor
 
 
@@ -237,6 +248,22 @@ def run_protected(
             # console output is attributable to a specific iteration.
             print(f"ralph: iteration {number} of {args.iterations}", file=sys.stderr)
             backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
+            if number == 1:
+                # Resolve the concrete interactive-only children once per run, now
+                # that preflight has proven the shared gh dependency, and publish
+                # the enriched protocol before this first session spends budget; a
+                # failed or malformed query fails the run closed here. The resolved
+                # set is retained so the run's evidence records what was resolved.
+                interactive_only = interactive_only_issues(
+                    slug, args.interactive_label, worktree, env
+                )
+                set_active_protocol(
+                    build_protocol(args.interactive_label, interactive_only)
+                )
+                write_json(
+                    run_dir / "interactive-only.json",
+                    {"label": args.interactive_label, "issues": interactive_only},
+                )
             iteration_started = datetime.now(timezone.utc).isoformat()
             # A started session consumes its slot whatever the outcome; the loop
             # never restarts a slot itself.

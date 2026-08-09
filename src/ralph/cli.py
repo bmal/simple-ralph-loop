@@ -5,10 +5,12 @@ Invariants:
 - ``run`` validates the iteration budget (1..100), the timeout (finite, zero or
   positive, at most ``MAX_ITERATION_TIMEOUT_SECONDS``), the interactive-only label
   (non-empty after stripping), and the model before any budget is spent, resolves
-  the default model per backend, builds the Loop protocol once from the label and
-  publishes it through ``set_active_protocol``, then acquires the worktree lock and
-  hands off to the Loop. ``resume`` takes no label: recovery is already the
-  interactive session the label exists to demand.
+  the default model per backend, then acquires the worktree lock and hands off to
+  the Loop. The Loop resolves the concrete interactive-only children via ``gh`` and
+  publishes the Loop protocol once the trust boundary is proven, not ``run``: the
+  resolution rides the ``gh`` dependency preflight proves and so cannot precede it.
+  ``resume`` takes no label: recovery is already the interactive session the label
+  exists to demand.
 - ``clean`` removes only a real ``.git/ralph`` state directory, never following a
   symlink or deleting an unexpected file type, and refuses while a live loop holds
   the worktree lock.
@@ -26,7 +28,7 @@ Invariants:
 
 Depends on / must not know: the ``backends`` package (defaults, the registry, and
 the resolved Backend's five interface names), ``redaction`` (functions only),
-``protocol`` (``build_protocol`` / ``set_active_protocol`` and the default label),
+``protocol`` (the default interactive-only label),
 ``gitcontext``, ``launch`` (``session_argv``, ``establish_sandbox``), ``locking``
 (the worktree lock and ``secure_state_directory``), ``loop``, ``process``
 (timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
@@ -55,7 +57,7 @@ from .launch import establish_sandbox, session_argv
 from .locking import WorktreeLock, secure_state_directory
 from .loop import run_locked
 from .process import MAX_ITERATION_TIMEOUT_SECONDS
-from .protocol import DEFAULT_INTERACTIVE_LABEL, build_protocol, set_active_protocol
+from .protocol import DEFAULT_INTERACTIVE_LABEL
 from .redaction import collect_secrets, set_active_redactor
 
 
@@ -72,12 +74,13 @@ def run(args: argparse.Namespace) -> int:
     interactive_label = args.interactive_label.strip()
     if not interactive_label:
         raise RalphError("--interactive-label must not be empty or whitespace")
+    # Carry the stripped label as the value the Loop resolves and publishes; the
+    # concrete blocked children can only be resolved once preflight has proven the
+    # shared gh dependency, so the Loop builds and publishes the protocol, not run.
+    args.interactive_label = interactive_label
     backend = resolve(args.backend)
     args.model = args.model or DEFAULT_MODELS[args.backend]
     backend.validate_model(args.model)
-    # Build the Loop protocol once per run from the configured label and publish it
-    # for the whole run; both backends append it to the prompt exactly as before.
-    set_active_protocol(build_protocol(interactive_label))
 
     prompt_path, prompt = read_prompt(args.prompt)
     worktree, git_dir, branch, status, slug = git_context(args.worktree)

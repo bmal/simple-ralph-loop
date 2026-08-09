@@ -14,6 +14,7 @@ from harness import RalphCliTestCase
 RETAINED_RUN_ARTIFACTS = {
     "git-status-final.txt",
     "git-status.txt",
+    "interactive-only.json",
     "options.json",
     "outcome.json",
     "prompt.txt",
