@@ -263,9 +263,19 @@ class RalphCliTestCase(unittest.TestCase):
                 printf '%s\n' "${FAKE_CLAUDE_AUTH}"
                 ;;
               "-p "*)
-                cat > "$FAKE_CALLS/claude-stdin"
+                if test -n "${FAKE_CLAUDE_SEQUENCE_DIR:-}"; then
+                  count_file="$FAKE_CALLS/claude-run-count"
+                  count=0
+                  test ! -f "$count_file" || count=$(cat "$count_file")
+                  count=$((count + 1))
+                  printf '%s\n' "$count" > "$count_file"
+                  cat > "$FAKE_CALLS/claude-stdin-$count"
+                  cat "$FAKE_CLAUDE_SEQUENCE_DIR/events-$count"
+                else
+                  cat > "$FAKE_CALLS/claude-stdin"
+                  printf '%s\n' "${FAKE_CLAUDE_EVENTS}"
+                fi
                 env | sort > "$FAKE_CALLS/claude-env"
-                printf '%s\n' "${FAKE_CLAUDE_EVENTS}"
                 if test -n "${FAKE_CLAUDE_RAW_STDOUT_FILE:-}"; then
                   cat "$FAKE_CLAUDE_RAW_STDOUT_FILE"
                   exit 0
@@ -441,6 +451,34 @@ class RalphCliTestCase(unittest.TestCase):
             },
         ]
         return "\n".join(json.dumps(event) for event in events)
+
+    def _claude_sequence(self, streams: list[str]) -> Path:
+        # One stdout stream per `claude -p` call, so a test can give consecutive
+        # iterations different behaviour (a lost iteration, then its replacement).
+        sequence = self.base / "claude-sequence"
+        sequence.mkdir()
+        for index, events in enumerate(streams, 1):
+            (sequence / f"events-{index}").write_text(events + "\n", encoding="utf-8")
+        return sequence
+
+    def _claude_background_events(self, session_id: str) -> str:
+        # An iteration that registers a background subagent: the guard fires at
+        # `background_tasks_changed`, so nothing after it is ever read.
+        events = self._claude_events("Working.", session_id=session_id).splitlines()
+        events.insert(
+            2,
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "background_tasks_changed",
+                    "session_id": session_id,
+                    "tasks": [
+                        {"task_id": "t1", "task_type": "local_agent", "description": "survey"}
+                    ],
+                }
+            ),
+        )
+        return "\n".join(events)
 
     _ENV_ALLOWLIST = (
         "PATH",

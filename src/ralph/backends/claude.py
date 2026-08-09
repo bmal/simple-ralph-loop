@@ -18,6 +18,13 @@ Invariants:
   is the sole blocker and never masquerades as a remedy for something it cannot fix.
 - A stop Ralph itself caused (timeout/interrupt) is classified *before* any contract
   failure, so an interrupted session's error result is never misread as misbehavior.
+- A background subagent launch is the one contract failure handed back as a
+  ``RetryableIterationError``: the attempt is lost, but a fresh session can be
+  steered past it, so the adapter supplies ``SUBAGENT_CORRECTION`` and lets the Loop
+  replace the attempt. The killed session is *not* resumable for this failure: its
+  orphaned background task is redelivered on resume as a leading
+  ``task_notification`` plus a second ``init`` and an empty ``result``, which the
+  ordered contract here rejects — hence a fresh session, never ``--resume``.
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
@@ -41,7 +48,12 @@ import threading
 from typing import Any
 
 from ..environment import BACKEND_TIMEOUT_MS, clean_environment
-from ..errors import HandoffError, RalphError, raise_backend_contract_failure
+from ..errors import (
+    HandoffError,
+    RalphError,
+    RetryableIterationError,
+    raise_backend_contract_failure,
+)
 from ..gitcontext import command, write_json
 from ..launch import session_argv
 from ..preflight import common_preflight, version_tuple
@@ -134,17 +146,33 @@ UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
     }
 )
 CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running Ralph"
-# Appended to every Claude iteration prompt. The Task tool defaults to background
-# execution, but a subagent that finishes after the turn has ended forces the CLI
-# to emit a second `system` init, which breaks Ralph's single-turn stream contract
-# and halts the run (the accept() guard rejects `background_tasks_changed`). This
-# steers the model to the supported path -- synchronous subagents -- so the guard
-# stays a backstop rather than the common case.
+# Appended to every Claude iteration prompt. The subagent tool defaults to
+# *background* execution, and a subagent that finishes after the turn has ended
+# forces the CLI to emit a second `system` init, which breaks Ralph's single-turn
+# stream contract and halts the run (the accept() guard rejects
+# `background_tasks_changed`). Omitting the parameter therefore selects the very
+# failure this directive exists to prevent: the synchronous path must be asked for
+# explicitly, on every launch, so the guard stays a backstop rather than the common
+# case.
 SUBAGENT_DIRECTIVE = (
-    "\n\nRun every subagent (the Task tool) synchronously: do not pass "
-    "run_in_background, and let each Task return its result within the turn that "
-    "launched it. A background subagent that finishes after the turn has ended "
-    "breaks Ralph's stream contract and halts the run.\n"
+    "\n\nRun every subagent (the Agent/Task tool) synchronously: pass "
+    "run_in_background: false on every single launch -- it defaults to true, so "
+    "omitting it launches a background subagent -- and let each subagent return "
+    "its result within the turn that launched it. A background subagent that "
+    "finishes after the turn has ended breaks Ralph's stream contract and halts "
+    "the run.\n"
+)
+# Appended to the *replacement* iteration's prompt after a background launch cost
+# an iteration. The standing directive above evidently did not land for that
+# session, so this one names the loss as a fact and offers the escape hatch of
+# doing the work inline: a fresh session that cannot comply with the parameter is
+# better off not reaching for subagents at all.
+SUBAGENT_CORRECTION = (
+    "\n\nIMPORTANT -- the previous iteration was killed mid-turn and its work was "
+    "lost because it launched a background subagent. The Agent/Task tool defaults "
+    "to run_in_background: true, so every launch must set run_in_background: "
+    "false explicitly. If you cannot guarantee that, do not use subagents at all "
+    "this iteration; do the work yourself.\n"
 )
 # Appended to the refusal only when a Claude agent vector — the `.claude/agents`
 # directory or the settings.json `agent` key — is the *sole* blocker, so the
@@ -159,6 +187,14 @@ AGENT_OPT_OUT_HINT = (
     "settings.json 'agent' key for this run (unsafe: Ralph then cannot prove "
     "Claude subagent isolation)"
 )
+
+
+class BackgroundSubagentLaunch(RalphError):
+    # Raised from the event guard so the consume loop can tell this one contract
+    # failure apart from the rest and offer it to the Loop as retryable. It is a
+    # plain RalphError, not a HandoffError, so the controlled-stop reclassification
+    # still runs first and an interrupted session is never blamed on a subagent.
+    pass
 
 
 def validate_model(model: str) -> None:
@@ -368,10 +404,13 @@ class ClaudeEventResult:
             # as a tool result) never emit it. Fail here so the halt names the
             # real cause instead of the downstream "duplicate initialization
             # metadata", and so the wasted iteration stops at registration rather
-            # than at the end of the turn.
-            raise RalphError(
+            # than at the end of the turn. The dedicated type carries one further
+            # fact to the Loop: a fresh session can be steered past this, so the
+            # iteration is lost but the run need not be.
+            raise BackgroundSubagentLaunch(
                 "Claude launched a background subagent; Ralph requires subagents "
-                "to run synchronously (do not pass run_in_background)"
+                "to run synchronously (pass run_in_background: false, which the "
+                "tool does not default to)"
             )
         if event_type == "system" and event.get("subtype") == "init":
             self._accept_init(event)
@@ -671,6 +710,13 @@ def _consume_claude_iteration(
                 # event is an artifact of the stop, not a contract violation,
                 # so report the timeout or interruption instead.
                 raise_if_controlled_stop(controller, "Claude", result.session_id)
+                if isinstance(error, BackgroundSubagentLaunch) and result.session_id:
+                    # The one contract failure a replacement iteration can be
+                    # steered past: hand the Loop the correction along with the
+                    # handoff it would otherwise print.
+                    raise RetryableIterationError(
+                        str(error), result.session_id, SUBAGENT_CORRECTION
+                    ) from None
                 if result.session_id:
                     raise HandoffError(
                         str(error),

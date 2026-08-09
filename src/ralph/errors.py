@@ -8,6 +8,13 @@ Invariants:
   and the outcome so the Loop can record it and print a resume command. A
   ``StartedIterationError`` is the same idea before any session metadata arrived —
   the Iteration slot is consumed but there is nothing to resume.
+- A ``RetryableIterationError`` is a ``HandoffError`` the Loop is *allowed* to
+  absorb: the attempt produced no outcome, but the failure is one a fresh session
+  can be steered past, so the Loop may spend the same budget slot again on a
+  replacement attempt carrying the backend-supplied ``correction``. It remains a
+  ``HandoffError`` so the path that cannot retry — the replacement allowance spent
+  — hands off exactly as an ordinary contract failure does, charging the started
+  Iteration.
 - ``raise_backend_contract_failure`` encodes the shared rule both adapters obey: a
   contract failure *after* a session exists is a resumable, consuming handoff;
   before any session it is an ordinary pre-session ``RalphError``.
@@ -39,6 +46,21 @@ class HandoffError(RalphError):
         self.session_id = session_id
         self.detail = detail
         self.outcome = outcome
+
+
+class RetryableIterationError(HandoffError):
+    def __init__(
+        self,
+        reason: str,
+        session_id: str,
+        correction: str,
+        outcome: str = "backend_contract_failure",
+    ) -> None:
+        super().__init__(reason, session_id, outcome=outcome)
+        # Backend-authored text the Loop appends to the replacement Iteration's
+        # prompt. The Loop never composes it: only the adapter knows what the
+        # backend did wrong and what wording steers a fresh session past it.
+        self.correction = correction
 
 
 class StartedIterationError(RalphError):

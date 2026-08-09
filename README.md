@@ -121,7 +121,21 @@ line `<promise>COMPLETE</promise>`. Exhausting the budget without that marker is
 an incomplete, non-zero result.
 
 Questions, timeout, interruption, backend failure, or malformed output stop the
-loop without an automatic retry. Ralph prints a `ralph resume` command for the
+loop without an automatic retry. The single exception is an iteration lost to a
+Claude background subagent: the Agent/Task tool defaults to background
+execution, and a subagent that outlives its turn breaks the single-turn stream
+contract, so Ralph kills the session at the launch. That loss is one a fresh
+session can be steered past, so instead of ending the run Ralph warns on the
+console and retries the *same* iteration with a new session whose prompt carries
+a correction naming what went wrong. A lost attempt produced no outcome, so it
+spends no budget; only an attempt that returns one consumes its iteration. Each
+attempt retains its own output (replacements nest under `attempt-002/` and so
+on), so nothing is overwritten. An iteration may spend two replacements; a third
+failure in the same iteration hands off like any other contract failure, and
+that handoff does charge the started iteration. The killed session is offered
+for manual `ralph resume` as usual, though note that resuming it delivers the
+orphaned subagent's notification into the recovered turn.
+ Ralph prints a `ralph resume` command for the
 affected backend session and, when budget remains, a complete command for
 starting a new Ralph invocation. `ralph resume` re-establishes the same
 subscription-only trust boundary as an automated iteration: it sanitizes the

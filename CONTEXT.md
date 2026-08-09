@@ -15,6 +15,18 @@ One fresh backend session running the snapshotted prompt; consumes one unit of
 budget, including when handed off for manual recovery.
 _Avoid_: run, loop cycle
 
+**Attempt**:
+One backend session started for an iteration. Normally an iteration is one
+attempt; an attempt lost to a recoverable backend failure returns no outcome and
+so consumes no budget, and the iteration is attempted again.
+_Avoid_: try, run, session (when the budget question is what matters)
+
+**Replacement attempt**:
+The fresh session ralph starts for an iteration whose previous attempt was lost,
+carrying a backend-authored correction in its prompt. It reuses the same budget
+slot and retains its output separately from the attempt it replaces.
+_Avoid_: retry (as a noun), rerun, second iteration
+
 **Launch chain**:
 The ordered stack of wrappers every backend session starts under — the
 `caffeinate` power assertion outermost, host isolation inside it, the backend

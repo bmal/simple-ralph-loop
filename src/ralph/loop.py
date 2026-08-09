@@ -9,6 +9,16 @@ Invariants:
   clean finish, a ``HandoffError`` (resumable, records the session and prints a
   resume command), a ``StartedIterationError`` (slot consumed, nothing to resume),
   and an unexpected ``RalphError`` (recorded as ``backend_failure`` then re-raised).
+- A ``RetryableIterationError`` is the one failure the loop absorbs rather than
+  hands off: the lost attempt does *not* consume its iteration, so the same budget
+  slot is spent again on a replacement session whose prompt carries the backend's
+  correction. Only an attempt that returns an outcome consumes the slot. The
+  allowance is ``MAX_ITERATION_RETRIES`` replacements per slot, reset when the slot
+  is consumed; spending it falls through to the ordinary handoff, which still
+  charges the started iteration. Each attempt retains its own evidence directory so
+  a replacement never overwrites the lost attempt's output. The loop never inspects
+  why an attempt was retryable — only the backend knows that — so this stays
+  backend-agnostic.
 - ``print_handoff`` reproduces the exact remaining-budget restart command and, when
   a session exists, the resume command; every operator-facing string is redacted.
 - The loop holds a resolved ``Backend`` and drives it only through the Backend
@@ -43,7 +53,12 @@ from typing import Any
 import uuid
 
 from .backends import Backend
-from .errors import HandoffError, RalphError, StartedIterationError
+from .errors import (
+    HandoffError,
+    RalphError,
+    RetryableIterationError,
+    StartedIterationError,
+)
 from .gitcontext import command, write_json
 from .launch import (
     CaffeinateAssertion,
@@ -53,6 +68,15 @@ from .launch import (
 )
 from .locking import secure_state_directory
 from .redaction import collect_secrets, redact, set_active_redactor
+
+
+# Replacement attempts one iteration may spend before the loop stops trying. A
+# lost attempt costs no budget, so this is the only thing bounding a backend that
+# fails the same way forever: at most three sessions per slot. Two is enough to
+# absorb a backend that ignored a standing directive once and then again under the
+# sharpened correction; a third failure in the same slot means the correction is
+# not landing and the operator should see it. Consuming the slot resets it.
+MAX_ITERATION_RETRIES = 2
 
 
 def record_final_git_state(worktree: Path, run_dir: Path, initial_branch: str) -> str:
@@ -211,8 +235,19 @@ def run_protected(
     iterations: list[dict[str, Any]] = []
     session_id: str | None = None
     outcome = "budget_exhausted"
+    # Backend-authored text carried from a lost attempt into its replacement, and
+    # the replacements the current iteration has already spent.
+    correction = ""
+    retries = 0
+    # Iterations whose slot is spent. The slot being worked is always `consumed +
+    # 1`, so a lost attempt simply leaves `consumed` alone and the same slot is
+    # spent again; `number` stays the slot in flight for the handoff handlers,
+    # which must still charge a started iteration.
+    consumed = 0
+    number = 0
     try:
-        for number in range(1, args.iterations + 1):
+        while consumed < args.iterations:
+            number = consumed + 1
             # The loop-wide sleep assertion must still be held before each fresh
             # session; a lost assertion stops the loop with retained evidence.
             assertion.ensure_alive()
@@ -221,20 +256,63 @@ def run_protected(
                 if number == 1
                 else secure_state_directory(run_dir, f"iteration-{number:03d}")
             )
+            if retries:
+                # A replacement must not overwrite the lost attempt's retained
+                # evidence, so every attempt after the first nests its own
+                # directory under the iteration it belongs to.
+                iteration_dir = secure_state_directory(
+                    iteration_dir, f"attempt-{retries + 1:03d}"
+                )
             # Mark the boundary between fresh sessions so multi-iteration
-            # console output is attributable to a specific iteration.
-            print(f"ralph: iteration {number} of {args.iterations}", file=sys.stderr)
+            # console output is attributable to a specific iteration, and name the
+            # attempt when this session is replacing a lost one.
+            attempt = f" (attempt {retries + 1})" if retries else ""
+            print(f"ralph: iteration {number} of {args.iterations}{attempt}", file=sys.stderr)
             backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
             iteration_started = datetime.now(timezone.utc).isoformat()
-            outcome, session_id = backend.execute_iteration(
-                worktree,
-                iteration_dir,
-                prompt,
-                args.model,
-                env,
-                args.timeout,
-                sandbox_profile,
-            )
+            try:
+                outcome, session_id = backend.execute_iteration(
+                    worktree,
+                    iteration_dir,
+                    prompt + correction,
+                    args.model,
+                    env,
+                    args.timeout,
+                    sandbox_profile,
+                )
+            except RetryableIterationError as error:
+                # A lost attempt produced no outcome, so it does not consume its
+                # iteration: the same slot is spent again on a session carrying the
+                # correction. Only the allowance bounds this, since the budget no
+                # longer does; spending it falls through as the handoff it already
+                # is, and that one *does* charge the started iteration.
+                if retries >= MAX_ITERATION_RETRIES:
+                    raise
+                retries += 1
+                correction = error.correction
+                iterations.append(
+                    {
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "number": number,
+                        "outcome": error.outcome,
+                        "reason": error.reason,
+                        "retried": True,
+                        "session_id": error.session_id,
+                        "started_at": iteration_started,
+                    }
+                )
+                print(
+                    f"ralph: warning: iteration {number} was lost and is being "
+                    f"retried without spending budget (replacement {retries} of "
+                    f"{MAX_ITERATION_RETRIES}): {redact(error.reason)}",
+                    file=sys.stderr,
+                )
+                continue
+            # An attempt that returned an outcome consumes the slot, clears the
+            # correction, and restores the full allowance for the next iteration.
+            consumed = number
+            correction = ""
+            retries = 0
             iterations.append(
                 {
                     "finished_at": datetime.now(timezone.utc).isoformat(),
