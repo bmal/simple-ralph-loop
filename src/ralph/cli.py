@@ -3,9 +3,12 @@ commands.
 
 Invariants:
 - ``run`` validates the iteration budget (1..100), the timeout (finite, zero or
-  positive, at most ``MAX_ITERATION_TIMEOUT_SECONDS``), and the model before any
-  budget is spent, resolves the default model per backend, then acquires the
-  worktree lock and hands off to the Loop.
+  positive, at most ``MAX_ITERATION_TIMEOUT_SECONDS``), the interactive-only label
+  (non-empty after stripping), and the model before any budget is spent, resolves
+  the default model per backend, builds the Loop protocol once from the label and
+  publishes it through ``set_active_protocol``, then acquires the worktree lock and
+  hands off to the Loop. ``resume`` takes no label: recovery is already the
+  interactive session the label exists to demand.
 - ``clean`` removes only a real ``.git/ralph`` state directory, never following a
   symlink or deleting an unexpected file type, and refuses while a live loop holds
   the worktree lock.
@@ -23,6 +26,7 @@ Invariants:
 
 Depends on / must not know: the ``backends`` package (defaults, the registry, and
 the resolved Backend's five interface names), ``redaction`` (functions only),
+``protocol`` (``build_protocol`` / ``set_active_protocol`` and the default label),
 ``gitcontext``, ``launch`` (``session_argv``, ``establish_sandbox``), ``locking``
 (the worktree lock and ``secure_state_directory``), ``loop``, ``process``
 (timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
@@ -51,6 +55,7 @@ from .launch import establish_sandbox, session_argv
 from .locking import WorktreeLock, secure_state_directory
 from .loop import run_locked
 from .process import MAX_ITERATION_TIMEOUT_SECONDS
+from .protocol import DEFAULT_INTERACTIVE_LABEL, build_protocol, set_active_protocol
 from .redaction import collect_secrets, set_active_redactor
 
 
@@ -64,9 +69,15 @@ def run(args: argparse.Namespace) -> int:
             f"timeout must not exceed {MAX_ITERATION_TIMEOUT_SECONDS} seconds so backend "
             "request and Bash limits stay subordinate to Ralph's timer"
         )
+    interactive_label = args.interactive_label.strip()
+    if not interactive_label:
+        raise RalphError("--interactive-label must not be empty or whitespace")
     backend = resolve(args.backend)
     args.model = args.model or DEFAULT_MODELS[args.backend]
     backend.validate_model(args.model)
+    # Build the Loop protocol once per run from the configured label and publish it
+    # for the whole run; both backends append it to the prompt exactly as before.
+    set_active_protocol(build_protocol(interactive_label))
 
     prompt_path, prompt = read_prompt(args.prompt)
     worktree, git_dir, branch, status, slug = git_context(args.worktree)
@@ -172,6 +183,19 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument("--worktree")
+    run_parser.add_argument(
+        "--interactive-label",
+        default=DEFAULT_INTERACTIVE_LABEL,
+        metavar="LABEL",
+        help=(
+            "issue label marking a child as reserved for an interactive operator "
+            "session; the Loop protocol tells the backend to treat such children as "
+            "blocked for autonomous iterations and to halt for input when only "
+            f"labelled work remains (default: {DEFAULT_INTERACTIVE_LABEL}). Selection "
+            "stays advisory -- Ralph cannot observe which child the backend picks -- "
+            "so only the needs-input halt is enforced"
+        ),
+    )
     run_parser.add_argument(
         "--unsafe-allow-agents",
         action="store_true",

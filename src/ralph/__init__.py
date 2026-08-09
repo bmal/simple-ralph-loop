@@ -17,7 +17,8 @@ Module map — start here, then open only the module you need:
 - ``backends.claude``   — the Claude adapter: preflight, customization refusal,
                      Claude constants and host paths, event accumulation, iteration,
                      session persistence.
-- ``protocol``     — the Loop protocol text and completion/needs-input detection.
+- ``protocol``     — the Loop protocol text (built once per run from the
+                     interactive-only label) and completion/needs-input detection.
 - ``process``      — process-group control, timeouts, controlled-stop classification,
                      process identity.
 - ``locking``      — Git-private state directories, the worktree lock, lock metadata.

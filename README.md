@@ -120,6 +120,19 @@ stops early only when the final turn's assistant output contains the exact
 standalone line `<promise>COMPLETE</promise>`. Exhausting the budget without that
 marker is an incomplete, non-zero result.
 
+Some child issues embed an owner decision and must be worked interactively. The
+Loop protocol Ralph appends to every prompt names a configurable label — set with
+`--interactive-label` on `ralph run`, defaulting to `may-ask-owner` — and tells
+the backend to treat a child carrying it as blocked for this iteration: select the
+next unblocked child that does not carry it, and when only labelled children
+remain, halt with `<promise>NEEDS_INPUT</promise>` naming them rather than claiming
+completion. The honest limit: this selection is *advisory*. Ralph cannot observe
+which child the backend actually picks, so it cannot enforce the choice — the same
+class of prompt-level control that steering the backend away from background
+subagents used to be. What *is* mechanical is the escalation: the needs-input
+marker is detected and halts the run. `ralph resume` takes no label, because
+recovery is already the interactive session the label exists to demand.
+
 A Claude session may run across several turns. Claude Code's Agent/Task subagent
 tool defaults to background execution, and a subagent that finishes after the
 turn that launched it makes the CLI open a second turn with a fresh init. Ralph

@@ -3,6 +3,14 @@
 Invariants:
 - The protocol text appended to every prompt and the parser that reads its markers
   back out live together so the contract and its detection can never drift apart.
+- The protocol is built once per run from the configured interactive-only label
+  (``build_protocol``) rather than being a bare constant, so the label rule and the
+  markers it references stay in this one module. The built text is published for the
+  whole run through ``set_active_protocol`` and read back by the backends through
+  ``active_protocol`` -- import the *functions*, never the ``_ACTIVE_PROTOCOL``
+  global, exactly as ``redaction`` is used: a caller that captured the old binding
+  would keep appending a stale label. ``active_protocol`` always holds the default
+  label's protocol until ``run`` overrides it, so it is never unset.
 - Marker detection reads only *visible* Markdown: fenced code, indented code, and
   block quotes are excluded so a ``<promise>...</promise>`` line quoted inside the
   prompt, a code sample, or tool output is never mistaken for an iteration result.
@@ -32,10 +40,28 @@ import re
 from typing import Any
 
 
-PROTOCOL = """
+# The label that marks a child issue as reserved for an interactive operator
+# session. Repositories already using this convention need no configuration; a
+# repository using a different one names its own through ``ralph run``.
+DEFAULT_INTERACTIVE_LABEL = "may-ask-owner"
+
+
+def build_protocol(interactive_label: str) -> str:
+    """Return the Loop protocol text for a run, naming ``interactive_label`` as the
+    label that reserves a child for an interactive operator session. Built once per
+    run so the label rule and the markers it references stay in this one module."""
+    return f"""
 
 Ralph loop protocol:
 - Implement at most one child issue in this iteration.
+- A child issue labelled `{interactive_label}` is reserved for an interactive
+  session with the operator and is blocked for this iteration: do not select it,
+  and never guess the decision it embeds. Select the next unblocked child that
+  does not carry `{interactive_label}` instead.
+- When every remaining actionable child is labelled `{interactive_label}`, do not
+  emit <promise>COMPLETE</promise> -- work remains and is waiting on the operator.
+  Emit <promise>NEEDS_INPUT</promise> naming those `{interactive_label}` children
+  so the operator knows which ones need an interactive session.
 - Finishing that one child while unblocked children still remain is a normal
   end of iteration -- not completion and not a question. Emit no marker, do not
   ask whether to continue, and stop. The next iteration independently selects
@@ -56,6 +82,22 @@ Ralph loop protocol:
 - Only when the explicit completion conditions above are met, emit this exact
   standalone line in your final assistant output: <promise>COMPLETE</promise>
 """
+
+
+# The protocol built for the current run, published here for the whole process so
+# the backends append the run's configured label. Defaults to the built-in label's
+# protocol so it is never unset; ``run`` overrides it once per run. Import
+# ``active_protocol`` / ``set_active_protocol``, never this global (see Invariants).
+_ACTIVE_PROTOCOL = build_protocol(DEFAULT_INTERACTIVE_LABEL)
+
+
+def active_protocol() -> str:
+    return _ACTIVE_PROTOCOL
+
+
+def set_active_protocol(protocol: str) -> None:
+    global _ACTIVE_PROTOCOL
+    _ACTIVE_PROTOCOL = protocol
 
 
 def visible_markdown_lines(text: str) -> list[tuple[int, str]]:

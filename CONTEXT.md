@@ -24,8 +24,18 @@ _Avoid_: launcher, wrapper, command line
 **Loop protocol**:
 The contract ralph appends to every prompt telling the backend how to signal
 an iteration's outcome (complete, or needs operator input) via markers ralph
-can detect.
+can detect. Built once per run from the configured interactive-only label, so
+the same contract and its marker parser stay in one module.
 _Avoid_: prompt suffix, prompt template, system prompt
+
+**Interactive-only child**:
+A child issue carrying the configured label (default `may-ask-owner`) that
+embeds an owner decision and must be worked in an interactive session. The Loop
+protocol tells the backend to treat it as blocked for an autonomous iteration
+and to halt for input when only such children remain. The rule is advisory —
+ralph cannot observe which child the backend selects — so only the resulting
+needs-input halt is enforced.
+_Avoid_: blocked issue (reserved for declared dependencies), operator label
 
 **Trust boundary**:
 The set of properties ralph proves before spending budget: subscription-only

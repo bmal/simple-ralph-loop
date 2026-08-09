@@ -35,7 +35,7 @@ know these helpers exist beyond the five Backend interface names.
 
 See also: ``backends`` (registry and the five-name Protocol), ``backends.claude``
 (twin adapter), ``launch`` (``session_argv``, the wrapped argv), ``protocol``
-(marker detection).
+(marker detection and ``active_protocol``, the run's protocol text appended here).
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ from ..launch import session_argv
 from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
-    PROTOCOL,
+    active_protocol,
     explicit_needs_input,
     extract_question,
     has_completion_marker,
@@ -595,7 +595,7 @@ def _consume_opencode_iteration(
     thread = threading.Thread(target=drain_stderr, daemon=True)
     thread.start()
     try:
-        process.stdin.write(prompt + PROTOCOL)
+        process.stdin.write(prompt + active_protocol())
         process.stdin.close()
     except BrokenPipeError:
         process.stdout.close()

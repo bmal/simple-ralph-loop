@@ -653,3 +653,78 @@ class LoopProtocolTest(RalphCliTestCase):
         self.assertIn("malformed structured output", claude.stderr)
         self.assertIn("--session claude-session-1", claude.stderr)
         self.assertNotIn("Traceback", claude.stderr)
+
+
+class InteractiveLabelTest(RalphCliTestCase):
+    """The configurable interactive-only label rule the Loop protocol carries into
+    the composed prompt for both backends."""
+
+    def _composed_prompt(self, backend: str) -> str:
+        if backend == "claude":
+            return json.loads((self.calls / "claude-stdin").read_text())["message"]["content"]
+        return (self.calls / "stdin").read_text()
+
+    def test_default_label_rule_reaches_both_backends_with_all_three_parts(self) -> None:
+        # Omitting the option yields `may-ask-owner`, and the rule the protocol
+        # carries states all three parts: labelled children are blocked, the next
+        # unlabelled child is selected instead, and only-labelled-work-remaining
+        # halts with the needs-input marker naming them rather than completing.
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self.run_ralph(backend=backend)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                composed = self._composed_prompt(backend)
+                # Collapse the protocol's line wrapping so a phrase split across a
+                # wrapped line still matches; markers and the label are single
+                # tokens and are checked against the raw text.
+                flat = " ".join(composed.split())
+                self.assertIn("may-ask-owner", composed)
+                # Part 1: labelled children are blocked for the iteration.
+                self.assertIn("reserved for an interactive session", flat)
+                self.assertIn("blocked for this iteration", flat)
+                # Part 2: select the next unlabelled unblocked child instead.
+                self.assertIn("Select the next unblocked child that does not carry", flat)
+                # Part 3: only-labelled-work-remaining halts with needs-input
+                # naming them, never completing.
+                self.assertIn("waiting on the operator", flat)
+                self.assertIn("Emit <promise>NEEDS_INPUT</promise> naming those", flat)
+                # The pre-existing protocol text is still present unchanged.
+                self.assertIn("at most one child issue", flat)
+                self.assertIn("<promise>COMPLETE</promise>", composed)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_custom_label_overrides_the_default_in_the_composed_prompt(self) -> None:
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self.run_ralph("--interactive-label", "owner-decides", backend=backend)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                composed = self._composed_prompt(backend)
+                self.assertIn("owner-decides", composed)
+                self.assertNotIn("may-ask-owner", composed)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_empty_or_whitespace_label_is_rejected_before_budget_is_spent(self) -> None:
+        for label in ("", "   "):
+            with self.subTest(label=repr(label)):
+                result = self.run_ralph("--interactive-label", label)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--interactive-label", result.stderr)
+                # Fail closed before any backend session: no prompt was composed.
+                self.assertFalse((self.calls / "stdin").exists())
+                self.assertFalse((self.repo / ".git" / "ralph" / "runs").exists())
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_resume_does_not_accept_the_interactive_label_option(self) -> None:
+        result = self.resume_ralph(
+            "claude",
+            "claude-opus-4-8",
+            "claude-session-1",
+            "--interactive-label",
+            "owner-decides",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--interactive-label", result.stderr)
+        self.assertIn("unrecognized arguments", result.stderr)
