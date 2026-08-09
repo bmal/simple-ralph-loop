@@ -2,15 +2,28 @@
 and host paths, event accumulation, iteration, and session persistence.
 
 Invariants:
-- The init event is the single proof of a subscription-safe session: it must report
-  ``apiKeySource == "none"`` (billing rides the proven pro/max OAuth login, not a
-  metered key), ``bypassPermissions`` full-auto mode, no external MCP servers or
-  plugins, and a tool set that is a subset of ``CLAUDE_BUILTIN_TOOLS`` — anything
-  else fails closed. The session id is checkpointed before the rest of the init is
-  validated so a later contract failure is still a resumable handoff.
-- The terminal ``result`` must be the final event: any event after it violates the
-  ordered contract and fails closed, and the result text must agree with the
-  assembled final assistant response so a contradictory result is never trusted.
+- Each ``system/init`` opens a turn and re-proves the subscription-safe session: it
+  must report ``apiKeySource == "none"`` (billing rides the proven pro/max OAuth
+  login, not a metered key), ``bypassPermissions`` full-auto mode, no external MCP
+  servers or plugins, a tool set that is a subset of ``CLAUDE_BUILTIN_TOOLS``, and
+  the same session id — every turn, so a longer stream is a stronger proof, not a
+  weaker one. Anything else fails closed. The session id is checkpointed on the
+  first init before the rest is validated so a later contract failure is still a
+  resumable handoff.
+- The stream is read to EOF and may carry multiple turns. A second (or later) init
+  is admitted only in a session that registered a background task
+  (``background_tasks_changed``); an unexplained duplicate init stays the hard
+  ``Claude emitted duplicate initialization metadata`` failure it is today. Results
+  are flushed at EOF in turn order — a ``result`` does *not* close a turn. The i-th
+  result belongs to the i-th turn; Ralph asserts equal counts and that each result
+  agrees with its turn's last message from the Backend itself, failing closed
+  otherwise. The Iteration's outcome is judged on the final turn.
+- ``parent_tool_use_id`` distinguishes the Backend's own messages (``None``) from a
+  background subagent's (the launching tool-use id). Only the Backend's own messages
+  assemble a turn's response and are scanned for completion/needs-input markers, so a
+  subagent speaking last is never mistaken for the answer; the subagent's messages
+  still stay in the retained stream evidence. The native question tool halts wherever
+  it appears, unfiltered by origin.
 - ``--unsafe-allow-agents`` relaxes only the agent vectors (``.claude/agents`` and
   the settings ``agent`` key). Managed, server-managed, hooks, plugins, and every
   other unsafe settings key stay refused and are checked *before* the local
@@ -18,13 +31,8 @@ Invariants:
   is the sole blocker and never masquerades as a remedy for something it cannot fix.
 - A stop Ralph itself caused (timeout/interrupt) is classified *before* any contract
   failure, so an interrupted session's error result is never misread as misbehavior.
-- A background subagent launch is the one contract failure handed back as a
-  ``RetryableIterationError``: the attempt is lost, but a fresh session can be
-  steered past it, so the adapter supplies ``SUBAGENT_CORRECTION`` and lets the Loop
-  replace the attempt. The killed session is *not* resumable for this failure: its
-  orphaned background task is redelivered on resume as a leading
-  ``task_notification`` plus a second ``init`` and an empty ``result``, which the
-  ordered contract here rejects — hence a fresh session, never ``--resume``.
+- A wedged background subagent that never drains is bounded only by ``--timeout``;
+  the adapter adds no separate idle detection.
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
@@ -146,27 +154,10 @@ UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
     }
 )
 CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running Ralph"
-# Appended to every Claude iteration prompt. The subagent tool defaults to
-# *background* execution, and a subagent that finishes after the turn has ended
-# forces the CLI to emit a second `system` init, which breaks Ralph's single-turn
-# stream contract and halts the run (the accept() guard rejects
-# `background_tasks_changed`). Omitting the parameter therefore selects the very
-# failure this directive exists to prevent: the synchronous path must be asked for
-# explicitly, on every launch, so the guard stays a backstop rather than the common
-# case.
-SUBAGENT_DIRECTIVE = (
-    "\n\nRun every subagent (the Agent/Task tool) synchronously: pass "
-    "run_in_background: false on every single launch -- it defaults to true, so "
-    "omitting it launches a background subagent -- and let each subagent return "
-    "its result within the turn that launched it. A background subagent that "
-    "finishes after the turn has ended breaks Ralph's stream contract and halts "
-    "the run.\n"
-)
-# Appended to the *replacement* iteration's prompt after a background launch cost
-# an iteration. The standing directive above evidently did not land for that
-# session, so this one names the loss as a fact and offers the escape hatch of
-# doing the work inline: a fresh session that cannot comply with the parameter is
-# better off not reaching for subagents at all.
+# DEAD as of the multi-turn parser (#31): the background launch it corrected is now
+# a supported multi-turn path, not a lost iteration, so nothing produces the
+# retryable failure this text rode. Retained only until #32 removes the whole
+# replacement-attempt machinery (RetryableIterationError and the Loop allowance).
 SUBAGENT_CORRECTION = (
     "\n\nIMPORTANT -- the previous iteration was killed mid-turn and its work was "
     "lost because it launched a background subagent. The Agent/Task tool defaults "
@@ -190,10 +181,11 @@ AGENT_OPT_OUT_HINT = (
 
 
 class BackgroundSubagentLaunch(RalphError):
-    # Raised from the event guard so the consume loop can tell this one contract
-    # failure apart from the rest and offer it to the Loop as retryable. It is a
-    # plain RalphError, not a HandoffError, so the controlled-stop reclassification
-    # still runs first and an interrupted session is never blamed on a subagent.
+    # DEAD as of the multi-turn parser (#31): `accept` no longer raises this at a
+    # `background_tasks_changed` -- it records the registration and admits the
+    # later init instead -- so nothing constructs this type and the consume loop's
+    # handler for it is unreachable. Retained only until #32 removes it with the
+    # rest of the replacement-attempt machinery.
     pass
 
 
@@ -372,46 +364,63 @@ def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> st
     return "Claude returned a synthetic error instead of a model response"
 
 
+class ClaudeTurn:
+    # One turn of a Claude session: the model its init reported, and the text of
+    # each of the Backend's own (non-subagent) assistant messages in order. The
+    # turn's answer is its last such message; a background subagent's messages are
+    # recorded elsewhere and never assemble the turn's response.
+    def __init__(self, model: str) -> None:
+        self.initial_model = model
+        self.parent_texts: list[str] = []
+
+
 class ClaudeEventResult:
     def __init__(self, model: str) -> None:
         self.expected_model = model
         self.session_id: str | None = None
-        self.initial_model: str | None = None
+        self.turns: list[ClaudeTurn] = []
+        self.background_seen = False
         self.assistant_models: list[str] = []
-        self.assistant_results: list[str] = []
-        self.final_text: str | None = None
+        self.results: list[str] = []
         self.model_usage: list[str] = []
         self.question: str | None = None
 
+    @property
+    def initial_model(self) -> str | None:
+        return self.turns[0].initial_model if self.turns else None
+
+    @property
+    def final_text(self) -> str | None:
+        # The Iteration's answer is the final turn's result; results are flushed
+        # at EOF in turn order, so the last one is the final turn's.
+        return self.results[-1] if self.results else None
+
     def accept(self, event: Any) -> None:
-        if self.final_text is not None:
-            # The terminal result must be the final event in the stream. A
-            # duplicate result, a late assistant message, trailing init, or any
-            # other event after it means the ordered contract was violated, so
-            # fail closed rather than assess a stream we no longer trust.
-            raise RalphError("Claude emitted an event after the terminal result")
+        if self.results:
+            # Results are flushed at EOF in turn order. Once every turn's result
+            # has arrived nothing more may follow, and while they are still
+            # arriving only further results may -- a late init, assistant, or any
+            # other event means the ordered contract was violated. Fail closed
+            # rather than assess a stream we no longer trust. (In the single-turn
+            # case the very first result completes the count, so a second result
+            # or a trailing message is caught here exactly as before.)
+            results_complete = len(self.results) >= len(self.turns)
+            is_result = isinstance(event, dict) and event.get("type") == "result"
+            if results_complete or not is_result:
+                raise RalphError("Claude emitted an event after the terminal result")
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
         if event_type == "system" and event.get("subtype") == "background_tasks_changed":
             # A subagent launched with run_in_background finishes asynchronously,
-            # after the turn's terminal result, and forces the CLI to emit a fresh
-            # `system` init to deliver its completion -- a second init that breaks
-            # the single-turn contract this class enforces (one init, one result,
-            # nothing after). `background_tasks_changed` is the earliest and
-            # unambiguous fingerprint of a background launch: it fires when the
-            # task is registered, and synchronous subagents (which return inline
-            # as a tool result) never emit it. Fail here so the halt names the
-            # real cause instead of the downstream "duplicate initialization
-            # metadata", and so the wasted iteration stops at registration rather
-            # than at the end of the turn. The dedicated type carries one further
-            # fact to the Loop: a fresh session can be steered past this, so the
-            # iteration is lost but the run need not be.
-            raise BackgroundSubagentLaunch(
-                "Claude launched a background subagent; Ralph requires subagents "
-                "to run synchronously (pass run_in_background: false, which the "
-                "tool does not default to)"
-            )
+            # after the turn that launched it, and forces the CLI to open a second
+            # turn with a fresh `system` init. That registration is what licenses
+            # the later init: a duplicate init is admitted only in a session that
+            # recorded a background task here, and an unexplained one still fails
+            # closed. Synchronous subagents return inline as a tool result and
+            # never emit this, so they never flip the gate.
+            self.background_seen = True
+            return
         if event_type == "system" and event.get("subtype") == "init":
             self._accept_init(event)
             return
@@ -427,23 +436,26 @@ class ClaudeEventResult:
             # Checkpoint the session id before validating the rest of the event so
             # a later contract failure in a partially malformed init is still a
             # consuming, resumable handoff rather than an unrecoverable failure.
+            # Every turn must carry the same id.
             if self.session_id is not None and self.session_id != session_id:
                 raise RalphError("Claude stream contained inconsistent session metadata")
             self.session_id = session_id
         model = event.get("model")
         if not isinstance(session_id, str) or not session_id or not isinstance(model, str):
             raise RalphError("Claude initialization omitted required metadata")
-        if self.initial_model is not None:
+        if self.turns and not self.background_seen:
+            # A second (or later) init opens a new turn only in a session that
+            # registered a background task; otherwise it is the unexplained
+            # duplicate init that has always failed closed.
             raise RalphError("Claude emitted duplicate initialization metadata")
-        self.initial_model = model
         if model != self.expected_model:
             raise RalphError("Claude initial model did not match the selected model")
-        # `apiKeySource` reports where a metered API key came from. A real
-        # subscription-OAuth session (Claude Code >= 2.1.208) reports "none":
-        # no API key is in play, so billing rides the OAuth login that
-        # preflight already proved is a pro/max subscription. Any other value
-        # ("ANTHROPIC_API_KEY", "apiKeyHelper", ...) means a metered key was
-        # loaded, so fail closed.
+        # Every init re-proves the full Trust boundary, so a longer stream is a
+        # stronger proof, not a weaker one. `apiKeySource` "none" means no metered
+        # API key is in play, so billing rides the OAuth login preflight proved is
+        # a pro/max subscription; `bypassPermissions` is full-auto mode; the MCP,
+        # plugin, and tool sets prove no external customization loaded. Any other
+        # value fails closed -- on the first turn and on every turn after it.
         if event.get("apiKeySource") != "none":
             raise RalphError("Claude session did not use subscription OAuth")
         if event.get("permissionMode") != "bypassPermissions":
@@ -457,6 +469,7 @@ class ClaudeEventResult:
             or not set(tools).issubset(CLAUDE_BUILTIN_TOOLS)
         ):
             raise RalphError("Claude loaded an unknown or external tool")
+        self.turns.append(ClaudeTurn(model))
 
     def _accept_assistant(self, event: dict[str, Any]) -> None:
         self._require_session(event.get("session_id"))
@@ -479,6 +492,12 @@ class ClaudeEventResult:
         content = message.get("content")
         if not isinstance(content, list):
             raise RalphError("Claude assistant event omitted content")
+        # `parent_tool_use_id` is None for the Backend's own messages and the
+        # launching tool-use id for a background subagent's. Only the Backend's
+        # own text assembles the turn's response and is later scanned for markers,
+        # so a subagent speaking last is never mistaken for the answer; the
+        # subagent's output is still printed and retained as evidence.
+        is_backend = event.get("parent_tool_use_id") is None
         # Each Claude stream-json assistant event carries a complete message
         # (there are no incremental text deltas without partial-message mode),
         # so print each part on its own line: text as a paragraph, tool use as a
@@ -496,11 +515,13 @@ class ClaudeEventResult:
             if part.get("type") == "tool_use":
                 name = part.get("name")
                 if name == "AskUserQuestion":
+                    # The native question tool halts wherever it appears, whether
+                    # the Backend or a subagent reached for it.
                     self.question = extract_question(part.get("input")) or "Claude attempted to ask a question."
                 print(redact(f"[{name if isinstance(name, str) and name else 'tool'}]"), flush=True)
         text = "".join(texts)
-        if text:
-            self.assistant_results.append(text)
+        if text and is_backend and self.turns:
+            self.turns[-1].parent_texts.append(text)
 
     def _accept_result(self, event: dict[str, Any]) -> None:
         self._require_session(event.get("session_id"))
@@ -509,18 +530,34 @@ class ClaudeEventResult:
         result = event.get("result")
         if not isinstance(result, str) or not result:
             raise RalphError("Claude result omitted the final assistant response")
-        # The terminal result text must agree with the assembled final assistant
-        # response so a contradictory result (a different final answer than the
-        # one that was streamed) fails closed rather than being trusted.
-        if self.assistant_results and result.strip() != self.assistant_results[-1].strip():
+        # Results are attributed positionally: the i-th result belongs to the
+        # i-th turn. `accept` admits a result only while results are still
+        # outstanding, and a result cannot arrive before its turn's init
+        # established the session, so this index is always in range.
+        turn = self.turns[len(self.results)]
+        # Every turn's result must be backed by one of the Backend's own messages
+        # to agree with; a turn that produced only subagent output leaves nothing
+        # to verify the attribution against, so fail closed rather than trust an
+        # unbacked result.
+        if not turn.parent_texts:
+            raise RalphError("Claude produced a result for a turn with no assistant response")
+        # The i-th result must agree with the i-th turn's last Backend message so
+        # a contradictory result -- a different final answer than the one that was
+        # streamed, or one that echoes a subagent instead of the Backend -- fails
+        # closed rather than being trusted.
+        if result.strip() != turn.parent_texts[-1].strip():
             raise RalphError("Claude terminal result disagreed with the final assistant response")
         usage = event.get("modelUsage")
         if not isinstance(usage, dict) or any(
             not isinstance(model, str) or not model.startswith("claude-") for model in usage
         ):
             raise RalphError("Claude result omitted valid model usage")
-        self.model_usage = list(usage)
-        self.final_text = result
+        # modelUsage is unioned across every turn's result; each model named must
+        # still be a Claude model.
+        for model in usage:
+            if model not in self.model_usage:
+                self.model_usage.append(model)
+        self.results.append(result)
 
     def _require_session(self, value: Any) -> None:
         if self.session_id is None or value != self.session_id:
@@ -649,7 +686,7 @@ def _consume_claude_iteration(
     thread.start()
     message = {
         "type": "user",
-        "message": {"role": "user", "content": prompt + PROTOCOL + SUBAGENT_DIRECTIVE},
+        "message": {"role": "user", "content": prompt + PROTOCOL},
         "parent_tool_use_id": None,
     }
     try:
@@ -711,9 +748,10 @@ def _consume_claude_iteration(
                 # so report the timeout or interruption instead.
                 raise_if_controlled_stop(controller, "Claude", result.session_id)
                 if isinstance(error, BackgroundSubagentLaunch) and result.session_id:
-                    # The one contract failure a replacement iteration can be
-                    # steered past: hand the Loop the correction along with the
-                    # handoff it would otherwise print.
+                    # DEAD as of the multi-turn parser (#31): nothing raises
+                    # BackgroundSubagentLaunch any more, so this branch is
+                    # unreachable. Retained until #32 removes the replacement
+                    # machinery it feeds.
                     raise RetryableIterationError(
                         str(error), result.session_id, SUBAGENT_CORRECTION
                     ) from None
@@ -753,9 +791,9 @@ def _consume_claude_iteration(
         raise RalphError("Claude session failed; see retained stderr")
     if (
         result.session_id is None
-        or result.initial_model is None
-        or not result.assistant_results
-        or result.final_text is None
+        or not result.turns
+        or not result.results
+        or not result.turns[-1].parent_texts
     ):
         if result.session_id:
             raise HandoffError(
@@ -764,10 +802,35 @@ def _consume_claude_iteration(
                 outcome="backend_contract_failure",
             )
         raise RalphError("Claude output omitted required session metadata or final result")
-    explicit = explicit_needs_input(result.final_text)
+    if len(result.results) != len(result.turns):
+        # Each turn must produce exactly one result, attributed positionally; a
+        # count that does not match means the stream ended mid-turn or in a shape
+        # nobody has studied, so fail closed rather than judge a partial session.
+        raise_backend_contract_failure(
+            result.session_id, "Claude produced a result for only some of its turns"
+        )
+    final = result.final_text
+    explicit = explicit_needs_input(final)
     if explicit:
+        # The final parent turn is authoritative for a needs-input halt.
         raise HandoffError("Claude requested operator input", result.session_id, explicit)
-    inferred = inferred_needs_input(result.final_text)
+    # A NEEDS_INPUT marker an earlier turn raised but the final turn withdrew is
+    # not a halt: the Backend itself took the question back (Probe B showed it
+    # re-emitting or dropping the marker per turn), so warn and continue rather
+    # than cost the Iteration -- mirroring the explicit-versus-inferred split.
+    withdrawn: str | None = None
+    for earlier in result.results[:-1]:
+        withdrawn = explicit_needs_input(earlier)
+        if withdrawn:
+            break
+    if withdrawn:
+        print(
+            "ralph: warning: an earlier turn requested operator input but the final "
+            "turn withdrew it; continuing to the next iteration:\n"
+            f"{redact(withdrawn)}",
+            file=sys.stderr,
+        )
+    inferred = inferred_needs_input(final)
     if inferred:
         # An unmarked concluding question is a low-confidence signal; the loop must
         # not take the irreversible operator-halt on a guess. Surface it and let the
@@ -778,7 +841,7 @@ def _consume_claude_iteration(
             f"marker and no question tool used):\n{redact(inferred)}",
             file=sys.stderr,
         )
-    complete = has_completion_marker(result.final_text)
+    complete = has_completion_marker(final)
     return ("complete" if complete else "budget_exhausted"), result.session_id
 
 

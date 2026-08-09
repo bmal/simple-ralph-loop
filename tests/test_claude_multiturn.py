@@ -1,0 +1,293 @@
+"""Claude multi-turn stream contract: a session may span several turns (a
+background subagent that finishes after its launching turn forces a fresh init),
+the stream is read to EOF, results are attributed positionally, every init
+re-proves the Trust boundary, and completion is judged on the final turn. All
+assertions are on external behaviour -- exit code, operator-facing stderr, and
+the retained artifacts under .git/ralph/ -- never on the accumulator's internals."""
+
+from __future__ import annotations
+
+import json
+
+from harness import RalphCliTestCase
+
+
+class ClaudeMultiTurnTest(RalphCliTestCase):
+    def _run(self, events: str, *extra: str):
+        return self.run_ralph("--iterations", "1", *extra, backend="claude", env={"FAKE_CLAUDE_EVENTS": events})
+
+    def _read_outcome(self):
+        # A test may drive more than one run in the same worktree, so read the
+        # newest run directory (names are timestamp-prefixed, so max is latest).
+        runs = (self.repo / ".git" / "ralph" / "runs").iterdir()
+        run_dir = max(runs, key=lambda path: path.name)
+        return run_dir, json.loads((run_dir / "outcome.json").read_text())
+
+    def test_two_and_three_turn_streams_complete_normally(self) -> None:
+        # A background subagent that finishes after its launching turn opens a
+        # second (and third) turn with a fresh init; Ralph reads to EOF, judges
+        # the final turn, and finishes normally instead of ending the run.
+        two_turn = self._claude_multiturn_events(
+            [
+                {"text": "Investigating with a helper."},
+                {
+                    "text": "Work complete.\n<promise>COMPLETE</promise>",
+                    "subagents": ["Survey finished: no blockers found."],
+                },
+            ]
+        )
+        result = self._run(two_turn)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Work complete.", result.stdout)
+        # Operator-facing stderr announces the run and stays clean of any halt.
+        self.assertIn("ralph: backend claude", result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertNotIn("RALPH INCOMPLETE", result.stderr)
+        run_dir, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+        self.assertEqual(outcome["session_id"], "claude-session-1")
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(session["session_id"], "claude-session-1")
+        # The subagent's own work and the background registration stay in the
+        # retained stream evidence even though neither is the Backend's answer.
+        retained = (run_dir / "stdout.ndjson").read_text()
+        self.assertIn("background_tasks_changed", retained)
+        self.assertIn("Survey finished", retained)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        three_turn = self._claude_multiturn_events(
+            [
+                {"text": "Turn one done."},
+                {"text": "Turn two done."},
+                {"text": "All children done.\n<promise>COMPLETE</promise>"},
+            ]
+        )
+        result = self._run(three_turn)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
+    def _bad_second_init(self, second_session: str = "claude-session-1", **override: object) -> str:
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event(second_session, **override),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_result_event("Turn two.", "claude-session-1"),
+        ]
+        return self._claude_stream(events)
+
+    def test_each_init_reproves_the_trust_boundary(self) -> None:
+        # A later init that differs from the first in any isolation property, or in
+        # the session id, fails the Iteration closed -- so a longer stream is a
+        # stronger proof, not a weaker one. Each property is asserted separately.
+        cases = [
+            ({"apiKeySource": "ANTHROPIC_API_KEY"}, "did not use subscription OAuth"),
+            ({"permissionMode": "default"}, "did not enter full-auto permission mode"),
+            ({"mcp_servers": [{"name": "external"}]}, "external MCP servers or plugins"),
+            ({"plugins": [{"name": "external"}]}, "external MCP servers or plugins"),
+            ({"tools": ["Bash", "UnknownExternalTool"]}, "unknown or external tool"),
+            ({"second_session": "claude-session-other"}, "inconsistent session metadata"),
+        ]
+        for override, message in cases:
+            with self.subTest(override=override):
+                for path in self.calls.iterdir():
+                    path.unlink()
+                result = self._run(self._bad_second_init(**override))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_duplicate_init_without_a_background_task_still_fails_closed(self) -> None:
+        # The relaxation is licensed by observed cause: absent a
+        # `background_tasks_changed`, a second init is the unexplained duplicate
+        # it has always been.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_result_event("Turn two.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("duplicate initialization metadata", result.stderr)
+
+    def test_a_result_count_that_does_not_match_the_turn_count_fails_closed(self) -> None:
+        # Two turns but one result: the stream ended mid-session, so Ralph must not
+        # judge a partial iteration.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("only some of its turns", result.stderr)
+
+    def test_a_turn_with_only_subagent_output_and_no_backend_message_fails_closed(self) -> None:
+        # A turn whose result is backed by no message of the Backend's own leaves
+        # nothing to verify the positional attribution against, so fail closed
+        # rather than trust an unbacked result.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "Subagent survey only.", "claude-session-1", parent_tool_use_id="toolu_only"
+            ),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two done.", "claude-session-1"),
+            self._claude_result_event("Subagent survey only.", "claude-session-1"),
+            self._claude_result_event("Turn two done.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("turn with no assistant response", result.stderr)
+
+    def test_a_result_that_disagrees_with_its_turns_last_message_fails_closed(self) -> None:
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("The streamed answer.", "claude-session-1"),
+            self._claude_result_event("A different answer.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("disagreed with the final assistant response", result.stderr)
+
+    def test_subagent_messages_never_count_as_the_answer_or_a_marker(self) -> None:
+        # A subagent speaks last and its message even carries a completion marker;
+        # neither the response check nor marker detection may see it, so the run
+        # is judged only on the Backend's own final message.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Still investigating.", "claude-session-1"),
+            self._claude_assistant_event(
+                "<promise>COMPLETE</promise>",
+                "claude-session-1",
+                parent_tool_use_id="toolu_sub_1",
+            ),
+            self._claude_result_event("Still investigating.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("iteration budget exhausted", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+    def test_completion_is_judged_only_on_the_final_turn(self) -> None:
+        # A completion claim an earlier turn made but later work superseded does
+        # not complete the run.
+        superseded = self._claude_multiturn_events(
+            [
+                {"text": "Done early.\n<promise>COMPLETE</promise>"},
+                {"text": "Actually more remained; continuing."},
+            ]
+        )
+        result = self._run(superseded)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        # The same marker in the final turn does complete the run.
+        final = self._claude_multiturn_events(
+            [
+                {"text": "First pass."},
+                {"text": "Everything landed.\n<promise>COMPLETE</promise>"},
+            ]
+        )
+        result = self._run(final)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
+    def test_needs_input_in_the_final_turn_halts_with_a_resume_command(self) -> None:
+        halting = self._claude_multiturn_events(
+            [
+                {"text": "Looking into it."},
+                {"text": "<promise>NEEDS_INPUT</promise>\nWhich migration path should I take?"},
+            ]
+        )
+        result = self._run(halting)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("Which migration path", result.stderr)
+        self.assertIn("ralph resume --backend claude", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "needs_input")
+
+    def test_needs_input_withdrawn_by_the_final_turn_warns_and_continues(self) -> None:
+        # A question an earlier turn raised but the final turn took back is not a
+        # halt: warn on stderr and continue, mirroring the inferred-question split.
+        withdrawn = self._claude_multiturn_events(
+            [
+                {"text": "<promise>NEEDS_INPUT</promise>\nShould I pick option A?"},
+                {"text": "Resolved it from the tracker; option A it is."},
+            ]
+        )
+        result = self._run(withdrawn)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertIn("withdrew it", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "budget_exhausted")
+
+    def test_model_usage_is_unioned_across_results(self) -> None:
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("First pass.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "Done.\n<promise>COMPLETE</promise>", "claude-session-1"
+            ),
+            self._claude_result_event(
+                "First pass.",
+                "claude-session-1",
+                model_usage={"claude-opus-4-8": {"inputTokens": 1, "outputTokens": 1}},
+            ),
+            self._claude_result_event(
+                "Done.\n<promise>COMPLETE</promise>",
+                "claude-session-1",
+                model_usage={"claude-3-5-haiku": {"inputTokens": 2, "outputTokens": 2}},
+            ),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir, _ = self._read_outcome()
+        session = json.loads((run_dir / "session.json").read_text())
+        self.assertEqual(
+            set(session["model_usage"]), {"claude-opus-4-8", "claude-3-5-haiku"}
+        )
+
+    def test_a_result_naming_a_non_claude_model_fails_closed(self) -> None:
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Working.", "claude-session-1"),
+            self._claude_result_event(
+                "Working.",
+                "claude-session-1",
+                model_usage={"gpt-4o": {"inputTokens": 1, "outputTokens": 1}},
+            ),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("valid model usage", result.stderr)
+
+    def test_the_prompt_no_longer_carries_the_deleted_subagent_directive(self) -> None:
+        # The parser now enforces what the directive asked for, so the tokens go.
+        result = self.run_ralph(backend="claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        composed = json.loads((self.calls / "claude-stdin").read_text())["message"]["content"]
+        self.assertNotIn("run_in_background", composed)
+        self.assertNotIn("run synchronously", composed)
+        # The Loop protocol is still appended unchanged.
+        self.assertIn("at most one child issue", composed)

@@ -461,24 +461,105 @@ class RalphCliTestCase(unittest.TestCase):
             (sequence / f"events-{index}").write_text(events + "\n", encoding="utf-8")
         return sequence
 
-    def _claude_background_events(self, session_id: str) -> str:
-        # An iteration that registers a background subagent: the guard fires at
-        # `background_tasks_changed`, so nothing after it is ever read.
-        events = self._claude_events("Working.", session_id=session_id).splitlines()
-        events.insert(
-            2,
-            json.dumps(
-                {
-                    "type": "system",
-                    "subtype": "background_tasks_changed",
-                    "session_id": session_id,
-                    "tasks": [
-                        {"task_id": "t1", "task_type": "local_agent", "description": "survey"}
-                    ],
-                }
-            ),
-        )
-        return "\n".join(events)
+    # Atomic Claude stream-event builders. Multi-turn tests compose these directly
+    # so a stream's exact shape -- interleaved inits, a background registration,
+    # tagged subagent messages, results flushed at EOF -- is spelled out in the
+    # test that depends on it.
+    def _claude_init_event(
+        self, session_id: str, model: str = "claude-opus-4-8", **overrides: object
+    ) -> dict:
+        event = {
+            "type": "system",
+            "subtype": "init",
+            "session_id": session_id,
+            "apiKeySource": "none",
+            "model": model,
+            "permissionMode": "bypassPermissions",
+            "tools": ["Bash", "Read", "Edit"],
+            "mcp_servers": [],
+            "skills": ["implement"],
+            "plugins": [],
+        }
+        event.update(overrides)
+        return event
+
+    def _claude_assistant_event(
+        self,
+        text: str,
+        session_id: str,
+        model: str = "claude-opus-4-8",
+        parent_tool_use_id: str | None = None,
+    ) -> dict:
+        # `parent_tool_use_id` is None for the Backend's own messages and a
+        # tool-use id for a background subagent's.
+        return {
+            "type": "assistant",
+            "session_id": session_id,
+            "parent_tool_use_id": parent_tool_use_id,
+            "message": {
+                "id": "msg_claude",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": text}],
+            },
+        }
+
+    def _claude_background_event(self, session_id: str) -> dict:
+        # Registers a background subagent; this is what licenses a later init.
+        return {
+            "type": "system",
+            "subtype": "background_tasks_changed",
+            "session_id": session_id,
+            "tasks": [{"task_id": "t1", "task_type": "local_agent", "description": "survey"}],
+        }
+
+    def _claude_result_event(
+        self,
+        text: str,
+        session_id: str,
+        model: str = "claude-opus-4-8",
+        model_usage: dict | None = None,
+    ) -> dict:
+        return {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "session_id": session_id,
+            "result": text,
+            "modelUsage": model_usage or {model: {"inputTokens": 1, "outputTokens": 1}},
+        }
+
+    @staticmethod
+    def _claude_stream(events: list[dict]) -> str:
+        return "\n".join(json.dumps(event) for event in events)
+
+    def _claude_multiturn_events(
+        self,
+        turns: list[dict],
+        session_id: str = "claude-session-1",
+        model: str = "claude-opus-4-8",
+    ) -> str:
+        # Compose an N-turn stream in the observed shape: each init opens a turn
+        # interleaved with that turn's work, a `background_tasks_changed`
+        # registers before the next init licenses it, and every turn's result is
+        # flushed at EOF in turn order. Each entry of `turns` is a dict with
+        # "text" (the turn's final Backend message and its result) and optional
+        # "subagents" (subagent message texts, tagged with parent_tool_use_id).
+        events: list[dict] = []
+        for index, turn in enumerate(turns):
+            events.append(self._claude_init_event(session_id, model))
+            for order, subagent in enumerate(turn.get("subagents", [])):
+                events.append(
+                    self._claude_assistant_event(
+                        subagent, session_id, model, parent_tool_use_id=f"toolu_{index}_{order}"
+                    )
+                )
+            events.append(self._claude_assistant_event(turn["text"], session_id, model))
+            if index < len(turns) - 1:
+                events.append(self._claude_background_event(session_id))
+        for turn in turns:
+            events.append(self._claude_result_event(turn["text"], session_id, model))
+        return self._claude_stream(events)
 
     _ENV_ALLOWLIST = (
         "PATH",
