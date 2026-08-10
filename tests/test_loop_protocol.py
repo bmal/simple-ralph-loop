@@ -610,7 +610,9 @@ class LoopProtocolTest(RalphCliTestCase):
         self.assertIn("[step started]", result.stdout)
         self.assertIn("[bash (completed)]", result.stdout)
         self.assertIn("[step finished]", result.stdout)
-        self.assertIn("full-auto mode", result.stderr)
+        # Backend progress stays on stdout; Ralph's own voice stays on stderr,
+        # where the run header states the full-auto permissions as a setting.
+        self.assertIn("ralph: permissions dangerous full-auto", result.stderr)
 
     def test_deeply_nested_json_fails_closed_without_traceback(self) -> None:
         # JSON nested past the interpreter's recursion limit raises RecursionError

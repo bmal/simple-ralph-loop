@@ -1,23 +1,84 @@
 """Shared black-box test harness: fake backends on PATH, the subprocess
-command builder, the sanitized-environment allowlist, and the run/clean/
-resume helpers. Every behavior-area test case subclasses RalphCliTestCase
-so this harness lives in exactly one home."""
+command builder, the sanitized-environment allowlist, the run/clean/
+resume helpers, and the narrow pseudo-terminal capability. Every behavior-area
+test case subclasses RalphCliTestCase so this harness lives in exactly one home.
+
+``PtyCapture`` and ``run_ralph_pty`` exist because the suite otherwise drives
+Ralph exclusively through pipes, which would leave the terminal path — colour and
+width — as the one path nothing exercises, and the degraded piped path free to rot
+unnoticed (register G20). The capability is deliberately narrow: a handful of
+tests, asserting what an operator on a terminal is shown, never how it is
+painted."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
+import pty
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import textwrap
+import threading
 import time
+from typing import TextIO
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+class PtyCapture:
+    """A pseudo-terminal of a known width, and what was written to it.
+
+    Used as a context manager. The master end is drained by a thread for the whole
+    lifetime, so a writer that outruns the pty's own buffer cannot block; ``text``
+    is readable once the block exits, with the CRLF a pty puts on every line
+    normalized away so assertions stay about *what* was said."""
+
+    def __init__(self, columns: int = 100) -> None:
+        self._columns = columns
+        self._chunks: list[bytes] = []
+
+    def __enter__(self) -> PtyCapture:
+        self._master, self.fd = pty.openpty()
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, self._columns, 0, 0))
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        # The slave must close before the master can see end of file: it is the
+        # last writer once the process or stream under test has finished with it.
+        os.close(self.fd)
+        self._reader.join(timeout=10)
+        os.close(self._master)
+
+    def text_stream(self) -> TextIO:
+        """A text stream onto the terminal that owns its own descriptor, so closing
+        it cannot pull the slave out from under the capture."""
+        return os.fdopen(os.dup(self.fd), "w", encoding="utf-8")
+
+    @property
+    def text(self) -> str:
+        return b"".join(self._chunks).decode("utf-8", "replace").replace("\r\n", "\n")
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                data = os.read(self._master, 65536)
+            except OSError:
+                # The last writer closed the slave: macOS reports EIO here rather
+                # than a clean end of file.
+                return
+            if not data:
+                return
+            self._chunks.append(data)
 
 
 class RalphCliTestCase(unittest.TestCase):
@@ -679,6 +740,38 @@ class RalphCliTestCase(unittest.TestCase):
             env=self._environment(env),
             text=True,
             capture_output=True,
+        )
+
+    def run_ralph_pty(
+        self,
+        *extra: str,
+        env: dict[str, str] | None = None,
+        backend: str = "opencode",
+        columns: int = 100,
+        timeout: float = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run Ralph with stderr attached to a pseudo-terminal of a known width,
+        returning what an operator sitting at that terminal would have seen.
+
+        The child is handed the slave end directly rather than being adopted into
+        its own session: ``isatty`` and the window-size ioctl -- the two facts the
+        Run console reads -- answer identically, and the run stays an ordinary
+        subprocess we can wait on."""
+        with PtyCapture(columns) as terminal:
+            process = subprocess.run(
+                self._command("run", *extra, backend=backend),
+                cwd=self.base,
+                env=self._environment(env),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=terminal.fd,
+                timeout=timeout,
+            )
+        return subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            process.stdout.decode("utf-8", "replace"),
+            terminal.text,
         )
 
     def clean_ralph(self) -> subprocess.CompletedProcess[str]:

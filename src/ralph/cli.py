@@ -28,19 +28,26 @@ Invariants:
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
+- ``main`` is the composition root (register G16): it is the only module in the
+  tree that constructs a concrete Run console, and it injects it into ``run`` and
+  uses it for that terminal error line. Everything below depends on the
+  ``RunConsole`` abstraction only, so a later rendering change — quiet, verbose,
+  plain — is a different concrete class selected here and nothing else.
 
 Depends on / must not know: the ``backends`` package (defaults, the registry, and
-the resolved Backend's five interface names), ``redaction`` (functions only),
-``protocol`` (the default interactive-only label),
+the resolved Backend's five interface names), ``console`` (the ``RunConsole``
+abstraction and the one concrete renderer it selects), ``redaction`` (functions
+only), ``protocol`` (the default interactive-only label),
 ``gitcontext``, ``launch`` (``session_argv``, ``establish_sandbox``), ``locking``
 (the worktree lock and ``secure_state_directory``), ``loop``, ``process``
 (timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
 through the interface; it must not contain any Backend, Launch chain, or Loop
-mechanism of its own, nor branch on the backend name.
+mechanism of its own, nor branch on the backend name. It words no operator-facing
+line of its own beyond the ones not yet migrated to the Run console.
 
-See also: ``loop`` (the budgeted Iteration loop), ``backends`` (the registry and
-adapters), ``launch`` (wrapped argv and recovery-command formatting), package
-docstring in ``ralph`` (the map).
+See also: ``console`` (the Run console it constructs), ``loop`` (the budgeted
+Iteration loop), ``backends`` (the registry and adapters), ``launch`` (wrapped argv
+and recovery-command formatting), package docstring in ``ralph`` (the map).
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ import stat
 import sys
 
 from .backends import DEFAULT_MODELS, resolve
+from .console import RunConsole, StreamRunConsole
 from .errors import RalphError
 from .gitcontext import command, git_context, read_prompt
 from .launch import establish_sandbox, session_argv
@@ -64,7 +72,7 @@ from .protocol import DEFAULT_INTERACTIVE_LABEL
 from .redaction import collect_secrets, set_active_redactor
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, console: RunConsole) -> int:
     if not 1 <= args.iterations <= 100:
         raise RalphError("iterations must be between 1 and 100")
     if not math.isfinite(args.timeout) or args.timeout < 0:
@@ -96,7 +104,16 @@ def run(args: argparse.Namespace) -> int:
     worktree, git_dir, branch, status, slug = git_context(args.worktree)
     with WorktreeLock(git_dir, git_dir / "ralph" / "lock.json"):
         return run_locked(
-            backend, args, prompt_path, prompt, worktree, git_dir, branch, status, slug
+            backend,
+            args,
+            prompt_path,
+            prompt,
+            worktree,
+            git_dir,
+            branch,
+            status,
+            slug,
+            console,
         )
 
 
@@ -264,15 +281,18 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    # The composition root: the one place a concrete Run console is selected and
+    # injected (register G16). Every module below here depends on the abstraction.
+    console = StreamRunConsole(sys.stderr)
     try:
         if args.command == "run":
-            return run(args)
+            return run(args, console)
         if args.command == "clean":
             return clean(args)
         if args.command == "resume":
             return resume(args)
     except RalphError as error:
-        print(f"ralph: {error}", file=sys.stderr)
+        console.failed(str(error))
         return 2
     return 2
 

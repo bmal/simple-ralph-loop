@@ -66,9 +66,35 @@ ralph run prompt.md --backend opencode --iterations 2 --timeout 5400
 ```
 
 OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
-`claude-opus-4-8`. Each run announces the resolved routing up front (for
-example `ralph: backend claude, model claude-opus-4-8`) so the console states
-exactly what the loop is about to spend budget on. Use `--model` for another
+`claude-opus-4-8`. Each run opens with a header stating the settings it
+resolved and the directory its evidence will be retained in, before any budget
+is spent:
+
+```
+ralph: backend claude, model claude-opus-4-8
+ralph: iterations 4, timeout 3600s
+ralph: repository example/project, branch main
+ralph: worktree /Users/you/code/project
+ralph: prompt /Users/you/code/project/prompt.md
+ralph: interactive-only label may-ask-owner; children resolved before the first iteration
+ralph: run directory /Users/you/code/project/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d
+ralph: permissions dangerous full-auto; the backend may edit files and run commands without confirmation
+ralph: power assertion caffeinate -im, which cannot prevent lid-close or explicit sleep, power loss, or external network and service outages
+```
+
+The concrete interactive-only children complete that header once Ralph has
+resolved them, which it can only do after the first iteration's preflight has
+proven `gh`. The last two lines are standing facts about every run, stated as
+settings rather than shouted as warnings, so the rare real warning — a relaxed
+guarantee, a dirty worktree — is worth reading when it appears.
+
+Ralph writes its own lines to stderr, prefixed `ralph:` and coloured only when
+stderr is a terminal and `NO_COLOR` is unset, so a redirected log carries no
+escape sequences. On a terminal a header line that does not fit the window is
+shortened — paths keep their informative end — rather than folded onto a second
+row. Truncation is display-only: no retained artifact loses content.
+
+Use `--model` for another
 model in the selected subscription-backed provider and `--worktree PATH` to
 target another GitHub worktree. Each iteration defaults to 3,600 seconds (60 minutes). A positive
 `--timeout` changes the limit up to a maximum of 2,000,000 seconds; `--timeout 0`
@@ -195,8 +221,10 @@ ralph clean --worktree PATH
 ## Safety
 
 Ralph always grants dangerous full-auto permissions. The backend can edit
-files and run commands without confirmation. Review the prompt, repository,
-and effective authentication before starting an unattended run.
+files and run commands without confirmation. Every run's header states this,
+along with what the `caffeinate` power assertion cannot protect against. Review
+the prompt, repository, and effective authentication before starting an
+unattended run.
 
 ### Host isolation
 

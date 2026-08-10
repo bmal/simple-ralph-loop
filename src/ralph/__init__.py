@@ -3,7 +3,11 @@ in fresh full-auto coding-agent sessions against a finite Iteration budget.
 
 Module map — start here, then open only the module you need:
 
-- ``cli``          — argument parsing and the run/clean/resume commands; ``main``.
+- ``cli``          — argument parsing and the run/clean/resume commands; ``main``,
+                     the composition root that selects the concrete Run console.
+- ``console``      — the Run console: the operator-facing seam, the run header, the
+                     palette, terminal detection and width, no-wrap truncation, and
+                     the redaction choke point for console output.
 - ``loop``         — the budgeted Iteration loop, handoff printing, outcome
                      recording, and the once-per-run resolution of the concrete
                      interactive-only children (after preflight proves ``gh``).
@@ -36,7 +40,7 @@ Module map — start here, then open only the module you need:
 - ``errors``       — ``RalphError``, ``HandoffError``, ``StartedIterationError``.
 
 See CONTEXT.md for the vocabulary (Backend, Iteration, Launch chain, Loop protocol,
-Trust boundary, Handed-off session) these modules are named after.
+Run console, Trust boundary, Handed-off session) these modules are named after.
 """
 
 __version__ = "0.1.0"

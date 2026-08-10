@@ -35,16 +35,27 @@ Invariants:
   the run closed like any other preflight proof. The resolution is advisory --
   Ralph cannot observe which child the Backend selects -- so only the resulting
   needs-input halt is mechanical.
+- The run's opening facts go to the injected ``RunConsole`` as a ``RunSettings``
+  value object, never as text the loop worded itself (register G14). The header is
+  emitted once the run directory exists and before host isolation is established,
+  so the evidence path is on screen before any budget is spent or any failure
+  reported. The resolved interactive-only children complete that header from where
+  their resolution finishes, which is necessarily after the first iteration's
+  banner. Every emit site still holding a ``print`` here is one a later ticket in
+  the Run console program migrates; the structural test names them explicitly.
 
-Depends on / must not know: ``redaction`` (functions only), ``locking``,
-``gitcontext``, ``protocol`` (``build_protocol`` / ``set_active_protocol``),
-``launch``, ``errors``, and a resolved ``Backend`` (``cli`` resolves it through the
-registry and passes it in). It must not know which concrete Backend it holds, nor
-how that Backend consumes the argv or produces its events.
+Depends on / must not know: ``console`` (the ``RunConsole`` abstraction and its
+value objects -- never a concrete renderer), ``redaction`` (functions only),
+``locking``, ``gitcontext``, ``protocol`` (``build_protocol`` /
+``set_active_protocol``), ``launch``, ``errors``, and a resolved ``Backend``
+(``cli`` resolves it through the registry and passes it in). It must not know which
+concrete Backend it holds, nor how that Backend consumes the argv or produces its
+events, nor how the Run console words or paints anything it is handed.
 
-See also: ``launch`` (owns the wrapped argv, the profile gate, and recovery-command
-formatting), ``cli`` (``run`` resolves the Backend, acquires the lock, then calls
-``run_locked``), ``backends`` (the registry and Protocol).
+See also: ``console`` (the Run console and its rendering apparatus), ``launch``
+(owns the wrapped argv, the profile gate, and recovery-command formatting), ``cli``
+(``run`` resolves the Backend, acquires the lock, constructs the console, then
+calls ``run_locked``), ``backends`` (the registry and Protocol).
 """
 
 from __future__ import annotations
@@ -58,6 +69,7 @@ from typing import Any
 import uuid
 
 from .backends import Backend
+from .console import RunConsole, RunSettings
 from .errors import (
     HandoffError,
     RalphError,
@@ -149,10 +161,21 @@ def run_locked(
     branch: str,
     status: str,
     slug: str,
+    console: RunConsole,
 ) -> int:
     with CaffeinateAssertion(worktree) as assertion:
         return run_protected(
-            backend, args, prompt_path, prompt, worktree, git_dir, branch, status, slug, assertion
+            backend,
+            args,
+            prompt_path,
+            prompt,
+            worktree,
+            git_dir,
+            branch,
+            status,
+            slug,
+            assertion,
+            console,
         )
 
 
@@ -167,27 +190,13 @@ def run_protected(
     status: str,
     slug: str,
     assertion: CaffeinateAssertion,
+    console: RunConsole,
 ) -> int:
-    # Announce the resolved routing up front so a run's console output states
-    # exactly which backend and model the loop is about to spend budget on,
-    # including when the model came from DEFAULT_MODELS rather than --model.
-    print(f"ralph: backend {args.backend}, model {args.model}", file=sys.stderr)
-    if any(line and not line.startswith("##") for line in status.splitlines()):
-        print("ralph: warning: worktree has uncommitted changes", file=sys.stderr)
     env = backend.environment(args.model)
     # Redact subscription credentials from every readable and retained stream in
-    # case backend output echoes an environment value.
+    # case backend output echoes an environment value. This precedes the header so
+    # the Run console's choke point already has a live redactor to scrub through.
     set_active_redactor(collect_secrets())
-    print(
-        "WARNING: Ralph always uses dangerous full-auto mode permissions; the backend may edit files "
-        "and run commands without confirmation.",
-        file=sys.stderr,
-    )
-    print(
-        "WARNING: caffeinate cannot prevent lid-close or explicit sleep, power loss, or external "
-        "network and service outages.",
-        file=sys.stderr,
-    )
 
     runs_root = secure_state_directory(git_dir, "ralph", "runs")
     run_dir = runs_root / (
@@ -212,6 +221,28 @@ def run_protected(
         },
     )
     (run_dir / "git-status.txt").write_text(status, encoding="utf-8")
+    # Open the run with the header: the resolved settings the loop is about to
+    # spend budget on and the evidence path they will be recorded under (register
+    # G8). It is emitted the moment the run directory exists and before host
+    # isolation is established, so no budget is spent — and no failure reported —
+    # before the operator has been told what this run is and where to look.
+    console.run_started(
+        RunSettings(
+            backend=args.backend,
+            model=args.model,
+            iterations=args.iterations,
+            timeout=args.timeout,
+            repository=slug,
+            branch=branch,
+            worktree=worktree,
+            prompt_path=prompt_path,
+            interactive_label=args.interactive_label,
+            run_dir=run_dir,
+            dirty=any(
+                line and not line.startswith("##") for line in status.splitlines()
+            ),
+        )
+    )
     # Establish host isolation once per run (the profile is stable across
     # iterations): generate the per-run profile and prove it actually bites via
     # the one-shot self-test before any budget is spent, or stop fail-closed here
@@ -264,6 +295,11 @@ def run_protected(
                     run_dir / "interactive-only.json",
                     {"label": args.interactive_label, "issues": interactive_only},
                 )
+                # Completes the header where its resolution finishes: the concrete
+                # children cannot be known until preflight has proven gh, so this
+                # line lands after the first iteration's banner for the same reason
+                # register G8 lands the Trust boundary line there.
+                console.interactive_only_resolved(args.interactive_label, interactive_only)
             iteration_started = datetime.now(timezone.utc).isoformat()
             # A started session consumes its slot whatever the outcome; the loop
             # never restarts a slot itself.

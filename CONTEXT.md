@@ -40,6 +40,17 @@ which child the backend selects — so only the resulting needs-input halt is
 enforced.
 _Avoid_: blocked issue (reserved for declared dependencies), operator label
 
+**Run console**:
+The module that owns every operator-facing line of a run — the header stating
+the resolved settings and the evidence path, the warnings, the failures — and
+the rendering apparatus behind that small interface: the four-role palette,
+terminal and `NO_COLOR` detection, dynamic width, no-wrap truncation, and the
+single choke point every operator-facing string is redacted at. It is the only
+module permitted to write to a terminal — the emit sites still outside it are
+named explicitly by the structural test that enforces the rule, and each is
+migrated in turn — and `cli` is the only module that constructs one.
+_Avoid_: log, output, UI, stderr (the stream it happens to write to)
+
 **Trust boundary**:
 The set of properties ralph proves before spending budget: subscription-only
 authentication, customization isolation, and host isolation.
