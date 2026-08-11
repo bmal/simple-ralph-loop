@@ -44,13 +44,16 @@ _Avoid_: blocked issue (reserved for declared dependencies), operator label
 The module that owns every operator-facing line of a run — the header stating
 the resolved settings and the evidence path, the Iteration rules and outcome
 blocks, the terminal summary naming the git outcome on every path including
-success, the Trust boundary line, the warnings, the failures, and the bell — and
-the rendering apparatus behind that small interface: the four-role palette,
-terminal and `NO_COLOR` detection, dynamic width, no-wrap truncation, and the
-single choke point every operator-facing string is redacted at. It is the only
-module permitted to write to a terminal — the emit sites still outside it are
-named explicitly by the structural test that enforces the rule, and each is
-migrated in turn — and `cli` is the only module that constructs one.
+success, the Trust boundary line, the loud deviation warnings for a relaxed
+guarantee, the full help block every failure gets once a run directory exists (the
+`RALPH NEEDS OPERATOR` handoff, the backend-failure next step, and the budget-
+exhaustion continuation command), and the bell — and the rendering apparatus behind
+that small interface: the four-role palette, terminal and `NO_COLOR` detection,
+dynamic width, no-wrap truncation, and the single choke point every operator-facing
+string is redacted at. It is the only module permitted to write to a terminal — the
+emit sites still outside it are named explicitly by the structural test that enforces
+the rule, and each is migrated in turn — and `cli` is the only module that constructs
+one.
 _Avoid_: log, output, UI, stderr (the stream it happens to write to)
 
 **Trust boundary**:

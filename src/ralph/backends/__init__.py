@@ -15,6 +15,10 @@ Invariants:
   ``execute_iteration``, ``resume_argv``, ``environment`` — for type-checkers only;
   the adapters are plain modules, matched structurally with no runtime class or ABC
   machinery (register E1).
+- ``preflight`` returns a ``console.Deviation`` (or ``None``): when it admits an
+  agent vector under ``--unsafe-allow-agents``, it hands the fact back so the caller
+  states the relaxed guarantee loudly through the Run console (register G7/G14). The
+  adapter constructs no operator-facing warning; the console owns the wording.
 - ``execute_iteration`` returns ``(outcome, session_id, concluding_message)``: the
   Iteration's outcome, the session to resume, and the Backend's final message — the
   same text the completion/needs-input markers were read from — which the Loop hands
@@ -22,7 +26,8 @@ Invariants:
   formatted text; the console truncates it for display only (register G14).
 
 Depends on / must not know: the two adapter modules (imported so the registry can
-name them). It must not grow backend-specific logic — that belongs in the adapters.
+name them) and ``console`` (only for the ``Deviation`` value type ``preflight``
+returns). It must not grow backend-specific logic — that belongs in the adapters.
 
 See also: ``backends.opencode`` / ``backends.claude`` (the adapters), ``loop`` and
 ``cli`` (resolve once, then drive the Backend through the five names), ``launch``
@@ -34,6 +39,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from ..console import Deviation
 from . import claude, opencode
 
 
@@ -50,7 +56,7 @@ class Backend(Protocol):
 
     def preflight(
         self, worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = ...
-    ) -> None: ...
+    ) -> Deviation | None: ...
 
     def validate_model(self, model: str) -> None: ...
 

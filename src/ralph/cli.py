@@ -24,7 +24,12 @@ Invariants:
   automated iterations (register D9). It resolves the Backend through the registry,
   establishes the sandbox through ``launch.establish_sandbox`` (skipped only under
   ``--unsafe-no-sandbox``), and obtains its wrapped argv from ``launch.session_argv``,
-  the one seam #19 edits.
+  the one seam #19 edits. Recovery relaxes the same guarantees a run does, so it
+  states them as loudly: an admitted agent vector (the ``Deviation`` ``preflight``
+  hands back) and the sandbox opt-out are stated through the injected console
+  (register G7/G13), which is why ``main`` passes it in. The remaining resume line —
+  the dangerous full-auto warning — is a ``print`` a later ticket migrates; the
+  structural test names ``cli`` explicitly.
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
@@ -61,7 +66,7 @@ import stat
 import sys
 
 from .backends import DEFAULT_MODELS, resolve
-from .console import RunConsole, StreamRunConsole
+from .console import NO_SANDBOX_DEVIATION, Deviation, RunConsole, StreamRunConsole
 from .errors import RalphError
 from .gitcontext import command, git_context, read_prompt
 from .launch import establish_sandbox, session_argv
@@ -149,7 +154,7 @@ def clean(args: argparse.Namespace) -> int:
     return 0
 
 
-def resume(args: argparse.Namespace) -> int:
+def resume(args: argparse.Namespace, console: RunConsole) -> int:
     backend = resolve(args.backend)
     backend.validate_model(args.model)
     worktree, git_dir, _branch, _status, slug = git_context(args.worktree)
@@ -160,7 +165,11 @@ def resume(args: argparse.Namespace) -> int:
     # or custom endpoint, so recovery cannot silently inherit unsafe routing.
     env = backend.environment(args.model)
     set_active_redactor(collect_secrets())
-    backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
+    agent_deviation = backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
+    if agent_deviation is not None:
+        # Recovery relaxes the same guarantees the run did; an admitted agent vector
+        # is stated as loudly on resume as it is on a run (register G7/G14).
+        console.deviation(agent_deviation)
     # Re-establish host isolation identically to automated iterations (register
     # D9): the same generator and one-shot self-test, writing the concrete profile
     # under the untracked .git/ralph (register D10), then wrapping it around the
@@ -174,6 +183,10 @@ def resume(args: argparse.Namespace) -> int:
         env,
         no_sandbox=args.unsafe_no_sandbox,
     )
+    if args.unsafe_no_sandbox:
+        # The gate is silent; recovery states the relaxed host-isolation guarantee
+        # loudly through the console, exactly as `run` does (register G7/G13).
+        console.deviation(Deviation(NO_SANDBOX_DEVIATION))
     # The Launch chain assembles the wrapped argv: caffeinate outermost, the
     # sandbox-exec host-isolation wrap inside it, both launched by absolute path
     # exactly as automated iterations do (preflight has proved caffeinate exists).
@@ -290,7 +303,7 @@ def main() -> int:
         if args.command == "clean":
             return clean(args)
         if args.command == "resume":
-            return resume(args)
+            return resume(args, console)
     except RalphError as error:
         console.failed(str(error))
         return 2

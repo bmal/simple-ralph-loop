@@ -37,6 +37,11 @@ Invariants:
   injectable, and ``default_sandbox_probe``'s ``home`` argument is an internal
   test seam (the qualification smoke points the probes at a hermetic home); like
   the ``RALPH_*`` overrides, production supplies neither.
+- ``establish_sandbox`` is silent: under ``--unsafe-no-sandbox`` it returns no
+  profile and words nothing. Stating the relaxed guarantee loudly is the Run
+  console's job now (register G7/G13); the gate emits only the fact (no profile),
+  and its callers — the Loop and ``cli`` resume — raise the deviation through the
+  console.
 - Recovery commands route through ``ralph resume`` / ``ralph run`` so replayed
   recovery re-establishes the full Trust boundary rather than inheriting the
   operator's ambient environment; ``--unsafe-allow-agents`` is reproduced so resume
@@ -49,7 +54,8 @@ Depends on / must not know: ``errors``. It must not know how the Loop schedules
 Iterations or how a Backend consumes the argv it helps build.
 
 See also: ``process`` (per-Iteration process control), ``loop`` (holds the
-CaffeinateAssertion and prints handoffs), the Backend adapters (wrap their argv).
+CaffeinateAssertion and hands the run's facts to the Run console), the Backend
+adapters (wrap their argv).
 """
 
 from __future__ import annotations
@@ -58,7 +64,6 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 from typing import Callable
 
 from .errors import RalphError
@@ -146,18 +151,6 @@ SANDBOX_WORLD_WRITABLE_TMP_ROOTS = (Path("/private/tmp"), Path("/tmp"))
 PROBE_BLOCKED = "blocked"
 PROBE_ALLOWED = "allowed"
 PROBE_UNAVAILABLE = "unavailable"
-
-# Loud stderr warning printed when `--unsafe-no-sandbox` relaxes host isolation
-# (register D7). It relaxes only host isolation: the sandbox wrap and its
-# self-test are skipped, so the backend runs unconfined and Ralph cannot prove
-# host isolation for the session. Every other guarantee — subscription-only
-# auth, customization isolation, redaction — is untouched.
-SANDBOX_DISABLED_WARNING = (
-    "WARNING: --unsafe-no-sandbox is set; Ralph is NOT proving host isolation for "
-    "this session. The backend runs unconfined and may write outside the worktree "
-    "or read the operator's credentials. No other guarantee is relaxed."
-)
-
 
 def caffeinate_executable() -> str:
     # Always an absolute path so the sleep assertion cannot be satisfied by a
@@ -410,12 +403,13 @@ def establish_sandbox(
     # actually bites via the one-shot self-test before any budget is spent
     # (register D7/D8): a profile that cannot be built or written, or one that
     # fails open, stops the session right here rather than launching unconfined.
-    # `--unsafe-no-sandbox` relaxes only host isolation (register D7): no profile,
-    # no self-test, and a loud warning that the boundary is unproven — every other
-    # guarantee (subscription-only auth, customization isolation, redaction) is
-    # untouched because this gate governs nothing else.
+    # `--unsafe-no-sandbox` relaxes only host isolation (register D7): no profile and
+    # no self-test — every other guarantee (subscription-only auth, customization
+    # isolation, redaction) is untouched because this gate governs nothing else. The
+    # loud warning that the boundary is unproven is the Run console's to word now
+    # (register G7/G13): the gate returns the fact (no profile) and its two callers —
+    # the Loop and ``cli`` resume — state the deviation through the console.
     if no_sandbox:
-        print(SANDBOX_DISABLED_WARNING, file=sys.stderr)
         return None
     profile = sandbox_profile_for(backend, run_dir, worktree, ralph_dir, env)
     run_sandbox_self_test(profile)

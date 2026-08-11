@@ -28,7 +28,15 @@ Invariants:
   judged on decides completion and the needs-input halt, and a needs-input marker
   in any other message of the Backend's own — an earlier turn's or an earlier
   message of the final turn's — is one the Backend withdrew, so it warns on stderr
-  and continues rather than costing the Iteration.
+  and continues rather than costing the Iteration. That withdrawn-marker warning and
+  the unmarked-question warning stay mid-run stderr lines, but the fragment each
+  quotes back is redacted and then bounded through ``protocol.bounded_quote`` so a
+  warning is a bounded interruption, never the Backend's whole final message (#39).
+- ``preflight`` returns a ``console.Deviation`` (or ``None``): when it admits the
+  ``.claude/agents`` vector under ``--unsafe-allow-agents`` and otherwise clears, it
+  hands back the fact so the caller states the relaxed subagent-isolation guarantee
+  loudly through the Run console — the adapter words no operator-facing warning of its
+  own (register G7/G14). A refused run is not warned about isolation it never reaches.
 - ``parent_tool_use_id`` distinguishes the Backend's own messages (``None``) from a
   background subagent's (the launching tool-use id). Only the Backend's own messages
   assemble a turn's response and are scanned for completion/needs-input markers, so a
@@ -47,9 +55,11 @@ Invariants:
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
-``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``, and
-``preflight``. It must not know how the Loop schedules Iterations; the Loop must not
-know these helpers exist beyond the five Backend interface names.
+``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``,
+``preflight``, and ``console`` (only for the ``Deviation`` value type ``preflight``
+returns — never a console instance). It must not know how the Loop schedules
+Iterations; the Loop must not know these helpers exist beyond the five Backend
+interface names.
 
 See also: ``backends`` (registry and the five-name Protocol), ``backends.opencode``
 (twin adapter), ``launch`` (``session_argv``, the wrapped argv), ``protocol``
@@ -66,6 +76,7 @@ import sys
 import threading
 from typing import Any
 
+from ..console import CLAUDE_AGENTS_DEVIATION, Deviation
 from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import (
     HandoffError,
@@ -78,6 +89,7 @@ from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
     active_protocol,
+    bounded_quote,
     explicit_needs_input,
     extract_question,
     has_completion_marker,
@@ -233,7 +245,7 @@ def read_unsafe_settings_keys(settings_path: Path) -> set[str]:
     return set(UNSAFE_CLAUDE_SETTINGS_KEYS.intersection(settings))
 
 
-def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> None:
+def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> Deviation | None:
     claude_dir = worktree / ".claude"
     # --unsafe-allow-agents relaxes only the agent vectors: the
     # `.claude/agents` directory and the settings.json `agent` key. It exists for
@@ -241,13 +253,11 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
     # configuration, and every other unsafe setting stay refused, and runtime
     # MCP/plugin/tool isolation is still proven from the init event. The trade is
     # deliberate and unsafe: Ralph can no longer prove which subagents loaded, so
-    # the operator vouches for them for this run.
-    if allow_agents and (claude_dir / "agents").exists():
-        print(
-            "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
-            "Claude subagent isolation for this run.",
-            file=sys.stderr,
-        )
+    # the operator vouches for them for this run. That relaxed guarantee is stated
+    # loudly by the Run console (register G7/G14), so this returns the deviation
+    # rather than wording it -- and only when the check otherwise clears, so a run
+    # that is refused anyway is not warned about the isolation it never reaches.
+    admitted_agents = allow_agents and (claude_dir / "agents").exists()
     # Managed and server-managed configuration is refused before the local
     # customization checks: the flag cannot relax it, so it must take precedence
     # over any co-present agent vector and never masquerade as something the
@@ -284,7 +294,7 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
     ]
     offending_keys = read_unsafe_settings_keys(claude_dir / "settings.json") - relaxable_keys
     if not offending_dirs and not offending_keys:
-        return
+        return Deviation(CLAUDE_AGENTS_DEVIATION) if admitted_agents else None
     # The hint is offered only when every offending item is an agent vector. If
     # the flag is already set the agent vectors are filtered out above, so any
     # surviving blocker is non-agent and the plain refusal stands.
@@ -299,9 +309,9 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
 
 def preflight(
     worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = False
-) -> None:
+) -> Deviation | None:
     common_preflight(worktree, slug, "claude", env)
-    reject_claude_customizations(worktree, allow_agents)
+    agent_deviation = reject_claude_customizations(worktree, allow_agents)
     version = command(["claude", "--version"], cwd=worktree, env=env).stdout
     if version_tuple(version, "Claude Code") < MIN_CLAUDE_VERSION:
         raise RalphError("Claude Code 2.1.208 or newer is required")
@@ -328,6 +338,9 @@ def preflight(
     )
     if not stored_subscription and not setup_token:
         raise RalphError("Claude must use first-party subscription OAuth authentication")
+    # Every proof cleared: hand back the admitted-agents deviation, if any, for the
+    # caller to state loudly through the Run console (register G7/G14).
+    return agent_deviation
 
 
 def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> str:
@@ -845,10 +858,12 @@ def _consume_claude_iteration(
         if withdrawn:
             break
     if withdrawn:
+        # A bounded interruption, not an outlet for the whole final message: the
+        # fragment is redacted, then collapsed and capped for display (issue #39).
         print(
             "ralph: warning: the backend requested operator input earlier in the "
             "session but its final message withdrew it; continuing to the next "
-            f"iteration:\n{redact(withdrawn)}",
+            f"iteration: {bounded_quote(redact(withdrawn))}",
             file=sys.stderr,
         )
     inferred = inferred_needs_input(final)
@@ -859,7 +874,7 @@ def _consume_claude_iteration(
         print(
             "ralph: warning: final message ended on an unmarked operator-directed "
             "question; continuing to the next iteration (no <promise>NEEDS_INPUT</promise> "
-            f"marker and no question tool used):\n{redact(inferred)}",
+            f"marker and no question tool used): {bounded_quote(redact(inferred))}",
             file=sys.stderr,
         )
     complete = has_completion_marker(final)

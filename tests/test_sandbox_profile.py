@@ -368,15 +368,17 @@ class SandboxEstablishmentTest(unittest.TestCase):
             )
         return profile, stderr.getvalue()
 
-    def test_opt_out_returns_no_profile_and_warns_loudly(self) -> None:
+    def test_opt_out_returns_no_profile_and_touches_nothing_else(self) -> None:
         with mock.patch.object(launch, "run_sandbox_self_test") as self_test:
             profile, warning = self._establish(no_sandbox=True)
         self.assertIsNone(profile)
         # No profile file is written and the self-test never runs.
         self.assertFalse((self.run_dir / "sandbox.sb").exists())
         self_test.assert_not_called()
-        self.assertIn("--unsafe-no-sandbox is set", warning)
-        self.assertIn("NOT proving host isolation", warning)
+        # The gate itself is silent now: stating the relaxed guarantee loudly is the
+        # Run console's job (register G7/G13), proven end-to-end by the black-box
+        # --unsafe-no-sandbox tests. The gate emits only the fact — no profile.
+        self.assertEqual(warning, "")
 
     def test_default_generates_the_profile_and_runs_the_self_test(self) -> None:
         with mock.patch.object(launch, "run_sandbox_self_test") as self_test:

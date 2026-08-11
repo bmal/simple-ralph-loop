@@ -44,6 +44,20 @@ Invariants:
   written to disk from it, so the retained copy stays byte-identical (register G18).
   The Trust boundary line (``trust_boundary_established``) is emitted where its proof
   completes, after the first Iteration's preflight, never in the header (register G8).
+- The full help block applies to every failure once a run directory exists (register
+  G10): a resumable handoff and a consuming stop are worded by ``operator_help`` as the
+  byte-identical ``RALPH NEEDS OPERATOR`` banner; a backend failure that left evidence
+  behind is worded by ``failure_help`` — the reason plus a next step pointing at the
+  run directory — never the banner, because a pre-session failure is not a resumable
+  handoff. Argument and precondition failures never reach either and stay the one-line
+  ``failed``. Budget exhaustion gains the exact continuation command through
+  ``budget_continue``. A relaxed guarantee — ``--unsafe-no-sandbox`` or an admitted
+  agent vector — is stated loudly through ``deviation`` (register G7). The handoff
+  block, the deviations, and the continuation line carry their own first-column
+  vocabulary and so are emitted verbatim through ``_line``, without the header's
+  ``ralph: `` prefix, but through the same redaction choke point (register G17). The
+  Launch chain, not the console, produces the recovery commands ``operator_help`` and
+  ``budget_continue`` render (register G14).
 
 Depends on / must not know: ``redaction`` (functions only, never the active-redactor
 global). It must not know how a run is driven, which Backend it holds, or what any
@@ -103,6 +117,34 @@ OUTCOME_HEADLINES = {
     "timeout": "run failed: iteration timed out",
 }
 
+# The deviation warnings a run states loudly when a standing guarantee is relaxed
+# (register G7): ``--unsafe-no-sandbox`` drops host isolation, and
+# ``--unsafe-allow-agents`` drops the proof of the backend's subagent isolation.
+# Their wording lives here, the one place operator-facing text is worded (register
+# G14) -- the Loop, ``cli``, and the Backend adapters only name which deviation
+# occurred. The load-bearing phrases ``--unsafe-no-sandbox is set`` and each
+# ``Ralph is not proving ... isolation`` are preserved byte-identical so the events
+# an operator greps for survive the redesign (register G19).
+NO_SANDBOX_DEVIATION = "no-sandbox"
+CLAUDE_AGENTS_DEVIATION = "claude-agents"
+OPENCODE_AGENTS_DEVIATION = "opencode-agents"
+
+DEVIATION_TEXTS = {
+    NO_SANDBOX_DEVIATION: (
+        "WARNING: --unsafe-no-sandbox is set; Ralph is NOT proving host isolation for "
+        "this session. The backend runs unconfined and may write outside the worktree "
+        "or read the operator's credentials. No other guarantee is relaxed."
+    ),
+    CLAUDE_AGENTS_DEVIATION: (
+        "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
+        "Claude subagent isolation for this run."
+    ),
+    OPENCODE_AGENTS_DEVIATION: (
+        "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
+        "OpenCode agent isolation for this run."
+    ),
+}
+
 
 @dataclass(frozen=True)
 class RunSettings:
@@ -153,6 +195,35 @@ class RunSummary:
     ahead: int
 
 
+@dataclass(frozen=True)
+class Deviation:
+    """A standing guarantee a run relaxed, named by the site that relaxed it and
+    worded loudly by the console (register G7/G14). ``kind`` selects one of
+    ``DEVIATION_TEXTS``; the site that raises it -- the Loop for the sandbox opt-out,
+    a Backend adapter for an admitted agent vector -- constructs no operator text."""
+
+    kind: str
+
+
+@dataclass(frozen=True)
+class OperatorHelp:
+    """The full help block a run prints when it stops and leaves a run directory full
+    of evidence behind (register G10): the reason it stopped, the run to point at, the
+    session to resume when one exists, the remaining budget, and the recovery commands
+    the Launch chain produced. The Loop fills it with facts and pre-built commands; the
+    console words the block and keeps its ``RALPH NEEDS OPERATOR`` vocabulary
+    byte-identical (register G14/G19)."""
+
+    reason: str
+    run_id: str
+    remaining: int
+    backend: str
+    session_id: str | None = None
+    detail: str | None = None
+    resume_command: str | None = None
+    continue_command: str | None = None
+
+
 class RunConsole(Protocol):
     """The operator-facing seam. It widens as later tickets migrate their emit
     sites; it is structural, matched with no runtime class or ABC machinery, in the
@@ -162,6 +233,8 @@ class RunConsole(Protocol):
 
     def interactive_only_resolved(self, label: str, issues: list[int]) -> None: ...
 
+    def deviation(self, warning: Deviation) -> None: ...
+
     def iteration_started(self, number: int, iterations: int) -> None: ...
 
     def trust_boundary_established(self, properties: list[str]) -> None: ...
@@ -169,6 +242,12 @@ class RunConsole(Protocol):
     def iteration_finished(self, outcome: IterationOutcome) -> None: ...
 
     def run_finished(self, summary: RunSummary) -> None: ...
+
+    def budget_continue(self, command: str) -> None: ...
+
+    def operator_help(self, help: OperatorHelp) -> None: ...
+
+    def failure_help(self, reason: str, run_dir: Path) -> None: ...
 
     def failed(self, message: str) -> None: ...
 
@@ -261,6 +340,14 @@ class StreamRunConsole:
         listed = ", ".join(f"#{issue}" for issue in issues) if issues else "none open"
         self._fact("interactive-only children", f"{listed} (label {label})")
 
+    def deviation(self, warning: Deviation) -> None:
+        # A relaxed guarantee stays loud (register G7): worded here and painted in
+        # the warning role on a terminal. Emitted whole, without the header's
+        # ``ralph: `` prefix, because its ``WARNING:`` opener and the phrases behind
+        # it are the anchors an operator greps for (register G19) -- so a narrow
+        # window may wrap it but never clips a word out of it.
+        self._line("warning", DEVIATION_TEXTS[warning.kind])
+
     def iteration_started(self, number: int, iterations: int) -> None:
         # A rule opening the Iteration (register G2/G9): a full-width divider on a
         # terminal, embedding the number and the budget; a plain labelled line when
@@ -326,6 +413,51 @@ class StreamRunConsole:
             return f"{summary.ahead} commit(s) not pushed to {summary.upstream}"
         return f"pushed to {summary.upstream}"
 
+    def budget_continue(self, command: str) -> None:
+        # Budget exhaustion is not a failure, but the operator has just spent the whole
+        # budget and the next thing they do is run it again, so the run states the exact
+        # command that continues the work (register G10). The ``continue Ralph:`` anchor
+        # is the same one the handoff block uses, so a habit built on one reads the other.
+        self._line("chrome", f"continue Ralph: {command}")
+
+    def operator_help(self, help: OperatorHelp) -> None:
+        # The full help block once a run directory exists (register G10), byte-identical
+        # to the banner an operator greps for. Painted whole in the failure role on a
+        # terminal, and without the header's ``ralph: `` prefix: ``RALPH NEEDS
+        # OPERATOR``, ``reason:``, ``manual resume:``, and ``continue Ralph:`` are the
+        # first-column anchors tooling and habits match on (register G19).
+        self._line("failure", "========== RALPH NEEDS OPERATOR ==========")
+        self._line("failure", f"reason: {help.reason}")
+        self._line("failure", f"ralph run: {help.run_id}")
+        if help.session_id:
+            self._line("failure", f"{help.backend} session: {help.session_id}")
+        if help.detail:
+            self._line("failure", f"question/error: {help.detail}")
+        if help.session_id and help.resume_command:
+            # Without a session there is nothing to resume; the handoff still offers
+            # the remaining-budget command so the loop can be continued.
+            self._line("failure", f"manual resume: {help.resume_command}")
+        self._line("failure", f"iterations remaining: {help.remaining}")
+        if help.remaining and help.continue_command:
+            self._line("failure", f"continue Ralph: {help.continue_command}")
+        else:
+            self._line("failure", "No iterations remain to continue Ralph.")
+        self._line("failure", "==========================================")
+
+    def failure_help(self, reason: str, run_dir: Path) -> None:
+        # A failure that left a run directory behind is told what failed and where the
+        # evidence is, not just one sentence (register G10). The reason keeps the
+        # failure role and the ``ralph: `` voice the one-line handler used, so the
+        # existing stderr assertions on it still hold; the next step names the run
+        # directory itself — the retained diagnostics, and the backend's stream when a
+        # session got that far — so the block carries the evidence path on its own.
+        self._message("failure", reason)
+        self._message(
+            "chrome",
+            f"next step: inspect the retained diagnostics under {run_dir}, then run "
+            "Ralph again once the cause is resolved",
+        )
+
     def failed(self, message: str) -> None:
         self._message("failure", message)
 
@@ -357,6 +489,17 @@ class StreamRunConsole:
         G3), and only because every fact they drop is recoverable from the run
         directory they name."""
         self._paint("", role, redact(PREFIX + text), role)
+
+    def _line(self, role: str, text: str) -> None:
+        """A whole operator-facing line emitted verbatim, without the ``ralph: ``
+        prefix the header uses. The handoff block and the deviation warnings carry
+        their own first-column vocabulary -- ``RALPH NEEDS OPERATOR``, ``reason:``,
+        ``manual resume:``, ``continue Ralph:``, ``WARNING:`` -- that operators and
+        tooling anchor on, so the prefix that marks Ralph's header voice would break
+        those anchors. Redacted at the choke point and painted whole in *role*; a long
+        line wraps rather than clipping, exactly like a warning or a failure (register
+        G17/G19)."""
+        self._paint("", role, redact(text), role)
 
     def _paint(self, prefix: str, prefix_role: str, value: str, value_role: str) -> None:
         # The last stop before the stream. Everything above has already passed

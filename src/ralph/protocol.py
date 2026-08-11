@@ -33,8 +33,9 @@ Depends on / must not know: nothing but the standard library. It parses backend
 text and must not know how any Backend produced it.
 
 See also: ``backends.opencode`` / ``backends.claude`` (feed final text to
-has_completion_marker plus explicit_needs_input / inferred_needs_input, and tool
-payloads to extract_question).
+has_completion_marker plus explicit_needs_input / inferred_needs_input, tool
+payloads to extract_question, and the withdrawn/unmarked fragments through
+``bounded_quote`` before warning on them).
 """
 
 from __future__ import annotations
@@ -267,6 +268,25 @@ def explicit_needs_input(text: str) -> str | None:
     marker_index = marker_indexes[-1]
     following = [line for index, line in visible if index > marker_index and line]
     return "\n".join(following) or "The assistant requested operator input."
+
+
+# The most of a quoted marker fragment a mid-run warning prints. A withdrawn or
+# unmarked question is surfaced as a bounded interruption, not as an outlet for the
+# backend's whole final message: the operator needs enough to recognise the question,
+# not the narration around it (issue #39).
+MARKER_QUOTE_LIMIT = 200
+
+
+def bounded_quote(text: str) -> str:
+    """Collapse a quoted marker fragment to one line and cap its length, so the
+    withdrawn-marker and unmarked-question warnings stay bounded interruptions rather
+    than printing unbounded backend prose mid-stream (issue #39). Callers redact
+    *before* bounding, so a secret is replaced whole and the placeholder is what gets
+    measured; the retained stream keeps the fragment in full (register G18)."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= MARKER_QUOTE_LIMIT:
+        return collapsed
+    return collapsed[: MARKER_QUOTE_LIMIT - 3] + "..."
 
 
 def inferred_needs_input(text: str) -> str | None:

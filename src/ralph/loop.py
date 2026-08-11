@@ -1,5 +1,5 @@
-"""The budgeted Iteration loop: per-run setup, handoff printing, and outcome
-recording under the loop-wide power assertion.
+"""The budgeted Iteration loop: per-run setup, the operator help a stop hands off,
+and outcome recording under the loop-wide power assertion.
 
 Invariants:
 - The loop-wide ``CaffeinateAssertion`` wraps the whole run and is re-checked with
@@ -7,23 +7,27 @@ Invariants:
   loop with retained evidence rather than continuing unprotected.
 - Every terminal path writes ``outcome.json``, records the final git state, and ends
   with a Run console summary (register G9): a clean finish, a ``HandoffError``
-  (resumable, records the session and prints a resume command), a
-  ``StartedIterationError`` (slot consumed, nothing to resume), and an unexpected
-  ``RalphError`` (recorded as ``backend_failure``, summarised, then re-raised for the
-  top-level one-line handler). ``record_final_git_state`` returns the
-  ``(branch, status)`` the summary is worded from and no longer prints the branch
-  change; the console words the git outcome — branch, dirty state, and whether the
-  branch's commits reached its upstream — from those facts (register G14).
+  (resumable, records the session and the ``RALPH NEEDS OPERATOR`` help block with a
+  resume command), a ``StartedIterationError`` (slot consumed, nothing to resume,
+  same block without one), and a ``RalphError`` (recorded as ``backend_failure``,
+  summarised, then given ``failure_help`` — the reason and a next step, never the
+  handoff banner, because a pre-session failure is not resumable). Once a run
+  directory exists every stop gets the full help block; the loop no longer re-raises
+  the backend failure to a one-line handler (register G10). ``record_final_git_state``
+  returns the ``(branch, status)`` the summary is worded from; the console words the
+  git outcome — branch, dirty state, and whether the branch's commits reached its
+  upstream — from those facts (register G14).
 - The loop spends exactly one backend session per iteration: an iteration that
   starts a session consumes its budget slot whatever the outcome, and the loop
   never restarts a slot itself. Any future retry allowance must reset per
   iteration — iterations are independent by design and must not accumulate state
   across one another.
-- ``print_handoff`` reproduces the exact remaining-budget restart command and, when
-  a session exists, the resume command; every operator-facing string is redacted. It
-  no longer rings the bell — the Run console summary does, once per run, on every
-  terminal outcome (register G12) — and the summary precedes it so the
-  ``RALPH NEEDS OPERATOR`` block stays the last, most visible lines.
+- ``handoff_help`` builds the full help block from the run's facts and the exact
+  recovery commands the Launch chain produces — the remaining-budget restart and,
+  when a session exists, the resume; the console words the block and redacts it. The
+  summary precedes it and rings the bell once per run (register G12), so the
+  ``RALPH NEEDS OPERATOR`` block stays the last, most visible lines. Budget exhaustion
+  gains the continuation command through ``console.budget_continue`` at the clean end.
 - The loop holds a resolved ``Backend`` and drives it only through the Backend
   Protocol (here ``environment``, ``preflight``, and ``execute_iteration``); it never
   names a concrete backend, so it cannot tell the two apart (register E2, user story
@@ -31,9 +35,12 @@ Invariants:
   the shared fail-closed gate that generates the profile and proves it bites via
   the self-test before the first iteration (register D8) — or, under
   ``--unsafe-no-sandbox``, returns no profile so the backend runs unconfined
-  (register D7). The loop threads ``args.unsafe_no_sandbox`` into that gate and
-  into ``print_handoff`` so recovery reproduces the opt-out, and governs nothing
-  else about host isolation.
+  (register D7). That gate is silent; the loop states the relaxed guarantees loudly
+  through ``console.deviation`` — the sandbox opt-out from the flag it holds, and an
+  admitted agent vector from the ``Deviation`` ``preflight`` hands back (register
+  G7/G14). It threads ``args.unsafe_no_sandbox`` into the gate and the recovery
+  commands so recovery reproduces the opt-out, and governs nothing else about host
+  isolation.
 - The concrete interactive-only children are resolved once per run, after the first
   iteration's preflight has proven the shared ``gh`` dependency and before that
   session spends budget: the loop asks ``gitcontext.interactive_only_issues`` for
@@ -51,9 +58,10 @@ Invariants:
   budget is spent or any failure reported. Each Iteration opens with a console rule
   and closes with its outcome block; the Trust boundary and the resolved
   interactive-only children complete the header from where their proof and resolution
-  finish, necessarily after the first Iteration's rule (register G8). The only
-  ``print`` still held here is the ``print_handoff`` banner, which a later ticket in
-  the Run console program migrates; the structural test names it explicitly.
+  finish, necessarily after the first Iteration's rule (register G8). The loop holds
+  no ``print`` of its own: every operator-facing line — header, iteration blocks,
+  summary, deviations, and the full help block — goes through the injected console
+  (register G13), so this module no longer appears in the terminal-write allowlist.
 
 Depends on / must not know: ``console`` (the ``RunConsole`` abstraction and its
 value objects -- never a concrete renderer), ``redaction`` (functions only),
@@ -76,12 +84,19 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
-import sys
 from typing import Any
 import uuid
 
 from .backends import Backend
-from .console import IterationOutcome, RunConsole, RunSettings, RunSummary
+from .console import (
+    NO_SANDBOX_DEVIATION,
+    Deviation,
+    IterationOutcome,
+    OperatorHelp,
+    RunConsole,
+    RunSettings,
+    RunSummary,
+)
 from .errors import (
     HandoffError,
     RalphError,
@@ -96,7 +111,7 @@ from .launch import (
 )
 from .locking import secure_state_directory
 from .protocol import build_protocol, set_active_protocol
-from .redaction import collect_secrets, redact, set_active_redactor
+from .redaction import collect_secrets, set_active_redactor
 
 
 def record_final_git_state(worktree: Path, run_dir: Path) -> tuple[str, str]:
@@ -144,53 +159,56 @@ def build_summary(
     )
 
 
-def print_handoff(
+def handoff_help(
     *,
-    reason: str,
-    session_id: str | None,
-    detail: str | None,
-    backend: str,
-    model: str,
+    error: HandoffError | StartedIterationError,
+    args: argparse.Namespace,
     worktree: Path,
     prompt_path: Path,
     remaining: int,
     run_id: str,
-    timeout: float,
-    allow_agents: bool = False,
-    no_sandbox: bool = False,
-) -> None:
-    terminal = sys.stderr.isatty()
-    if terminal:
-        # The bell now rings once per run in the Run console's summary (register
-        # G12), on every terminal outcome rather than only the handoff, so it is no
-        # longer emitted here; the handoff keeps only its failure-role colour.
-        print("\033[1;31m", end="", file=sys.stderr)
-    print("========== RALPH NEEDS OPERATOR ==========", file=sys.stderr)
-    print(f"reason: {redact(reason)}", file=sys.stderr)
-    print(f"ralph run: {run_id}", file=sys.stderr)
-    if session_id:
-        print(f"{backend} session: {session_id}", file=sys.stderr)
-    if detail:
-        print(f"question/error: {redact(detail)}", file=sys.stderr)
-    if session_id:
-        # Without a session id there is nothing to resume; the operator handoff
-        # still prints the remaining-budget command so the loop can continue.
-        print(
-            "manual resume: "
-            f"{resume_command(backend, model, worktree, session_id, allow_agents, no_sandbox)}",
-            file=sys.stderr,
-        )
-    print(f"iterations remaining: {remaining}", file=sys.stderr)
-    if remaining:
-        print(
-            "continue Ralph: "
-            f"{restart_command(backend, model, worktree, prompt_path, remaining, timeout, allow_agents, no_sandbox)}",
-            file=sys.stderr,
-        )
-    else:
-        print("No iterations remain to continue Ralph.", file=sys.stderr)
-    print("==========================================", end="", file=sys.stderr)
-    print("\033[0m" if terminal else "", file=sys.stderr)
+) -> OperatorHelp:
+    """Build the full help block for a consuming stop from the run's facts and the
+    recovery commands the Launch chain produces (register G14). A ``HandoffError``
+    carries a session to resume and an operator-facing detail; a ``StartedIterationError``
+    consumed its slot with nothing to resume, so it omits both. The console words the
+    ``RALPH NEEDS OPERATOR`` block; this function never formats operator text."""
+    session_id = getattr(error, "session_id", None)
+    detail = getattr(error, "detail", None)
+    return OperatorHelp(
+        reason=error.reason,
+        run_id=run_id,
+        remaining=remaining,
+        backend=args.backend,
+        session_id=session_id,
+        detail=detail,
+        resume_command=(
+            resume_command(
+                args.backend,
+                args.model,
+                worktree,
+                session_id,
+                args.unsafe_allow_agents,
+                args.unsafe_no_sandbox,
+            )
+            if session_id
+            else None
+        ),
+        continue_command=(
+            restart_command(
+                args.backend,
+                args.model,
+                worktree,
+                prompt_path,
+                remaining,
+                args.timeout,
+                args.unsafe_allow_agents,
+                args.unsafe_no_sandbox,
+            )
+            if remaining
+            else None
+        ),
+    )
 
 
 def run_locked(
@@ -285,21 +303,6 @@ def run_protected(
             ),
         )
     )
-    # Establish host isolation once per run (the profile is stable across
-    # iterations): generate the per-run profile and prove it actually bites via
-    # the one-shot self-test before any budget is spent, or stop fail-closed here
-    # (register D2/D6/D8) — exactly as the caffeinate startup assertion gates the
-    # whole loop. Both backends are wrapped uniformly (#20 OpenCode, #22 Claude);
-    # `--unsafe-no-sandbox` relaxes only this, returning no profile so the shared
-    # Launch chain runs the backend unconfined (register D7).
-    sandbox_profile = establish_sandbox(
-        args.backend,
-        run_dir,
-        worktree,
-        git_dir / "ralph",
-        env,
-        no_sandbox=args.unsafe_no_sandbox,
-    )
     started = datetime.now(timezone.utc).isoformat()
     iterations: list[dict[str, Any]] = []
     session_id: str | None = None
@@ -307,7 +310,32 @@ def run_protected(
     # The slot in flight, kept current for the handoff handlers so a started
     # iteration is charged against its own number.
     number = 0
+    # A default the handoff handlers read for the started_at of an iteration that
+    # stopped; only the branches reachable after a session started ever consult it.
+    iteration_started = started
     try:
+        # Establish host isolation once per run (the profile is stable across
+        # iterations): generate the per-run profile and prove it actually bites via
+        # the one-shot self-test before any budget is spent, or stop fail-closed here
+        # (register D2/D6/D8) — exactly as the caffeinate startup assertion gates the
+        # whole loop. Both backends are wrapped uniformly (#20 OpenCode, #22 Claude);
+        # `--unsafe-no-sandbox` relaxes only this, returning no profile so the shared
+        # Launch chain runs the backend unconfined (register D7). Inside the try so a
+        # self-test failure — a failure once the run directory exists — gets the same
+        # summary and full help block as any other (register G10).
+        sandbox_profile = establish_sandbox(
+            args.backend,
+            run_dir,
+            worktree,
+            git_dir / "ralph",
+            env,
+            no_sandbox=args.unsafe_no_sandbox,
+        )
+        if args.unsafe_no_sandbox:
+            # The gate is silent now; the run states the relaxed host-isolation
+            # guarantee loudly here, beside the other deviation warnings (register
+            # G7/G13), and the console owns its wording (register G14).
+            console.deviation(Deviation(NO_SANDBOX_DEVIATION))
         for number in range(1, args.iterations + 1):
             # The loop-wide sleep assertion must still be held before each fresh
             # session; a lost assertion stops the loop with retained evidence.
@@ -321,7 +349,14 @@ def run_protected(
             # Run console words it, so multi-iteration output stays attributable to a
             # specific fresh session (register G2/G9).
             console.iteration_started(number, args.iterations)
-            backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
+            agent_deviation = backend.preflight(
+                worktree, slug, args.model, env, args.unsafe_allow_agents
+            )
+            if agent_deviation is not None:
+                # Preflight admitted an agent vector under --unsafe-allow-agents and
+                # handed the fact back; the run states the relaxed subagent-isolation
+                # guarantee loudly through the console (register G7/G14).
+                console.deviation(agent_deviation)
             if number == 1:
                 # The full Trust boundary is proven once this first preflight has
                 # cleared: subscription-only authentication and customization
@@ -393,14 +428,22 @@ def run_protected(
             )
             if outcome == "complete":
                 break
-    except HandoffError as error:
+    except (HandoffError, StartedIterationError) as error:
+        # A consuming stop: a ``HandoffError`` carries a session to resume; a
+        # ``StartedIterationError`` consumed its slot before any session metadata
+        # arrived and has none. Both close the same way — record the slot, write the
+        # outcome, then summary-before-block so the ``RALPH NEEDS OPERATOR`` banner and
+        # its recovery commands stay the last, most visible lines and the summary rings
+        # the bell once (register G9/G12). ``handoff_help`` reads the session (absent on
+        # the started-iteration error) from the error, so the two need no separate arms.
+        session_id = getattr(error, "session_id", None)
         iterations.append(
             {
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "number": number,
                 "outcome": error.outcome,
                 "reason": error.reason,
-                "session_id": error.session_id,
+                "session_id": session_id,
                 "started_at": iteration_started,
             }
         )
@@ -413,73 +456,23 @@ def run_protected(
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "iterations": iterations,
                 "outcome": outcome,
-                "session_id": error.session_id,
-                "started_at": started,
-            },
-        )
-        # The summary precedes the handoff banner so the RALPH NEEDS OPERATOR block
-        # and its resume command stay the last, most visible lines; the summary rings
-        # the bell for this terminal outcome (register G9/G12).
-        console.run_finished(build_summary(outcome, run_dir, branch, final_branch, status))
-        print_handoff(
-            reason=error.reason,
-            session_id=error.session_id,
-            detail=error.detail,
-            backend=args.backend,
-            model=args.model,
-            worktree=worktree,
-            prompt_path=prompt_path,
-            remaining=args.iterations - number,
-            run_id=run_dir.name,
-            timeout=args.timeout,
-            allow_agents=args.unsafe_allow_agents,
-            no_sandbox=args.unsafe_no_sandbox,
-        )
-        return 2
-    except StartedIterationError as error:
-        # A started iteration that stopped before any session metadata still
-        # consumes its slot. There is no session to resume, but the operator
-        # handoff must appear with the exact remaining-budget command.
-        iterations.append(
-            {
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "number": number,
-                "outcome": error.outcome,
-                "reason": error.reason,
-                "session_id": None,
-                "started_at": iteration_started,
-            }
-        )
-        outcome = error.outcome
-        final_branch, status = record_final_git_state(worktree, run_dir)
-        write_json(
-            run_dir / "outcome.json",
-            {
-                "final_branch": final_branch,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "iterations": iterations,
-                "outcome": outcome,
-                "session_id": None,
+                "session_id": session_id,
                 "started_at": started,
             },
         )
         console.run_finished(build_summary(outcome, run_dir, branch, final_branch, status))
-        print_handoff(
-            reason=error.reason,
-            session_id=None,
-            detail=None,
-            backend=args.backend,
-            model=args.model,
-            worktree=worktree,
-            prompt_path=prompt_path,
-            remaining=args.iterations - number,
-            run_id=run_dir.name,
-            timeout=args.timeout,
-            allow_agents=args.unsafe_allow_agents,
-            no_sandbox=args.unsafe_no_sandbox,
+        console.operator_help(
+            handoff_help(
+                error=error,
+                args=args,
+                worktree=worktree,
+                prompt_path=prompt_path,
+                remaining=args.iterations - number,
+                run_id=run_dir.name,
+            )
         )
         return 2
-    except RalphError:
+    except RalphError as error:
         final_branch, status = record_final_git_state(worktree, run_dir)
         write_json(
             run_dir / "outcome.json",
@@ -491,12 +484,17 @@ def run_protected(
                 "started_at": started,
             },
         )
-        # The summary states the git outcome and evidence path on the error path too;
-        # the one-line ``ralph: <message>`` still follows from the top-level handler.
+        # A backend failure that left a run directory behind gets the full help block
+        # once evidence exists (register G10): the summary names the git outcome and
+        # the evidence path, then failure_help states what failed and points at the
+        # run directory. It is not a resumable handoff — a pre-session failure has no
+        # session and never shows the RALPH NEEDS OPERATOR banner — so the loop words
+        # and returns it here rather than re-raising to the one-line handler.
         console.run_finished(
             build_summary("backend_failure", run_dir, branch, final_branch, status)
         )
-        raise
+        console.failure_help(str(error), run_dir)
+        return 2
     final_branch, status = record_final_git_state(worktree, run_dir)
     write_json(
         run_dir / "outcome.json",
@@ -514,4 +512,21 @@ def run_protected(
     # The budget-exhausted headline keeps the byte-identical "iteration budget
     # exhausted" phrase an operator greps for (register G19).
     console.run_finished(build_summary(outcome, run_dir, branch, final_branch, status))
+    if outcome == "budget_exhausted":
+        # The operator has just spent the whole budget without completion; the next
+        # thing they do is run it again, so state the exact continuation command
+        # (register G10). The Launch chain builds it from the run's own facts with the
+        # full budget restored, so it is a fresh run rather than a zero-iteration one.
+        console.budget_continue(
+            restart_command(
+                args.backend,
+                args.model,
+                worktree,
+                prompt_path,
+                args.iterations,
+                args.timeout,
+                args.unsafe_allow_agents,
+                args.unsafe_no_sandbox,
+            )
+        )
     return 0 if outcome == "complete" else 1

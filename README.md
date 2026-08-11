@@ -106,6 +106,17 @@ upstream, and the run directory where the evidence lives. A terminal bell rings
 on every terminal outcome — completion, budget exhaustion, handoff, or error — so
 an unattended run calls you back; a piped log carries no bell.
 
+Once a run directory exists, every way a run can stop gets the full help block, not
+one sentence. A question or a consuming stop prints the `RALPH NEEDS OPERATOR`
+banner with the reason, the run id, the session to resume, the remaining budget, and
+the exact recovery commands. Budget exhaustion adds the command that continues the
+work — the same invocation with the budget restored — so you do not reconstruct it.
+A backend failure that leaves evidence behind names what failed and points you at the
+run directory to inspect, rather than dropping a bare line. Only argument and
+precondition failures, which happen before anything is on disk, stay one-liners. A
+relaxed guarantee — `--unsafe-no-sandbox` or admitted backend agents — is stated
+loudly as a deviation warning, distinct from the standing settings above it.
+
 Use `--model` for another
 model in the selected subscription-backed provider and `--worktree PATH` to
 target another GitHub worktree. Each iteration defaults to 3,600 seconds (60 minutes). A positive

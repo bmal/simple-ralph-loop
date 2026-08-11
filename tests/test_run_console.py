@@ -17,7 +17,17 @@ import unittest
 from unittest import mock
 
 from harness import ROOT, PtyCapture, RalphCliTestCase
-from ralph.console import IterationOutcome, RunSettings, RunSummary, StreamRunConsole
+from ralph.console import (
+    CLAUDE_AGENTS_DEVIATION,
+    NO_SANDBOX_DEVIATION,
+    OPENCODE_AGENTS_DEVIATION,
+    Deviation,
+    IterationOutcome,
+    OperatorHelp,
+    RunSettings,
+    RunSummary,
+    StreamRunConsole,
+)
 
 
 def without_ansi(text: str) -> str:
@@ -349,6 +359,133 @@ class PipedConsoleTest(unittest.TestCase):
         self.assertNotIn("\033", "\n".join(lines))
 
 
+class HelpAndDeviationConsoleTest(unittest.TestCase):
+    """Drives the full help block, the deviation warnings, and the continuation line
+    onto a plain (non-terminal) stream, where their exact wording, first-column
+    anchors, and redaction are what an operator and any tooling depend on. Colour and
+    the bell are terminal concerns proven on a real pty above; here the facts stand
+    alone."""
+
+    def _lines(self, say: object) -> list[str]:
+        stream = io.StringIO()
+        say(StreamRunConsole(stream))
+        return stream.getvalue().rstrip("\n").split("\n")
+
+    def _handoff(self, **overrides: object) -> OperatorHelp:
+        defaults: dict[str, object] = {
+            "reason": "OpenCode requested operator input",
+            "run_id": "20260810T101112.131415Z-0a1b2c3d",
+            "remaining": 2,
+            "backend": "opencode",
+            "session_id": "ses_1",
+            "detail": "Should I preserve the legacy file?",
+            "resume_command": "cd /w && ralph resume --backend opencode --session ses_1",
+            "continue_command": "cd /w && ralph run prompt.md --backend opencode --iterations 2",
+        }
+        defaults.update(overrides)
+        return OperatorHelp(**defaults)  # type: ignore[arg-type]
+
+    def test_the_handoff_block_names_the_reason_session_and_recovery_commands(self) -> None:
+        lines = self._lines(lambda console: console.operator_help(self._handoff()))
+        joined = "\n".join(lines)
+        self.assertIn("========== RALPH NEEDS OPERATOR ==========", lines)
+        self.assertIn("reason: OpenCode requested operator input", lines)
+        self.assertIn("ralph run: 20260810T101112.131415Z-0a1b2c3d", lines)
+        self.assertIn("opencode session: ses_1", lines)
+        self.assertIn("question/error: Should I preserve the legacy file?", lines)
+        self.assertIn("iterations remaining: 2", lines)
+        # The recovery lines keep their first-column anchors: tooling and habits match
+        # ``manual resume: `` and ``continue Ralph: `` from the start of the line, so
+        # they must not gain the header's ``ralph: `` prefix.
+        self.assertTrue(any(line.startswith("manual resume: ") for line in lines), joined)
+        self.assertTrue(any(line.startswith("continue Ralph: ") for line in lines), joined)
+
+    def test_the_handoff_block_without_a_session_omits_resume_but_keeps_the_restart(self) -> None:
+        lines = self._lines(
+            lambda console: console.operator_help(
+                self._handoff(session_id=None, detail=None, resume_command=None)
+            )
+        )
+        self.assertIn("RALPH NEEDS OPERATOR", "\n".join(lines))
+        self.assertFalse(any(line.startswith("manual resume: ") for line in lines))
+        self.assertFalse(any("session:" in line for line in lines))
+        self.assertTrue(any(line.startswith("continue Ralph: ") for line in lines))
+        self.assertIn("iterations remaining: 2", lines)
+
+    def test_the_handoff_block_with_no_budget_left_says_so(self) -> None:
+        lines = self._lines(
+            lambda console: console.operator_help(
+                self._handoff(remaining=0, continue_command=None)
+            )
+        )
+        self.assertIn("iterations remaining: 0", lines)
+        self.assertIn("No iterations remain to continue Ralph.", lines)
+        self.assertFalse(any(line.startswith("continue Ralph: ") for line in lines))
+
+    def test_the_handoff_block_is_redacted_at_the_console(self) -> None:
+        from ralph.redaction import set_active_redactor
+
+        secret = "oauth-secret-value-987654321"
+        set_active_redactor([secret])
+        self.addCleanup(set_active_redactor, [])
+        lines = self._lines(
+            lambda console: console.operator_help(
+                self._handoff(reason=f"backend leaked {secret} mid-run")
+            )
+        )
+        joined = "\n".join(lines)
+        self.assertNotIn(secret, joined)
+        self.assertIn("[redacted]", joined)
+
+    def test_the_handoff_block_carries_no_ansi_or_bell_on_a_pipe(self) -> None:
+        stream = io.StringIO()
+        StreamRunConsole(stream).operator_help(self._handoff())
+        self.assertNotIn("\033", stream.getvalue())
+        self.assertNotIn("\a", stream.getvalue())
+
+    def test_a_deviation_states_the_relaxed_guarantee_loudly(self) -> None:
+        sandbox = self._lines(
+            lambda console: console.deviation(Deviation(NO_SANDBOX_DEVIATION))
+        )
+        joined = "\n".join(sandbox)
+        self.assertIn("--unsafe-no-sandbox is set", joined)
+        self.assertIn("NOT proving host isolation", joined)
+        claude = self._lines(
+            lambda console: console.deviation(Deviation(CLAUDE_AGENTS_DEVIATION))
+        )
+        self.assertIn("--unsafe-allow-agents is set", "\n".join(claude))
+        self.assertIn("Ralph is not proving Claude subagent isolation", "\n".join(claude))
+        opencode = self._lines(
+            lambda console: console.deviation(Deviation(OPENCODE_AGENTS_DEVIATION))
+        )
+        self.assertIn("Ralph is not proving OpenCode agent isolation", "\n".join(opencode))
+
+    def test_a_deviation_carries_no_ansi_on_a_pipe(self) -> None:
+        stream = io.StringIO()
+        StreamRunConsole(stream).deviation(Deviation(NO_SANDBOX_DEVIATION))
+        self.assertNotIn("\033", stream.getvalue())
+
+    def test_budget_exhaustion_states_the_command_that_continues_the_work(self) -> None:
+        command = "cd /w && ralph run prompt.md --backend opencode --iterations 4"
+        lines = self._lines(lambda console: console.budget_continue(command))
+        self.assertTrue(any(line.startswith("continue Ralph: ") for line in lines))
+        self.assertIn(command, "\n".join(lines))
+
+    def test_a_backend_failure_names_the_reason_and_a_next_step_not_the_banner(self) -> None:
+        run_dir = Path("/w/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d")
+        lines = self._lines(
+            lambda console: console.failure_help("OpenCode session failed", run_dir)
+        )
+        joined = "\n".join(lines)
+        # The reason keeps the one-line handler's ``ralph: `` voice, so the existing
+        # stderr assertions on it still hold; a next step names the evidence path.
+        self.assertIn("ralph: OpenCode session failed", lines)
+        self.assertTrue(any("next step" in line for line in lines), joined)
+        self.assertIn(str(run_dir), joined)
+        # A pre-session failure is not a resumable handoff, so the banner never shows.
+        self.assertNotIn("RALPH NEEDS OPERATOR", joined)
+
+
 class RunHeaderTest(RalphCliTestCase):
     def test_the_run_header_states_the_settings_and_the_evidence_path(self) -> None:
         result = self.run_ralph("--iterations", "3", "--timeout", "900")
@@ -434,15 +571,12 @@ class TerminalOwnershipTest(unittest.TestCase):
 
     # Modules with an unmigrated operator-facing write, and what still holds them.
     NOT_YET_MIGRATED = {
-        # the handoff banner (the iteration rule, the outcome blocks, the run
-        # summary, the branch change, and the budget-exhausted line migrated to the
-        # Run console in #38)
-        "loop.py",
-        # the resume full-auto warning
+        # the resume full-auto warning (the handoff, budget-exhausted, and backend-
+        # failure help migrated to the Run console in #39; the run header, iteration
+        # blocks, summary, and deviation warnings before it)
         "cli.py",
-        # the --unsafe-no-sandbox warning
-        "launch.py",
-        # the --unsafe-allow-agents warning and the Backend feed
+        # the Backend feed, and the withdrawn/unmarked mid-run marker warnings (the
+        # --unsafe-allow-agents deviation migrated to the Run console in #39)
         "backends/claude.py",
         "backends/opencode.py",
     }

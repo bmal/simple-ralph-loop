@@ -7,7 +7,13 @@ Invariants:
   ``--pure`` still loads project/global agents into the ``agent`` map, so a
   non-empty map fails closed unless ``--unsafe-allow-agents`` admits it; provider
   routing, model availability, and the sanitized ``isolated_config`` are all
-  re-proven from ``debug config`` before budget is spent.
+  re-proven from ``debug config`` before budget is spent. When the flag admits a
+  non-empty map, ``preflight`` returns a ``console.Deviation`` (else ``None``) so the
+  caller states the relaxed agent-isolation guarantee loudly through the Run console;
+  the adapter words no operator-facing warning of its own (register G7/G14).
+- The unmarked-question warning stays a mid-run stderr line, but the fragment it
+  quotes back is redacted and then bounded through ``protocol.bounded_quote`` so a
+  warning is a bounded interruption, never the Backend's whole final message (#39).
 - Live text is diffed redacted-against-redacted: the whole accumulated part is
   redacted, then compared to what was already shown, so a secret that only
   completes across streaming chunk boundaries can never leak to the console even
@@ -33,9 +39,11 @@ Invariants:
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
-``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``, and
-``preflight``. It must not know how the Loop schedules Iterations; the Loop must not
-know these helpers exist beyond the five Backend interface names.
+``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``,
+``preflight``, and ``console`` (only for the ``Deviation`` value type ``preflight``
+returns — never a console instance). It must not know how the Loop schedules
+Iterations; the Loop must not know these helpers exist beyond the five Backend
+interface names.
 
 See also: ``backends`` (registry and the five-name Protocol), ``backends.claude``
 (twin adapter), ``launch`` (``session_argv``, the wrapped argv), ``protocol``
@@ -54,6 +62,7 @@ import threading
 import time
 from typing import Any
 
+from ..console import OPENCODE_AGENTS_DEVIATION, Deviation
 from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import (
     HandoffError,
@@ -67,6 +76,7 @@ from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
     active_protocol,
+    bounded_quote,
     explicit_needs_input,
     extract_question,
     has_completion_marker,
@@ -163,30 +173,28 @@ OPENCODE_AGENT_REFUSAL = (
 )
 
 
-def reject_opencode_agents(config: dict[str, Any], allow_agents: bool) -> None:
+def reject_opencode_agents(config: dict[str, Any], allow_agents: bool) -> Deviation | None:
     # OpenCode loads project (`.opencode/agent`) and global agent definitions
     # even under `--pure`, and they all surface in the effective configuration's
     # `agent` map, so that map is the single authoritative proof of agent
     # isolation. An unfamiliar shape fails closed like every other preflight
     # proof. --unsafe-allow-agents admits a non-empty map with the same trade as
-    # the Claude backend: the operator vouches for the agents for this run.
+    # the Claude backend: the operator vouches for the agents for this run. That
+    # relaxed guarantee is stated loudly by the Run console (register G7/G14), so
+    # this returns the deviation for the caller to word rather than printing it.
     agents = config.get("agent")
     if not isinstance(agents, dict):
         raise RalphError("effective OpenCode configuration omitted the agent map")
     if not agents:
-        return
+        return None
     if not allow_agents:
         raise RalphError(OPENCODE_AGENT_REFUSAL)
-    print(
-        "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
-        "OpenCode agent isolation for this run.",
-        file=sys.stderr,
-    )
+    return Deviation(OPENCODE_AGENTS_DEVIATION)
 
 
 def preflight(
     worktree: Path, slug: str, model: str, env: dict[str, str], allow_agents: bool = False
-) -> None:
+) -> Deviation | None:
     common_preflight(worktree, slug, "opencode", env)
     reject_custom_tools(worktree)
 
@@ -206,8 +214,10 @@ def preflight(
     if model not in {item.strip() for item in models}:
         raise RalphError(f"selected model is unavailable: {model}")
     # Checked after every other proof so the opt-out hint in the refusal is
-    # advertised only when the agent map truly is the sole remaining blocker.
-    reject_opencode_agents(config, allow_agents)
+    # advertised only when the agent map truly is the sole remaining blocker. Its
+    # admitted-agents deviation, if any, rides back for the caller to state loudly
+    # through the Run console (register G7/G14).
+    return reject_opencode_agents(config, allow_agents)
 
 
 class EventResult:
@@ -732,10 +742,12 @@ def _consume_opencode_iteration(
         # An unmarked concluding question is a low-confidence signal; the loop must
         # not take the irreversible operator-halt on a guess. Surface it and let the
         # next iteration re-derive from the tracker.
+        # A bounded interruption, not an outlet for the whole final message: the
+        # fragment is redacted, then collapsed and capped for display (issue #39).
         print(
             "ralph: warning: final message ended on an unmarked operator-directed "
             "question; continuing to the next iteration (no <promise>NEEDS_INPUT</promise> "
-            f"marker and no question tool used):\n{redact(inferred)}",
+            f"marker and no question tool used): {bounded_quote(redact(inferred))}",
             file=sys.stderr,
         )
     complete = has_completion_marker(final_text)

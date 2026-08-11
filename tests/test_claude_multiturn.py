@@ -351,6 +351,26 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertIn("withdrew it", result.stderr)
         self.assertNotIn("earlier turn", result.stderr)
 
+    def test_a_withdrawn_marker_warning_bounds_the_quoted_fragment(self) -> None:
+        # The withdrawn-marker warning is a bounded interruption, not an outlet for
+        # the backend's whole final message (#39): a long quoted question is capped,
+        # so its far tail never reaches the operator's stderr even though the whole
+        # of it stays in the retained stream.
+        tail = "TAIL_SENTINEL_NOT_SHOWN"
+        long_question = "Should I take path A, weighing " + ("considerations " * 40) + tail + "?"
+        withdrawn = self._claude_multiturn_events(
+            [
+                {"text": f"<promise>NEEDS_INPUT</promise>\n{long_question}"},
+                {"text": "Resolved it from the tracker; path A it is."},
+            ]
+        )
+        result = self._run(withdrawn)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("withdrew it", result.stderr)
+        # The head of the question is shown; the far tail past the cap is not.
+        self.assertIn("Should I take path A", result.stderr)
+        self.assertNotIn(tail, result.stderr)
+
     def test_completion_in_a_non_final_message_of_the_final_turn_does_not_complete(self) -> None:
         # The COMPLETE half is untouched by the needs-input generalisation: a
         # completion claim the Backend spoke past inside its final turn is still
