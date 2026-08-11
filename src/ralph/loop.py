@@ -5,17 +5,25 @@ Invariants:
 - The loop-wide ``CaffeinateAssertion`` wraps the whole run and is re-checked with
   ``ensure_alive`` before every fresh session, so a lost power assertion stops the
   loop with retained evidence rather than continuing unprotected.
-- Every terminal path writes ``outcome.json`` and records the final git state: a
-  clean finish, a ``HandoffError`` (resumable, records the session and prints a
-  resume command), a ``StartedIterationError`` (slot consumed, nothing to resume),
-  and an unexpected ``RalphError`` (recorded as ``backend_failure`` then re-raised).
+- Every terminal path writes ``outcome.json``, records the final git state, and ends
+  with a Run console summary (register G9): a clean finish, a ``HandoffError``
+  (resumable, records the session and prints a resume command), a
+  ``StartedIterationError`` (slot consumed, nothing to resume), and an unexpected
+  ``RalphError`` (recorded as ``backend_failure``, summarised, then re-raised for the
+  top-level one-line handler). ``record_final_git_state`` returns the
+  ``(branch, status)`` the summary is worded from and no longer prints the branch
+  change; the console words the git outcome — branch, dirty state, and whether the
+  branch's commits reached its upstream — from those facts (register G14).
 - The loop spends exactly one backend session per iteration: an iteration that
   starts a session consumes its budget slot whatever the outcome, and the loop
   never restarts a slot itself. Any future retry allowance must reset per
   iteration — iterations are independent by design and must not accumulate state
   across one another.
 - ``print_handoff`` reproduces the exact remaining-budget restart command and, when
-  a session exists, the resume command; every operator-facing string is redacted.
+  a session exists, the resume command; every operator-facing string is redacted. It
+  no longer rings the bell — the Run console summary does, once per run, on every
+  terminal outcome (register G12) — and the summary precedes it so the
+  ``RALPH NEEDS OPERATOR`` block stays the last, most visible lines.
 - The loop holds a resolved ``Backend`` and drives it only through the Backend
   Protocol (here ``environment``, ``preflight``, and ``execute_iteration``); it never
   names a concrete backend, so it cannot tell the two apart (register E2, user story
@@ -35,14 +43,17 @@ Invariants:
   the run closed like any other preflight proof. The resolution is advisory --
   Ralph cannot observe which child the Backend selects -- so only the resulting
   needs-input halt is mechanical.
-- The run's opening facts go to the injected ``RunConsole`` as a ``RunSettings``
-  value object, never as text the loop worded itself (register G14). The header is
-  emitted once the run directory exists and before host isolation is established,
-  so the evidence path is on screen before any budget is spent or any failure
-  reported. The resolved interactive-only children complete that header from where
-  their resolution finishes, which is necessarily after the first iteration's
-  banner. Every emit site still holding a ``print`` here is one a later ticket in
-  the Run console program migrates; the structural test names them explicitly.
+- The run's facts go to the injected ``RunConsole`` as value objects, never as text
+  the loop worded itself (register G14): ``RunSettings`` for the header, an
+  ``IterationOutcome`` for each Iteration's outcome block, and a ``RunSummary`` for
+  the terminal summary. The header is emitted once the run directory exists and
+  before host isolation is established, so the evidence path is on screen before any
+  budget is spent or any failure reported. Each Iteration opens with a console rule
+  and closes with its outcome block; the Trust boundary and the resolved
+  interactive-only children complete the header from where their proof and resolution
+  finish, necessarily after the first Iteration's rule (register G8). The only
+  ``print`` still held here is the ``print_handoff`` banner, which a later ticket in
+  the Run console program migrates; the structural test names it explicitly.
 
 Depends on / must not know: ``console`` (the ``RunConsole`` abstraction and its
 value objects -- never a concrete renderer), ``redaction`` (functions only),
@@ -64,12 +75,13 @@ import argparse
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 import uuid
 
 from .backends import Backend
-from .console import RunConsole, RunSettings
+from .console import IterationOutcome, RunConsole, RunSettings, RunSummary
 from .errors import (
     HandoffError,
     RalphError,
@@ -87,7 +99,10 @@ from .protocol import build_protocol, set_active_protocol
 from .redaction import collect_secrets, redact, set_active_redactor
 
 
-def record_final_git_state(worktree: Path, run_dir: Path, initial_branch: str) -> str:
+def record_final_git_state(worktree: Path, run_dir: Path) -> tuple[str, str]:
+    """Record the final git state as evidence and return the ``(branch, status)`` the
+    run summary is worded from. The branch change, dirty state, and push state are
+    facts the Run console words (register G14); this function no longer prints them."""
     branch_result = command(
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=worktree, allow_failure=True
     )
@@ -97,12 +112,36 @@ def record_final_git_state(worktree: Path, run_dir: Path, initial_branch: str) -
     )
     status = status_result.stdout or status_result.stderr
     (run_dir / "git-status-final.txt").write_text(status, encoding="utf-8")
-    if final_branch != initial_branch:
-        print(
-            f"ralph: warning: branch changed from {initial_branch} to {final_branch}",
-            file=sys.stderr,
-        )
-    return final_branch
+    return final_branch, status
+
+
+def build_summary(
+    outcome: str, run_dir: Path, initial_branch: str, final_branch: str, status: str
+) -> RunSummary:
+    """Turn the recorded git state into the summary value object the Run console
+    renders on a terminal outcome. The porcelain branch header carries the tracking
+    upstream and how many commits are ahead of it, which is how the summary states
+    whether the run's work was pushed."""
+    dirty = any(line and not line.startswith("##") for line in status.splitlines())
+    upstream: str | None = None
+    ahead = 0
+    for line in status.splitlines():
+        if line.startswith("## "):
+            header = line[3:]
+            matched = re.search(r"\.\.\.(\S+)", header)
+            upstream = matched.group(1) if matched else None
+            ahead_match = re.search(r"\[ahead (\d+)", header)
+            ahead = int(ahead_match.group(1)) if ahead_match else 0
+            break
+    return RunSummary(
+        outcome=outcome,
+        run_dir=run_dir,
+        initial_branch=initial_branch,
+        final_branch=final_branch,
+        dirty=dirty,
+        upstream=upstream,
+        ahead=ahead,
+    )
 
 
 def print_handoff(
@@ -122,7 +161,10 @@ def print_handoff(
 ) -> None:
     terminal = sys.stderr.isatty()
     if terminal:
-        print("\a\033[1;31m", end="", file=sys.stderr)
+        # The bell now rings once per run in the Run console's summary (register
+        # G12), on every terminal outcome rather than only the handoff, so it is no
+        # longer emitted here; the handoff keeps only its failure-role colour.
+        print("\033[1;31m", end="", file=sys.stderr)
     print("========== RALPH NEEDS OPERATOR ==========", file=sys.stderr)
     print(f"reason: {redact(reason)}", file=sys.stderr)
     print(f"ralph run: {run_id}", file=sys.stderr)
@@ -275,11 +317,22 @@ def run_protected(
                 if number == 1
                 else secure_state_directory(run_dir, f"iteration-{number:03d}")
             )
-            # Mark the boundary between fresh sessions so multi-iteration
-            # console output is attributable to a specific iteration.
-            print(f"ralph: iteration {number} of {args.iterations}", file=sys.stderr)
+            # Open the Iteration with a rule naming its number and the budget; the
+            # Run console words it, so multi-iteration output stays attributable to a
+            # specific fresh session (register G2/G9).
+            console.iteration_started(number, args.iterations)
             backend.preflight(worktree, slug, args.model, env, args.unsafe_allow_agents)
             if number == 1:
+                # The full Trust boundary is proven once this first preflight has
+                # cleared: subscription-only authentication and customization
+                # isolation here, host isolation already proven by the sandbox
+                # self-test before the loop (omitted, and so not claimed, under
+                # --unsafe-no-sandbox). It prints where its proof completes, after the
+                # first Iteration's banner, rather than in the header (register G8).
+                properties = ["subscription-only authentication", "customization isolation"]
+                if not args.unsafe_no_sandbox:
+                    properties.append("host isolation")
+                console.trust_boundary_established(properties)
                 # Resolve the concrete interactive-only children once per run, now
                 # that preflight has proven the shared gh dependency, and publish
                 # the enriched protocol before this first session spends budget; a
@@ -297,13 +350,14 @@ def run_protected(
                 )
                 # Completes the header where its resolution finishes: the concrete
                 # children cannot be known until preflight has proven gh, so this
-                # line lands after the first iteration's banner for the same reason
+                # line lands after the first iteration's rule for the same reason
                 # register G8 lands the Trust boundary line there.
                 console.interactive_only_resolved(args.interactive_label, interactive_only)
-            iteration_started = datetime.now(timezone.utc).isoformat()
+            iteration_started_at = datetime.now(timezone.utc)
+            iteration_started = iteration_started_at.isoformat()
             # A started session consumes its slot whatever the outcome; the loop
             # never restarts a slot itself.
-            outcome, session_id = backend.execute_iteration(
+            outcome, session_id, concluding_message = backend.execute_iteration(
                 worktree,
                 iteration_dir,
                 prompt,
@@ -321,6 +375,22 @@ def run_protected(
                     "started_at": iteration_started,
                 }
             )
+            # Close the Iteration with its outcome block: duration, outcome, session
+            # id, and the Backend's concluding message truncated for display. The raw
+            # message is a fact the console words; nothing is written to disk from the
+            # truncation, so the retained artifacts stay byte-identical (register G18).
+            console.iteration_finished(
+                IterationOutcome(
+                    number=number,
+                    iterations=args.iterations,
+                    duration_seconds=(
+                        datetime.now(timezone.utc) - iteration_started_at
+                    ).total_seconds(),
+                    outcome=outcome,
+                    session_id=session_id,
+                    concluding_message=concluding_message,
+                )
+            )
             if outcome == "complete":
                 break
     except HandoffError as error:
@@ -335,7 +405,7 @@ def run_protected(
             }
         )
         outcome = error.outcome
-        final_branch = record_final_git_state(worktree, run_dir, branch)
+        final_branch, status = record_final_git_state(worktree, run_dir)
         write_json(
             run_dir / "outcome.json",
             {
@@ -347,6 +417,10 @@ def run_protected(
                 "started_at": started,
             },
         )
+        # The summary precedes the handoff banner so the RALPH NEEDS OPERATOR block
+        # and its resume command stay the last, most visible lines; the summary rings
+        # the bell for this terminal outcome (register G9/G12).
+        console.run_finished(build_summary(outcome, run_dir, branch, final_branch, status))
         print_handoff(
             reason=error.reason,
             session_id=error.session_id,
@@ -377,7 +451,7 @@ def run_protected(
             }
         )
         outcome = error.outcome
-        final_branch = record_final_git_state(worktree, run_dir, branch)
+        final_branch, status = record_final_git_state(worktree, run_dir)
         write_json(
             run_dir / "outcome.json",
             {
@@ -389,6 +463,7 @@ def run_protected(
                 "started_at": started,
             },
         )
+        console.run_finished(build_summary(outcome, run_dir, branch, final_branch, status))
         print_handoff(
             reason=error.reason,
             session_id=None,
@@ -405,7 +480,7 @@ def run_protected(
         )
         return 2
     except RalphError:
-        final_branch = record_final_git_state(worktree, run_dir, branch)
+        final_branch, status = record_final_git_state(worktree, run_dir)
         write_json(
             run_dir / "outcome.json",
             {
@@ -416,8 +491,13 @@ def run_protected(
                 "started_at": started,
             },
         )
+        # The summary states the git outcome and evidence path on the error path too;
+        # the one-line ``ralph: <message>`` still follows from the top-level handler.
+        console.run_finished(
+            build_summary("backend_failure", run_dir, branch, final_branch, status)
+        )
         raise
-    final_branch = record_final_git_state(worktree, run_dir, branch)
+    final_branch, status = record_final_git_state(worktree, run_dir)
     write_json(
         run_dir / "outcome.json",
         {
@@ -429,7 +509,9 @@ def run_protected(
             "started_at": started,
         },
     )
-    if outcome == "complete":
-        return 0
-    print("RALPH INCOMPLETE: iteration budget exhausted without completion", file=sys.stderr)
-    return 1
+    # Every run ends with a summary, including a successful one that used to exit
+    # silently: the git outcome and the evidence path, and the bell (register G9).
+    # The budget-exhausted headline keeps the byte-identical "iteration budget
+    # exhausted" phrase an operator greps for (register G19).
+    console.run_finished(build_summary(outcome, run_dir, branch, final_branch, status))
+    return 0 if outcome == "complete" else 1

@@ -10,23 +10,25 @@ truncation and colour suppression are miserable to prove through a subprocess.""
 from __future__ import annotations
 
 import ast
+import io
 import os
 from pathlib import Path
 import unittest
 from unittest import mock
 
 from harness import ROOT, PtyCapture, RalphCliTestCase
-from ralph.console import RunSettings, StreamRunConsole
+from ralph.console import IterationOutcome, RunSettings, RunSummary, StreamRunConsole
 
 
 def without_ansi(text: str) -> str:
     """What the same output would have been on a stream that is not a terminal --
     the only form worth asserting on, since colour is a rendering detail and the
-    facts are not."""
+    facts are not. The bell is dropped too: it is a terminal signal that occupies no
+    column, so a width measurement must not count it."""
     while "\033[" in text:
         start = text.index("\033[")
         text = text[:start] + text[text.index("m", start) + 1 :]
-    return text
+    return text.replace("\a", "")
 
 
 def _settings(**overrides: object) -> RunSettings:
@@ -140,6 +142,212 @@ class TerminalConsoleTest(unittest.TestCase):
         self.assertNotIn(secret, "\n".join(lines))
         self.assertIn("[redacted]", "\n".join(lines))
 
+    def test_a_terminal_outcome_rings_the_bell(self) -> None:
+        summary = RunSummary(
+            outcome="complete",
+            run_dir=Path("/w/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d"),
+            initial_branch="main",
+            final_branch="main",
+            dirty=False,
+            upstream=None,
+            ahead=0,
+        )
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            shown = self._shown(80, lambda console: console.run_finished(summary))
+        self.assertIn("\a", "".join(shown))
+
+    def test_the_iteration_and_summary_lines_never_wrap_a_narrow_terminal(self) -> None:
+        columns = 44
+        outcome = IterationOutcome(
+            number=1,
+            iterations=4,
+            duration_seconds=63.0,
+            outcome="budget_exhausted",
+            session_id="ses_1",
+            concluding_message="Implemented and verified the change across every module.",
+        )
+        summary = RunSummary(
+            outcome="budget_exhausted",
+            run_dir=Path("/Users/operator/code/project/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d"),
+            initial_branch="main",
+            final_branch="agent-branch",
+            dirty=True,
+            upstream="origin/main",
+            ahead=3,
+        )
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            shown = self._shown(
+                columns,
+                lambda console: (
+                    console.iteration_started(1, 4),
+                    console.trust_boundary_established(
+                        ["subscription-only authentication", "customization isolation", "host isolation"]
+                    ),
+                    console.iteration_finished(outcome),
+                    console.run_finished(summary),
+                ),
+            )
+        for line in shown:
+            self.assertLessEqual(
+                len(without_ansi(line)), columns, f"{line!r} would wrap at {columns} columns"
+            )
+
+
+class PipedConsoleTest(unittest.TestCase):
+    """Drives the console onto a plain stream that is not a terminal -- the piped
+    path an operator captures to a file. It exercises the Iteration outcome blocks
+    and the terminal summary directly, where proving the exact wording, the
+    bell-versus-no-bell distinction, and display-only truncation through a subprocess
+    would be miserable."""
+
+    def _lines(self, say: object) -> list[str]:
+        stream = io.StringIO()
+        say(StreamRunConsole(stream))
+        return stream.getvalue().rstrip("\n").split("\n")
+
+    def _summary(self, **overrides: object) -> RunSummary:
+        defaults: dict[str, object] = {
+            "outcome": "complete",
+            "run_dir": Path(
+                "/w/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d"
+            ),
+            "initial_branch": "main",
+            "final_branch": "main",
+            "dirty": False,
+            "upstream": None,
+            "ahead": 0,
+        }
+        defaults.update(overrides)
+        return RunSummary(**defaults)  # type: ignore[arg-type]
+
+    def test_each_iteration_closes_with_its_outcome_and_concluding_message(self) -> None:
+        lines = self._lines(
+            lambda console: console.iteration_finished(
+                IterationOutcome(
+                    number=2,
+                    iterations=4,
+                    duration_seconds=63.0,
+                    outcome="budget_exhausted",
+                    session_id="ses_7",
+                    concluding_message="Implemented and verified.",
+                )
+            )
+        )
+        joined = "\n".join(lines)
+        # The block names the Iteration, its outcome, its duration, and the session
+        # to resume, then quotes the Backend's concluding message.
+        self.assertIn("iteration 2 of 4", joined)
+        self.assertIn("budget_exhausted", joined)
+        self.assertIn("1m03s", joined)
+        self.assertIn("session ses_7", joined)
+        self.assertIn("Implemented and verified.", joined)
+
+    def test_an_iteration_without_a_session_id_says_so(self) -> None:
+        lines = self._lines(
+            lambda console: console.iteration_finished(
+                IterationOutcome(1, 1, 4.0, "complete", None, "Done.")
+            )
+        )
+        self.assertIn("session no session id", "\n".join(lines))
+
+    def test_a_run_ends_with_a_summary_naming_the_git_outcome_and_evidence(self) -> None:
+        lines = self._lines(lambda console: console.run_finished(self._summary()))
+        self.assertIn("ralph: outcome run complete", lines)
+        self.assertIn("ralph: branch main", lines)
+        self.assertIn("ralph: worktree clean", lines)
+        self.assertIn(
+            "ralph: evidence /w/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d",
+            lines,
+        )
+
+    def test_budget_exhaustion_keeps_the_greppable_phrase(self) -> None:
+        lines = self._lines(
+            lambda console: console.run_finished(self._summary(outcome="budget_exhausted"))
+        )
+        self.assertIn("iteration budget exhausted", "\n".join(lines))
+
+    def test_a_piped_terminal_outcome_emits_no_bell(self) -> None:
+        stream = io.StringIO()
+        StreamRunConsole(stream).run_finished(self._summary())
+        self.assertNotIn("\a", stream.getvalue())
+        self.assertNotIn("\033", stream.getvalue())
+
+    def test_a_branch_change_is_reported_in_the_summary(self) -> None:
+        unchanged = self._lines(lambda console: console.run_finished(self._summary()))
+        changed = self._lines(
+            lambda console: console.run_finished(
+                self._summary(final_branch="agent-branch")
+            )
+        )
+        self.assertFalse(any("changed from" in line for line in unchanged))
+        self.assertIn("ralph: branch changed from main to agent-branch", changed)
+
+    def test_the_summary_states_whether_work_was_pushed(self) -> None:
+        no_upstream = self._lines(lambda console: console.run_finished(self._summary()))
+        self.assertTrue(any("nothing pushed" in line for line in no_upstream))
+
+        ahead = self._lines(
+            lambda console: console.run_finished(
+                self._summary(upstream="origin/main", ahead=2)
+            )
+        )
+        self.assertTrue(any("2 commit(s) not pushed to origin/main" in line for line in ahead))
+
+        pushed = self._lines(
+            lambda console: console.run_finished(
+                self._summary(upstream="origin/main", ahead=0)
+            )
+        )
+        self.assertTrue(any("pushed to origin/main" in line for line in pushed))
+
+    def test_a_dirty_worktree_is_reported_in_the_summary(self) -> None:
+        clean = self._lines(lambda console: console.run_finished(self._summary()))
+        dirty = self._lines(
+            lambda console: console.run_finished(self._summary(dirty=True))
+        )
+        self.assertIn("ralph: worktree clean", clean)
+        self.assertTrue(any("dirty" in line for line in dirty))
+
+    def test_the_concluding_message_is_truncated_for_display(self) -> None:
+        message = "verified. " * 100  # far past the display limit
+        lines = self._lines(
+            lambda console: console.iteration_finished(
+                IterationOutcome(1, 1, 1.0, "complete", "ses_1", message)
+            )
+        )
+        content = next(line for line in lines if "verified." in line)
+        self.assertTrue(content.endswith("..."))
+        self.assertLess(len(content), len(message))
+
+    def test_the_trust_boundary_names_only_the_proven_properties(self) -> None:
+        full = self._lines(
+            lambda console: console.trust_boundary_established(
+                ["subscription-only authentication", "customization isolation", "host isolation"]
+            )
+        )
+        self.assertIn(
+            "ralph: trust boundary proven: subscription-only authentication, "
+            "customization isolation, host isolation",
+            full,
+        )
+        relaxed = self._lines(
+            lambda console: console.trust_boundary_established(
+                ["subscription-only authentication", "customization isolation"]
+            )
+        )
+        self.assertFalse(any("host isolation" in line for line in relaxed))
+
+    def test_the_iteration_events_carry_no_ansi_on_a_pipe(self) -> None:
+        lines = self._lines(
+            lambda console: (
+                console.iteration_started(1, 2),
+                console.iteration_finished(
+                    IterationOutcome(1, 2, 1.0, "complete", "ses_1", "Done.")
+                ),
+            )
+        )
+        self.assertNotIn("\033", "\n".join(lines))
+
 
 class RunHeaderTest(RalphCliTestCase):
     def test_the_run_header_states_the_settings_and_the_evidence_path(self) -> None:
@@ -226,8 +434,9 @@ class TerminalOwnershipTest(unittest.TestCase):
 
     # Modules with an unmigrated operator-facing write, and what still holds them.
     NOT_YET_MIGRATED = {
-        # the iteration banner, the branch-change warning, the handoff banner, and
-        # the budget-exhausted line
+        # the handoff banner (the iteration rule, the outcome blocks, the run
+        # summary, the branch change, and the budget-exhausted line migrated to the
+        # Run console in #38)
         "loop.py",
         # the resume full-auto warning
         "cli.py",

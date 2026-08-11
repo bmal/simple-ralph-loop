@@ -26,6 +26,10 @@ Invariants:
 - A stop Ralph itself caused (timeout/interrupt) is classified *before* any
   contract failure, so a truncated or error-closed stream is never misreported as
   backend misbehavior.
+- ``execute_iteration`` returns the verified final message alongside the outcome and
+  session id, so the Run console can show it in the Iteration's outcome block; it is
+  the same text the completion/needs-input markers were read from, returned raw, and
+  the console truncates it for display only (register G14).
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
@@ -735,7 +739,10 @@ def _consume_opencode_iteration(
             file=sys.stderr,
         )
     complete = has_completion_marker(final_text)
-    return ("complete" if complete else "budget_exhausted"), result.session_id
+    # The concluding message rides back with the outcome so the Run console can show
+    # it in the Iteration's outcome block; it is the same final message the marker was
+    # read from. The Loop truncates it for display only (register G14).
+    return ("complete" if complete else "budget_exhausted"), result.session_id, final_text
 
 
 def write_opencode_session(run_dir: Path, result: EventResult) -> None:

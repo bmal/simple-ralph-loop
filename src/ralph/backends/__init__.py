@@ -15,6 +15,11 @@ Invariants:
   ``execute_iteration``, ``resume_argv``, ``environment`` — for type-checkers only;
   the adapters are plain modules, matched structurally with no runtime class or ABC
   machinery (register E1).
+- ``execute_iteration`` returns ``(outcome, session_id, concluding_message)``: the
+  Iteration's outcome, the session to resume, and the Backend's final message — the
+  same text the completion/needs-input markers were read from — which the Loop hands
+  to the Run console for the Iteration's outcome block. The message is a raw fact, not
+  formatted text; the console truncates it for display only (register G14).
 
 Depends on / must not know: the two adapter modules (imported so the registry can
 name them). It must not grow backend-specific logic — that belongs in the adapters.
@@ -58,7 +63,7 @@ class Backend(Protocol):
         env: dict[str, str],
         timeout: float,
         sandbox_profile: Path | None = ...,
-    ) -> tuple[str, str | None]: ...
+    ) -> tuple[str, str | None, str | None]: ...
 
     def resume_argv(self, worktree: Path, model: str, session: str) -> list[str]: ...
 

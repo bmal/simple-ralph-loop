@@ -94,6 +94,18 @@ escape sequences. On a terminal a header line that does not fit the window is
 shortened — paths keep their informative end — rather than folded onto a second
 row. Truncation is display-only: no retained artifact loses content.
 
+Each iteration opens with a rule naming its number and the budget, and closes
+with an outcome block giving its duration, outcome, session id, and the backend's
+concluding message truncated for display. Once the first iteration's preflight
+has proven authentication and customization isolation — the sandbox self-test
+having already proven host isolation — the trust boundary is stated as proven
+rather than left silent. Every run ends with a summary, on every terminal path
+including a successful one that used to exit in silence: it names the final
+branch, whether the worktree is clean, whether the branch's commits reached their
+upstream, and the run directory where the evidence lives. A terminal bell rings
+on every terminal outcome — completion, budget exhaustion, handoff, or error — so
+an unattended run calls you back; a piped log carries no bell.
+
 Use `--model` for another
 model in the selected subscription-backed provider and `--worktree PATH` to
 target another GitHub worktree. Each iteration defaults to 3,600 seconds (60 minutes). A positive

@@ -34,6 +34,16 @@ Invariants:
   the first Iteration's preflight proves ``gh``, so they complete the header from
   ``interactive_only_resolved`` where their resolution finishes — the same
   treatment register G8 gives the Trust boundary line.
+- Each Iteration opens with a rule (``iteration_started``) and closes with an outcome
+  block (``iteration_finished``) carrying its duration, outcome, session id, and the
+  Backend's concluding message truncated for display; every run ends with a summary
+  (``run_finished``) naming the git outcome and the evidence path, on every terminal
+  path including success (register G9). The bell rings in ``run_finished`` on every
+  terminal outcome but only on a terminal, so a piped log carries no bell character
+  (register G12). The concluding message is truncated for display only — nothing is
+  written to disk from it, so the retained copy stays byte-identical (register G18).
+  The Trust boundary line (``trust_boundary_established``) is emitted where its proof
+  completes, after the first Iteration's preflight, never in the header (register G8).
 
 Depends on / must not know: ``redaction`` (functions only, never the active-redactor
 global). It must not know how a run is driven, which Backend it holds, or what any
@@ -73,6 +83,26 @@ PREFIX = "ralph: "
 FALLBACK_TERMINAL_WIDTH = 80
 ELLIPSIS = "..."
 
+# The terminal bell, rung on every terminal outcome (register G12) — on a terminal
+# only, so a piped or redirected log never carries the control character.
+BELL = "\a"
+
+# The concluding message is truncated for display so a long final narration does not
+# fill the outcome block; the retained artifacts keep the whole of it (register G18).
+CONCLUDING_MESSAGE_LIMIT = 200
+
+# The run summary's headline per terminal outcome. ``budget_exhausted`` keeps the
+# byte-identical ``iteration budget exhausted`` phrase an operator greps for
+# (register G19); an unknown outcome degrades to naming itself rather than vanishing.
+OUTCOME_HEADLINES = {
+    "complete": "run complete",
+    "budget_exhausted": "run incomplete: iteration budget exhausted without completion",
+    "needs_input": "run handed off for operator input",
+    "backend_contract_failure": "run failed: backend contract violation",
+    "backend_failure": "run failed: backend error",
+    "timeout": "run failed: iteration timed out",
+}
+
 
 @dataclass(frozen=True)
 class RunSettings:
@@ -92,6 +122,37 @@ class RunSettings:
     dirty: bool
 
 
+@dataclass(frozen=True)
+class IterationOutcome:
+    """How one Iteration closed: its number and the budget it belongs to, how long
+    the session ran, the outcome the Loop recorded, the session id to resume, and the
+    Backend's concluding message. The Loop fills it with facts; the console truncates
+    the message and words the block (register G14)."""
+
+    number: int
+    iterations: int
+    duration_seconds: float
+    outcome: str
+    session_id: str | None
+    concluding_message: str | None
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """The git outcome and evidence path a run ends on, on every terminal path. The
+    Loop computes the facts — the final branch, whether the worktree is dirty, and
+    whether the branch's commits reached its upstream — and the console words them
+    and rings the bell (register G9, G12, G14)."""
+
+    outcome: str
+    run_dir: Path
+    initial_branch: str
+    final_branch: str
+    dirty: bool
+    upstream: str | None
+    ahead: int
+
+
 class RunConsole(Protocol):
     """The operator-facing seam. It widens as later tickets migrate their emit
     sites; it is structural, matched with no runtime class or ABC machinery, in the
@@ -101,6 +162,14 @@ class RunConsole(Protocol):
 
     def interactive_only_resolved(self, label: str, issues: list[int]) -> None: ...
 
+    def iteration_started(self, number: int, iterations: int) -> None: ...
+
+    def trust_boundary_established(self, properties: list[str]) -> None: ...
+
+    def iteration_finished(self, outcome: IterationOutcome) -> None: ...
+
+    def run_finished(self, summary: RunSummary) -> None: ...
+
     def failed(self, message: str) -> None: ...
 
 
@@ -108,6 +177,30 @@ def format_timeout(timeout: float) -> str:
     # `--timeout 0` deliberately disables the limit, which is a different fact
     # from "zero seconds" and must not be shown as one.
     return "disabled" if timeout <= 0 else f"{timeout:g}s"
+
+
+def format_duration(seconds: float) -> str:
+    """A compact elapsed duration for an outcome block: whole seconds under a minute,
+    then ``m``/``s``, then ``h``/``m``, so a four-hour and a four-second Iteration read
+    the same width."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def summarize_message(text: str) -> str:
+    """Collapse a Backend concluding message to one line and cap its length for the
+    outcome block. Display only: the caller never writes this back to disk, so the
+    retained artifacts keep the whole message byte-identical (register G18)."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= CONCLUDING_MESSAGE_LIMIT:
+        return collapsed
+    return collapsed[: CONCLUDING_MESSAGE_LIMIT - len(ELLIPSIS)] + ELLIPSIS
 
 
 def fit_line(prefix: str, value: str, width: int | None, *, keep_tail: bool) -> tuple[str, str]:
@@ -168,6 +261,71 @@ class StreamRunConsole:
         listed = ", ".join(f"#{issue}" for issue in issues) if issues else "none open"
         self._fact("interactive-only children", f"{listed} (label {label})")
 
+    def iteration_started(self, number: int, iterations: int) -> None:
+        # A rule opening the Iteration (register G2/G9): a full-width divider on a
+        # terminal, embedding the number and the budget; a plain labelled line when
+        # the stream has no width, so a piped log stays readable without the fill.
+        width = self._width()
+        if width is None:
+            self._message("chrome", f"iteration {number} of {iterations}")
+            return
+        opener = f"{PREFIX}── iteration {number} of {iterations} "
+        # Fill to the window on a terminal, but never past it: a rule wider than the
+        # window is clipped rather than folded onto a second row (register G3).
+        line = opener[:width] if width < len(opener) else opener + "─" * (width - len(opener))
+        self._paint("", "chrome", redact(line), "chrome")
+
+    def trust_boundary_established(self, properties: list[str]) -> None:
+        # Printed where its proof completes — after the first Iteration's preflight —
+        # rather than in the header, because the Loop's control flow is deliberately
+        # not reordered for cosmetics (register G8). Only the properties actually
+        # proven are named, so a relaxed guarantee is never reported as proven.
+        self._fact("trust boundary", "proven: " + ", ".join(properties))
+
+    def iteration_finished(self, outcome: IterationOutcome) -> None:
+        session = outcome.session_id or "no session id"
+        self._fact(
+            f"iteration {outcome.number} of {outcome.iterations}",
+            f"{outcome.outcome} in {format_duration(outcome.duration_seconds)}, "
+            f"session {session}",
+        )
+        # The Backend's concluding message: the one utterance worth keeping, shown as
+        # Backend content (uncoloured) and truncated for display only.
+        if outcome.concluding_message and outcome.concluding_message.strip():
+            self._content(summarize_message(outcome.concluding_message))
+
+    def run_finished(self, summary: RunSummary) -> None:
+        # Ring the bell on a terminal only, so an operator who walked away is called
+        # back on every terminal outcome and a piped log carries no control character.
+        if self._is_terminal():
+            self._stream.write(BELL)
+        self._fact(
+            "outcome", OUTCOME_HEADLINES.get(summary.outcome, f"run ended: {summary.outcome}")
+        )
+        self._fact("branch", self._branch_phrase(summary))
+        self._fact(
+            "worktree", "dirty; uncommitted changes remain" if summary.dirty else "clean"
+        )
+        self._fact("push", self._push_phrase(summary))
+        self._fact("evidence", str(summary.run_dir), keep_tail=True)
+
+    @staticmethod
+    def _branch_phrase(summary: RunSummary) -> str:
+        if summary.final_branch != summary.initial_branch:
+            return f"changed from {summary.initial_branch} to {summary.final_branch}"
+        return summary.final_branch
+
+    @staticmethod
+    def _push_phrase(summary: RunSummary) -> str:
+        # Answers "was the run's work pushed?" — keyed on how many commits are ahead
+        # of the upstream, not on how far behind it, so a branch that is merely behind
+        # is still reported as pushed rather than overclaimed as fully in sync.
+        if summary.upstream is None:
+            return "no upstream configured; nothing pushed"
+        if summary.ahead > 0:
+            return f"{summary.ahead} commit(s) not pushed to {summary.upstream}"
+        return f"pushed to {summary.upstream}"
+
     def failed(self, message: str) -> None:
         self._message("failure", message)
 
@@ -180,12 +338,24 @@ class StreamRunConsole:
         )
         self._paint(prefix, "chrome", value, "content")
 
+    def _content(self, text: str) -> None:
+        """A line of Backend content Ralph is quoting — the concluding message. The
+        ``ralph: `` prefix rides in the chrome so the line stays greppable and part of
+        the outcome block, while the value is the uncoloured ``content`` role so
+        Backend text can never be recoloured into Ralph's own voice (register G12).
+        Fitted to the window like a header fact: it is display, not a greppable event
+        name, and the whole of it survives on disk (register G18)."""
+        prefix, value = fit_line(redact(PREFIX), redact(text), self._width(), keep_tail=False)
+        self._paint(prefix, "chrome", value, "content")
+
     def _message(self, role: str, text: str) -> None:
-        """A warning or a failure, never fitted. Their wording is what the operator
-        greps for and what register G19 pins byte-identical, so a narrow window may
-        wrap one; it may not clip words out of it. Only the header trades
-        characters for a window (register G3), and only because every fact it drops
-        is recoverable from the run directory it names."""
+        """A whole line emitted unfitted: a warning, a failure, or the piped
+        Iteration rule that has no window to fit to. A warning's or a failure's
+        wording is what the operator greps for and what register G19 pins
+        byte-identical, so a narrow window may wrap one; it may not clip words out of
+        it. Only the header and outcome facts trade characters for a window (register
+        G3), and only because every fact they drop is recoverable from the run
+        directory they name."""
         self._paint("", role, redact(PREFIX + text), role)
 
     def _paint(self, prefix: str, prefix_role: str, value: str, value_role: str) -> None:

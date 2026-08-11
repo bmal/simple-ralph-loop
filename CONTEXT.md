@@ -42,7 +42,9 @@ _Avoid_: blocked issue (reserved for declared dependencies), operator label
 
 **Run console**:
 The module that owns every operator-facing line of a run — the header stating
-the resolved settings and the evidence path, the warnings, the failures — and
+the resolved settings and the evidence path, the Iteration rules and outcome
+blocks, the terminal summary naming the git outcome on every path including
+success, the Trust boundary line, the warnings, the failures, and the bell — and
 the rendering apparatus behind that small interface: the four-role palette,
 terminal and `NO_COLOR` detection, dynamic width, no-wrap truncation, and the
 single choke point every operator-facing string is redacted at. It is the only

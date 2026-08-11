@@ -20,7 +20,10 @@ Invariants:
   that each result agrees with its turn's last message from the Backend itself,
   failing closed otherwise. The Iteration's outcome is judged on that final
   message; a session that goes on after a result is the signature of a build that
-  flushes per turn instead, and fails closed naming that cause.
+  flushes per turn instead, and fails closed naming that cause. ``execute_iteration``
+  returns that final message alongside the outcome and session id, so the Run console
+  can show it in the Iteration's outcome block; it is returned raw, and the console
+  truncates it for display only (register G14).
 - Marker semantics are per *message*, not per turn: the message the Iteration is
   judged on decides completion and the needs-input halt, and a needs-input marker
   in any other message of the Backend's own — an earlier turn's or an earlier
@@ -860,7 +863,10 @@ def _consume_claude_iteration(
             file=sys.stderr,
         )
     complete = has_completion_marker(final)
-    return ("complete" if complete else "budget_exhausted"), result.session_id
+    # The concluding message rides back with the outcome so the Run console can show
+    # it in the Iteration's outcome block; it is the same final message the marker was
+    # read from. The Loop truncates it for display only (register G14).
+    return ("complete" if complete else "budget_exhausted"), result.session_id, final
 
 
 def write_claude_session(run_dir: Path, result: ClaudeEventResult) -> None:

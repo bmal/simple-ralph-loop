@@ -236,3 +236,59 @@ class RunLoopTest(RalphCliTestCase):
         self.assertIn("uncommitted changes", result.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         self.assertIn("uncommitted.txt", (run_dir / "git-status.txt").read_text())
+
+    def test_a_completed_run_closes_the_iteration_and_summarises(self) -> None:
+        # A successful run no longer exits silently: the Iteration closes with an
+        # outcome block, and the run ends with a summary naming the git outcome and
+        # the evidence path.
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ralph: iteration 1 of 1 complete in", result.stderr)
+        self.assertIn("session ses_1", result.stderr)
+        self.assertIn("ralph: outcome run complete", result.stderr)
+        self.assertIn("ralph: branch main", result.stderr)
+        run_dir = next((self.repo.resolve() / ".git" / "ralph" / "runs").iterdir())
+        self.assertIn(f"ralph: evidence {run_dir}", result.stderr)
+
+    def test_the_trust_boundary_is_stated_once_its_proof_completes(self) -> None:
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "ralph: trust boundary proven: subscription-only authentication, "
+            "customization isolation, host isolation",
+            result.stderr,
+        )
+
+    def test_budget_exhaustion_summarises_with_the_evidence_and_message(self) -> None:
+        result = self.run_ralph(
+            env={
+                "FAKE_EVENTS": self._events("Implemented and verified."),
+                "FAKE_EXPORT": self._export("Implemented and verified."),
+            }
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("iteration budget exhausted", result.stderr)
+        self.assertIn("Implemented and verified.", result.stderr)
+        run_dir = next((self.repo.resolve() / ".git" / "ralph" / "runs").iterdir())
+        self.assertIn(f"ralph: evidence {run_dir}", result.stderr)
+
+    def test_the_summary_appears_on_the_handoff_path_before_the_banner(self) -> None:
+        final = "<promise>NEEDS_INPUT</promise>\nShould I preserve the legacy file?"
+        result = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(final), "FAKE_EXPORT": self._export(final)}
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        # The handoff banner is preserved, and the summary now accompanies it on
+        # this terminal path too.
+        self.assertIn("RALPH NEEDS OPERATOR", result.stderr)
+        run_dir = next((self.repo.resolve() / ".git" / "ralph" / "runs").iterdir())
+        self.assertIn(f"ralph: evidence {run_dir}", result.stderr)
+        # The summary precedes the banner so the call-to-action stays last.
+        self.assertLess(
+            result.stderr.index(f"ralph: evidence {run_dir}"),
+            result.stderr.index("RALPH NEEDS OPERATOR"),
+        )
