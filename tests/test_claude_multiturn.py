@@ -92,6 +92,53 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
                 _, outcome = self._read_outcome()
                 self.assertEqual(outcome["outcome"], "complete")
 
+    def test_a_parked_background_teardown_ending_in_a_reinit_completes_normally(self) -> None:
+        # The #47 regression, caught by the H10 live smoke against Claude Code
+        # 2.1.228: a session that launched a background task and ended its turn
+        # while the task was still running gets a teardown tail that drains and
+        # kills the task and then re-emits `system/init` as its final event. That
+        # trailing init opens no turn -- nothing follows it -- so it is teardown,
+        # not the per-turn-flush shape, and the Iteration must be judged on its
+        # answer, not failed closed with the budget stranded. The synthesised
+        # fixtures modelled a park tail ending in `task_summary` and missed this
+        # trailing init; only the live run against the real CLI surfaced it.
+        answer = "Launched in the background, not waiting.\n<promise>COMPLETE</promise>"
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_assistant_event(answer, "claude-session-1"),
+            self._claude_result_event(answer, "claude-session-1"),
+            {
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "session_id": "claude-session-1",
+                "tasks": [],
+            },
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "session_id": "claude-session-1",
+                "task_id": "t1",
+                "patch": {"status": "killed", "end_time": 1},
+            },
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "session_id": "claude-session-1",
+                "task_id": "t1",
+                "status": "stopped",
+            },
+            self._claude_init_event("claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Launched in the background, not waiting.", result.stdout)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertNotIn("event after the terminal result", result.stderr)
+        self.assertNotIn("a result per turn", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
     def test_an_unrecognised_trailing_system_subtype_is_tolerated(self) -> None:
         # The rule is shape-based, not an allowlist (H4): a system subtype Ralph
         # has never seen, arriving after the result block, is teardown/telemetry
@@ -456,10 +503,12 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         # observation, taken from one Claude Code build. A build that closes each
         # turn with its own result must still fail closed -- but the operator who
         # meets this after an overnight run has to be pointed at the stream-shape
-        # change, not at a misbehaving backend. A post-result *init* is the only
-        # event that evidences that shape, so it is the only one that names the
-        # per-turn-flush cause (H6). A post-result background registration is no
-        # longer this signature -- it is teardown telemetry and is tolerated.
+        # change, not at a misbehaving backend. The signature is a post-result
+        # init that a turn actually *follows*: here the init is tolerated as
+        # possible teardown, and it is the continuation assistant behind it --
+        # closing a second turn Ralph cannot place -- that fails closed and names
+        # the per-turn-flush cause (H6). A lone trailing init would be teardown and
+        # would pass; the continuation is what proves the shape.
         events = [
             self._claude_init_event("claude-session-1"),
             self._claude_assistant_event("Turn one.", "claude-session-1"),
@@ -478,6 +527,30 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertEqual(outcome["outcome"], "backend_contract_failure")
         self.assertIn("manual resume:", result.stderr)
         self.assertIn("--session claude-session-1", result.stderr)
+
+    def test_a_background_registration_does_not_buy_a_continuation_turn_a_pass(self) -> None:
+        # Tolerating the teardown init is not a blank cheque, and a background
+        # registration does not license a genuine second turn. A session that
+        # registered a background task, flushed its first result, re-initialised,
+        # and then went on to speak a continuation turn is the per-turn-flush shape
+        # -- the follow-up assistant behind the post-result init fails closed with
+        # the wording reserved for it, exactly as when no background task was ever
+        # registered.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a result per turn", result.stderr)
+        self.assertNotIn("event after the terminal result", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertIn("manual resume:", result.stderr)
 
     def test_other_events_after_the_terminal_result_keep_the_original_message(self) -> None:
         # Only a *continuing* session gets the new diagnostic; a second result or

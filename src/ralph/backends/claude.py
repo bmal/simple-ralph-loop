@@ -24,18 +24,22 @@ Invariants:
   it is returned raw, and the console truncates it for display only (register G14).
 - What may follow the results is a matter of *shape*, not a census of subtypes,
   applied uniformly at every stream position (H4/H5). Once results have begun,
-  between them and after them alike, the only violations are events that could
-  change turn attribution: a fresh ``init`` or an ``assistant`` message would
-  (re)open or extend a turn, and a ``result`` beyond the turn count flushes a turn
-  that does not exist — each fails closed. Every other ``system`` subtype is
-  teardown or telemetry (Claude Code 2.1.228 emits ``task_summary``,
-  ``task_updated``, ``task_notification``, and a drained
-  ``background_tasks_changed`` after the results whenever a session touched a
-  background task); it changes no attribution and is ignored, whether or not Ralph
-  recognises it, so a later CLI addition is not another outage. A post-result
-  ``init`` — the one event that evidences a build closing each turn with its own
-  result instead of flushing them together at EOF — is the only violation that
-  names the per-turn-flush cause (H6); the rest keep the generic wording.
+  between them and after them alike, the violations are the events that actually
+  change turn attribution: an ``assistant`` message extends a turn, and a
+  ``result`` beyond the turn count flushes a turn that does not exist — each fails
+  closed. A post-result ``init`` is *not*, on its own, one of them: Claude Code
+  2.1.228 emits one at teardown whenever a session parked a background task (the
+  observed park tail is a drained ``background_tasks_changed``, ``task_updated``,
+  ``task_notification``, then a re-``init``), and that trailing init opens no
+  turn — nothing follows it — so failing on it closed every background-using
+  Iteration (#47). It is tolerated, and *proves* the per-turn-flush shape only if
+  an ``assistant`` or a further ``result`` then follows it, closing a real
+  continuation turn the parser cannot place; that follow-up is what fails closed,
+  and it alone names the per-turn-flush cause (H6). Every other ``system`` subtype
+  is teardown or telemetry (``task_summary`` and the rest of an open, growing
+  vocabulary); it changes no attribution and is ignored, whether or not Ralph
+  recognises it, so a later CLI addition is not another outage. A bare post-result
+  assistant or a duplicate result keeps the generic wording.
 - Marker semantics are per *message*, not per turn: the message the Iteration is
   judged on decides completion and the needs-input halt, and a needs-input marker
   in any other message of the Backend's own — an earlier turn's or an earlier
@@ -381,23 +385,21 @@ def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> st
     return "Claude returned a synthetic error instead of a model response"
 
 
-def event_after_result_reason(event: Any) -> str:
+def event_after_result_reason(per_turn_flush: bool) -> str:
     # Name the cause an operator can act on. F2's "results are flushed at EOF, in
     # turn order" is the observation the whole turn attribution rests on, and it
     # was taken from one Claude Code build. The per-turn-flush wording is reserved
-    # for the one event that evidences that shape (H6): a post-result *init*, the
-    # signature of a build that closes each turn with its own result instead of
-    # flushing them together at EOF. That is a CLI stream-shape change, not a
-    # misbehaving Backend, and blaming the Backend points the operator away from
-    # the fix. A post-result assistant event or a result beyond the turn count is
-    # an ordinary contract violation and keeps the generic wording; a post-result
-    # background registration is no longer a violation at all -- it is teardown
-    # telemetry, tolerated by `accept` and never routed here.
-    if (
-        isinstance(event, dict)
-        and event.get("type") == "system"
-        and event.get("subtype") == "init"
-    ):
+    # for the shape that evidences that build (H6): a post-result *init* that a
+    # turn actually *follows* -- an assistant or a further result that closes a
+    # continuation turn Ralph cannot place. A lone post-result init is teardown
+    # (2.1.228 emits one after a parked background task) and never reaches here;
+    # only the follow-up does, and it is what proves the CLI is closing each turn
+    # with its own result instead of flushing them together at EOF. That is a
+    # stream-shape change, not a misbehaving Backend, and blaming the Backend
+    # points the operator away from the fix. A bare post-result assistant or a
+    # result beyond the turn count -- no post-result init before it -- is an
+    # ordinary contract violation and keeps the generic wording.
+    if per_turn_flush:
         return (
             "Claude continued the session after a result, so this Claude Code build "
             "flushes a result per turn instead of at end of stream; Ralph cannot "
@@ -422,6 +424,7 @@ class ClaudeEventResult:
         self.session_id: str | None = None
         self.turns: list[ClaudeTurn] = []
         self.background_seen = False
+        self.post_result_init = False
         self.assistant_models: list[str] = []
         self.results: list[str] = []
         self.model_usage: list[str] = []
@@ -457,23 +460,28 @@ class ClaudeEventResult:
         if self.results:
             # Shape-based rule (H4/H5), applied uniformly once results have begun
             # -- between them and after them alike, so the inter-result window is
-            # no longer a separate, untested regime. The only violations are
-            # events that could change turn attribution: a fresh initialisation
-            # event or an assistant message (each would (re)open or extend a
-            # turn), and a result beyond the turn count (a flush for a turn that
-            # does not exist). Every other `system` subtype -- a teardown or
-            # telemetry event, whether or not Ralph recognises it -- is
-            # informational and ignored, so a Claude Code release that adds one
-            # after the results is not another outage. A result while results are
-            # still outstanding is the ordinary positional flush and passes
-            # through to be attributed below.
+            # no longer a separate, untested regime. The only violations are the
+            # events that actually change turn attribution: an assistant message
+            # (it extends a turn) and a result beyond the turn count (a flush for
+            # a turn that does not exist). A post-result init is *not* one of them
+            # on its own -- Claude Code 2.1.228 emits one at teardown after a
+            # parked background task, and that trailing init opens no turn, so
+            # rejecting it closed every background-using Iteration (#47). It is
+            # tolerated and remembered: it proves the per-turn-flush shape only if
+            # an assistant or a further result then follows it, closing a real
+            # continuation turn Ralph cannot place -- and that follow-up is what
+            # fails closed, with the wording reserved for it (H6). A lone trailing
+            # init, or one followed only by more telemetry, is teardown and passes.
+            # Every other `system` subtype is teardown or telemetry, ignored
+            # whether or not Ralph recognises it, so a later CLI addition is not
+            # another outage. A result while results are still outstanding is the
+            # ordinary positional flush and passes through to be attributed below.
             results_complete = len(self.results) >= len(self.turns)
-            if (
-                (event_type == "system" and subtype == "init")
-                or event_type == "assistant"
-                or (event_type == "result" and results_complete)
-            ):
-                raise RalphError(event_after_result_reason(event))
+            if event_type == "system" and subtype == "init":
+                self.post_result_init = True
+                return
+            if event_type == "assistant" or (event_type == "result" and results_complete):
+                raise RalphError(event_after_result_reason(self.post_result_init))
             if event_type != "result":
                 return
         if event_type == "system" and subtype == "background_tasks_changed":

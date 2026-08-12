@@ -206,12 +206,15 @@ explained only by a registration that preceded every turn, still fail closed.
 What may follow the results is judged by *shape*, not by a list of tolerated
 subtypes: whenever a session has touched a background task, Claude Code emits
 teardown and telemetry after the result block (a task summary, a killed-task
-update, a notification, a drained registration), and Ralph ignores all of it —
-recognised or not — so a future release that adds another such event is not an
-outage. Only an event that could change turn attribution after the results fails
-closed: a fresh init (named as the per-turn result flush a build closing each
-turn with its own result would produce), an assistant message, or a result
-beyond the turn count. A subagent's own messages stay in the retained stream
+update, a notification, a drained registration, and — after a parked task — a
+re-init), and Ralph ignores all of it — recognised or not — so a future release
+that adds another such event is not an outage. A post-result init on its own is
+teardown: it opens no turn, and failing on it once closed every background-using
+iteration. It fails closed only when a turn actually *follows* it — an assistant
+message or a further result, closing a continuation Ralph cannot place — and that
+follow-up is named as the per-turn result flush a build closing each turn with
+its own result would produce. A bare post-result assistant, or a result beyond
+the turn count, is an ordinary contract violation. A subagent's own messages stay in the retained stream
 evidence but never count as the Backend's answer or as a completion/needs-input
 marker. The honest
 limit: the only bound on a background subagent that never drains is `--timeout`
