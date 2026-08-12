@@ -17,3 +17,12 @@ ralph = "ralph.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.mypy]
+# The qualification workflow type-checks the source tree against the minimum
+# supported interpreter (H11). mypy is a CI-installed developer tool, never a
+# runtime dependency, so `[project].dependencies` stays empty and the zero-
+# runtime-dependency property holds. Scope is `src`: the deterministic suite
+# proves the tests, and the interface annotations live in the package.
+python_version = "3.11"
+files = ["src"]

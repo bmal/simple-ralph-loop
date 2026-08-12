@@ -603,6 +603,56 @@ class RalphCliTestCase(unittest.TestCase):
             "modelUsage": model_usage or {model: {"inputTokens": 1, "outputTokens": 1}},
         }
 
+    def _claude_clean_drain_teardown(self, session_id: str) -> list[dict]:
+        # The teardown tail Claude Code 2.1.228 emits after a session that
+        # drained its background task cleanly mid-turn: a single telemetry
+        # summary after the result block. Synthesised to the observed shape
+        # (H12); no captured or probe stream is committed.
+        return [
+            {
+                "type": "system",
+                "subtype": "task_summary",
+                "session_id": session_id,
+                "summary": {"completed": 1, "killed": 0},
+            },
+        ]
+
+    def _claude_park_teardown(
+        self, session_id: str, task_id: str = "t1", description: str = "verify CI"
+    ) -> list[dict]:
+        # The teardown tail after a park: the Backend ended its turn with a task
+        # still in flight, so the CLI drained the task list, killed the task,
+        # notified that it stopped, and summarised -- all after the result block.
+        # Synthesised to the observed shape (H12); no captured stream is committed.
+        return [
+            {
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "session_id": session_id,
+                "tasks": [],
+            },
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "session_id": session_id,
+                "task_id": task_id,
+                "patch": {"status": "killed", "end_time": 1, "description": description},
+            },
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "session_id": session_id,
+                "task_id": task_id,
+                "status": "stopped",
+            },
+            {
+                "type": "system",
+                "subtype": "task_summary",
+                "session_id": session_id,
+                "summary": {"completed": 0, "killed": 1},
+            },
+        ]
+
     @staticmethod
     def _claude_stream(events: list[dict]) -> str:
         return "\n".join(json.dumps(event) for event in events)
@@ -612,6 +662,7 @@ class RalphCliTestCase(unittest.TestCase):
         turns: list[dict],
         session_id: str = "claude-session-1",
         model: str = "claude-opus-4-8",
+        teardown: list[dict] | None = None,
     ) -> str:
         # Compose an N-turn stream in the observed shape: each init opens a turn
         # interleaved with that turn's work, a `background_tasks_changed`
@@ -619,6 +670,9 @@ class RalphCliTestCase(unittest.TestCase):
         # flushed at EOF in turn order. Each entry of `turns` is a dict with
         # "text" (the turn's final Backend message and its result) and optional
         # "subagents" (subagent message texts, tagged with parent_tool_use_id).
+        # An optional `teardown` tail (see the clean-drain and park builders) is
+        # appended after the result block, modelling the events the real CLI
+        # emits at teardown when a session touched a background task.
         events: list[dict] = []
         for index, turn in enumerate(turns):
             events.append(self._claude_init_event(session_id, model))
@@ -633,6 +687,8 @@ class RalphCliTestCase(unittest.TestCase):
                 events.append(self._claude_background_event(session_id))
         for turn in turns:
             events.append(self._claude_result_event(turn["text"], session_id, model))
+        if teardown:
+            events.extend(teardown)
         return self._claude_stream(events)
 
     _ENV_ALLOWLIST = (

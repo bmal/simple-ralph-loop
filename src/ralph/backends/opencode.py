@@ -526,7 +526,7 @@ def execute_iteration(
     env: dict[str, str],
     timeout: float,
     sandbox_profile: Path | None = None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = session_argv(
@@ -593,14 +593,15 @@ def _consume_opencode_iteration(
     env: dict[str, str],
     stdout_path: Path,
     stderr_path: Path,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    stderr_stream = process.stderr
     stderr_invalid: list[bool] = []
 
     def drain_stderr() -> None:
         with stderr_path.open("w", encoding="utf-8") as retained:
             try:
-                for chunk in process.stderr:
+                for chunk in stderr_stream:
                     retained.write(redact(chunk))
             except UnicodeDecodeError:
                 stderr_invalid.append(True)

@@ -202,11 +202,18 @@ afterwards, in that turn or an earlier one, does not stop the run early, and a
 needs-input marker it superseded the same way warns on stderr and continues
 instead of halting. A second init is admitted only in a session that registered
 a background task while a turn was open; an unexplained duplicate init, and one
-explained only by a registration that preceded every turn, still fail closed. If
-a session instead goes on *after* a result — a shape no observed Claude Code
-build produces — Ralph fails closed naming that per-turn result flush as the
-cause. A subagent's own messages stay in the retained stream evidence but never
-count as the Backend's answer or as a completion/needs-input marker. The honest
+explained only by a registration that preceded every turn, still fail closed.
+What may follow the results is judged by *shape*, not by a list of tolerated
+subtypes: whenever a session has touched a background task, Claude Code emits
+teardown and telemetry after the result block (a task summary, a killed-task
+update, a notification, a drained registration), and Ralph ignores all of it —
+recognised or not — so a future release that adds another such event is not an
+outage. Only an event that could change turn attribution after the results fails
+closed: a fresh init (named as the per-turn result flush a build closing each
+turn with its own result would produce), an assistant message, or a result
+beyond the turn count. A subagent's own messages stay in the retained stream
+evidence but never count as the Backend's answer or as a completion/needs-input
+marker. The honest
 limit: the only bound on a background subagent that never drains is `--timeout`
 — Ralph adds no separate idle detection, so a wedged background task can hold an
 iteration open until the timeout fires. Resuming a handed-off session that still held a background task

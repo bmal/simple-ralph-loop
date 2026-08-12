@@ -19,11 +19,23 @@ Invariants:
   turn. The i-th result belongs to the i-th turn; Ralph asserts equal counts and
   that each result agrees with its turn's last message from the Backend itself,
   failing closed otherwise. The Iteration's outcome is judged on that final
-  message; a session that goes on after a result is the signature of a build that
-  flushes per turn instead, and fails closed naming that cause. ``execute_iteration``
-  returns that final message alongside the outcome and session id, so the Run console
-  can show it in the Iteration's outcome block; it is returned raw, and the console
-  truncates it for display only (register G14).
+  message. ``execute_iteration`` returns that final message alongside the outcome
+  and session id, so the Run console can show it in the Iteration's outcome block;
+  it is returned raw, and the console truncates it for display only (register G14).
+- What may follow the results is a matter of *shape*, not a census of subtypes,
+  applied uniformly at every stream position (H4/H5). Once results have begun,
+  between them and after them alike, the only violations are events that could
+  change turn attribution: a fresh ``init`` or an ``assistant`` message would
+  (re)open or extend a turn, and a ``result`` beyond the turn count flushes a turn
+  that does not exist — each fails closed. Every other ``system`` subtype is
+  teardown or telemetry (Claude Code 2.1.228 emits ``task_summary``,
+  ``task_updated``, ``task_notification``, and a drained
+  ``background_tasks_changed`` after the results whenever a session touched a
+  background task); it changes no attribution and is ignored, whether or not Ralph
+  recognises it, so a later CLI addition is not another outage. A post-result
+  ``init`` — the one event that evidences a build closing each turn with its own
+  result instead of flushing them together at EOF — is the only violation that
+  names the per-turn-flush cause (H6); the rest keep the generic wording.
 - Marker semantics are per *message*, not per turn: the message the Iteration is
   judged on decides completion and the needs-input halt, and a needs-input marker
   in any other message of the Backend's own — an earlier turn's or an earlier
@@ -347,9 +359,11 @@ def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> st
     # Turn a Claude Code synthetic error message into an operator-facing halt
     # reason. The human-readable error text lives in the message content; the
     # machine-readable cause lives in the event's top-level `error` field.
+    content = message.get("content")
+    parts = content if isinstance(content, list) else []
     detail = " ".join(
         part["text"]
-        for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+        for part in parts
         if isinstance(part, dict)
         and part.get("type") == "text"
         and isinstance(part.get("text"), str)
@@ -370,16 +384,19 @@ def synthetic_error_reason(event: dict[str, Any], message: dict[str, Any]) -> st
 def event_after_result_reason(event: Any) -> str:
     # Name the cause an operator can act on. F2's "results are flushed at EOF, in
     # turn order" is the observation the whole turn attribution rests on, and it
-    # was taken from one Claude Code build; a session that *continues* after a
-    # result -- a fresh init, or a background registration once results have begun
-    # -- is the recognizable signature of a build that closes each turn with its
-    # own result instead. That is a CLI stream-shape change, not a misbehaving
-    # Backend, and blaming the Backend points the operator away from the fix.
-    # Every other event after a result stays the ordinary contract violation.
+    # was taken from one Claude Code build. The per-turn-flush wording is reserved
+    # for the one event that evidences that shape (H6): a post-result *init*, the
+    # signature of a build that closes each turn with its own result instead of
+    # flushing them together at EOF. That is a CLI stream-shape change, not a
+    # misbehaving Backend, and blaming the Backend points the operator away from
+    # the fix. A post-result assistant event or a result beyond the turn count is
+    # an ordinary contract violation and keeps the generic wording; a post-result
+    # background registration is no longer a violation at all -- it is teardown
+    # telemetry, tolerated by `accept` and never routed here.
     if (
         isinstance(event, dict)
         and event.get("type") == "system"
-        and event.get("subtype") in {"init", "background_tasks_changed"}
+        and event.get("subtype") == "init"
     ):
         return (
             "Claude continued the session after a result, so this Claude Code build "
@@ -431,22 +448,35 @@ class ClaudeEventResult:
         return spoken[:-1]
 
     def accept(self, event: Any) -> None:
-        if self.results:
-            # Results are flushed at EOF in turn order. Once every turn's result
-            # has arrived nothing more may follow, and while they are still
-            # arriving only further results may -- a late init, assistant, or any
-            # other event means the ordered contract was violated. Fail closed
-            # rather than assess a stream we no longer trust. (In the single-turn
-            # case the very first result completes the count, so a second result
-            # or a trailing message is caught here exactly as before.)
-            results_complete = len(self.results) >= len(self.turns)
-            is_result = isinstance(event, dict) and event.get("type") == "result"
-            if results_complete or not is_result:
-                raise RalphError(event_after_result_reason(event))
         if not isinstance(event, dict):
+            # A non-dict line carries no turn structure and can change no turn
+            # attribution, so it is ignored at every stream position.
             return
         event_type = event.get("type")
-        if event_type == "system" and event.get("subtype") == "background_tasks_changed":
+        subtype = event.get("subtype")
+        if self.results:
+            # Shape-based rule (H4/H5), applied uniformly once results have begun
+            # -- between them and after them alike, so the inter-result window is
+            # no longer a separate, untested regime. The only violations are
+            # events that could change turn attribution: a fresh initialisation
+            # event or an assistant message (each would (re)open or extend a
+            # turn), and a result beyond the turn count (a flush for a turn that
+            # does not exist). Every other `system` subtype -- a teardown or
+            # telemetry event, whether or not Ralph recognises it -- is
+            # informational and ignored, so a Claude Code release that adds one
+            # after the results is not another outage. A result while results are
+            # still outstanding is the ordinary positional flush and passes
+            # through to be attributed below.
+            results_complete = len(self.results) >= len(self.turns)
+            if (
+                (event_type == "system" and subtype == "init")
+                or event_type == "assistant"
+                or (event_type == "result" and results_complete)
+            ):
+                raise RalphError(event_after_result_reason(event))
+            if event_type != "result":
+                return
+        if event_type == "system" and subtype == "background_tasks_changed":
             # A subagent launched with run_in_background finishes asynchronously,
             # after the turn that launched it, and forces the CLI to open a second
             # turn with a fresh `system` init. That registration is what licenses
@@ -460,7 +490,7 @@ class ClaudeEventResult:
             if self.turns:
                 self.background_seen = True
             return
-        if event_type == "system" and event.get("subtype") == "init":
+        if event_type == "system" and subtype == "init":
             self._accept_init(event)
             return
         if event_type == "assistant":
@@ -635,7 +665,7 @@ def execute_iteration(
     env: dict[str, str],
     timeout: float,
     sandbox_profile: Path | None = None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     # Confine the Claude session under Ralph's generated profile via the shared
     # `session_argv` wrap (register D6/D13): `caffeinate -im sandbox-exec -f
     # <profile> claude …`, caffeinate outermost. This is the exact OpenCode code
@@ -708,14 +738,15 @@ def _consume_claude_iteration(
     prompt: str,
     stdout_path: Path,
     stderr_path: Path,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    stderr_stream = process.stderr
     stderr_invalid: list[bool] = []
 
     def drain_stderr() -> None:
         with stderr_path.open("w", encoding="utf-8") as retained:
             try:
-                for chunk in process.stderr:
+                for chunk in stderr_stream:
                     retained.write(redact(chunk))
             except UnicodeDecodeError:
                 stderr_invalid.append(True)
@@ -841,6 +872,10 @@ def _consume_claude_iteration(
             result.session_id, "Claude produced a result for only some of its turns"
         )
     final = result.final_text
+    # The guards above (session id, a result per turn, a Backend message backing
+    # the final turn) establish that the final result is present, so `final` is
+    # never None here; assert it so the marker scans below type-check.
+    assert final is not None
     explicit = explicit_needs_input(final)
     if explicit:
         # The final parent turn is authoritative for a needs-input halt.

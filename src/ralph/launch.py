@@ -285,7 +285,7 @@ def write_sandbox_profile(
 
 def sandbox_profile_for(
     backend: str, run_dir: Path, worktree: Path, ralph_dir: Path, env: dict[str, str]
-) -> Path | None:
+) -> Path:
     # The Launch chain confines every backend under Ralph's own profile, once per
     # run — Ralph proves the boundary rather than trusting a backend to sandbox
     # itself (register D6). Both OpenCode (#20) and Claude (#22) route through the

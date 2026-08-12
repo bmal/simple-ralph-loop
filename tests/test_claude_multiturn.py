@@ -68,6 +68,69 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         _, outcome = self._read_outcome()
         self.assertEqual(outcome["outcome"], "complete")
 
+    def test_a_teardown_tail_after_the_result_completes_normally(self) -> None:
+        # On Claude Code 2.1.228 the CLI emits teardown events after the result
+        # block whenever a session touched a background task -- even one that
+        # drained cleanly and answered correctly. Both observed tails (a clean
+        # drain and a park) must leave the Iteration judged on its final message
+        # exactly as before, not fail the run and strand the budget.
+        answer = "Work complete.\n<promise>COMPLETE</promise>"
+        tails = {
+            "clean drain": self._claude_clean_drain_teardown("claude-session-1"),
+            "park": self._claude_park_teardown("claude-session-1"),
+        }
+        for signature, teardown in tails.items():
+            with self.subTest(signature=signature):
+                for path in self.calls.iterdir():
+                    path.unlink()
+                events = self._claude_multiturn_events([{"text": answer}], teardown=teardown)
+                result = self._run(events)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Work complete.", result.stdout)
+                self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+                self.assertNotIn("event after the terminal result", result.stderr)
+                _, outcome = self._read_outcome()
+                self.assertEqual(outcome["outcome"], "complete")
+
+    def test_an_unrecognised_trailing_system_subtype_is_tolerated(self) -> None:
+        # The rule is shape-based, not an allowlist (H4): a system subtype Ralph
+        # has never seen, arriving after the result block, is teardown/telemetry
+        # and is ignored, so a future CLI addition is not another outage.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "Done.\n<promise>COMPLETE</promise>", "claude-session-1"
+            ),
+            self._claude_result_event("Done.\n<promise>COMPLETE</promise>", "claude-session-1"),
+            {"type": "system", "subtype": "post_turn_summary", "session_id": "claude-session-1"},
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
+    def test_an_informational_event_between_two_results_is_tolerated(self) -> None:
+        # The tolerance rule applies at every stream position, between results as
+        # well as after them (H5), closing the previously separate and untested
+        # inter-result regime: an informational event that arrives while results
+        # are still outstanding no longer fails the run.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("First pass.", "claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event(
+                "Done.\n<promise>COMPLETE</promise>", "claude-session-1"
+            ),
+            self._claude_result_event("First pass.", "claude-session-1"),
+            {"type": "system", "subtype": "task_summary", "session_id": "claude-session-1"},
+            self._claude_result_event("Done.\n<promise>COMPLETE</promise>", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
     def _bad_second_init(self, second_session: str = "claude-session-1", **override: object) -> str:
         events = [
             self._claude_init_event("claude-session-1"),
@@ -393,34 +456,28 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         # observation, taken from one Claude Code build. A build that closes each
         # turn with its own result must still fail closed -- but the operator who
         # meets this after an overnight run has to be pointed at the stream-shape
-        # change, not at a misbehaving backend. Both continuation signatures are
-        # asserted: a background registration and a fresh init.
-        continued = {
-            "background registration": self._claude_background_event("claude-session-1"),
-            "fresh init": self._claude_init_event("claude-session-1"),
-        }
-        for signature, event in continued.items():
-            with self.subTest(signature=signature):
-                events = [
-                    self._claude_init_event("claude-session-1"),
-                    self._claude_assistant_event("Turn one.", "claude-session-1"),
-                    self._claude_result_event("Turn one.", "claude-session-1"),
-                    event,
-                    self._claude_assistant_event("Turn two.", "claude-session-1"),
-                    self._claude_result_event("Turn two.", "claude-session-1"),
-                ]
-                result = self._run(self._claude_stream(events))
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("a result per turn", result.stderr)
-                self.assertNotIn("event after the terminal result", result.stderr)
-                # Behaviour is unchanged: still fail closed, still a consuming
-                # resumable handoff with a working resume command.
-                _, outcome = self._read_outcome()
-                self.assertEqual(outcome["outcome"], "backend_contract_failure")
-                self.assertIn("manual resume:", result.stderr)
-                self.assertIn("--session claude-session-1", result.stderr)
-                for path in self.calls.iterdir():
-                    path.unlink()
+        # change, not at a misbehaving backend. A post-result *init* is the only
+        # event that evidences that shape, so it is the only one that names the
+        # per-turn-flush cause (H6). A post-result background registration is no
+        # longer this signature -- it is teardown telemetry and is tolerated.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+            self._claude_result_event("Turn two.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a result per turn", result.stderr)
+        self.assertNotIn("event after the terminal result", result.stderr)
+        # Behaviour is unchanged: still fail closed, still a consuming resumable
+        # handoff with a working resume command.
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertIn("manual resume:", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
 
     def test_other_events_after_the_terminal_result_keep_the_original_message(self) -> None:
         # Only a *continuing* session gets the new diagnostic; a second result or
