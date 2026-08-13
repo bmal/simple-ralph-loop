@@ -251,7 +251,13 @@ stream it uses for its other mid-run warnings, so the operator learns which work
 went unverified. That report is observational — detected only from the CLI's
 explicit killed-task update, never inferred from a task-list drain (which also
 fires on an ordinary mid-turn completion) — and it leaves the iteration's outcome
-and final message exactly as they were.
+and final message exactly as they were. The killed update must carry the session's
+own id to be attributed: a foreign, missing, or empty session id is a crossed
+stream and names no task, and a duplicate report of a task already recorded adds
+no second one. Once a valid killed update is accepted, its warning is delivered on
+every terminal path — an ordinary completion and a contract-failure handoff alike
+— so a later stream event that fails the contract cannot suppress the work the CLI
+already reported abandoned.
 
 Questions, timeout, interruption, backend failure, or malformed output stop the
 loop and hand off for manual recovery; Ralph spends exactly one session per

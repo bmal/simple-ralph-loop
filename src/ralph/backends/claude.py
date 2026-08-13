@@ -74,10 +74,16 @@ Invariants:
   names the abandoned task on stderr, the stream the operator already watches for
   the mid-run marker warnings (H9). Detection is that explicit report alone, never
   inference from a task-list drain, which also fires mid-stream on an ordinary
-  completion (H7). The report is observational: it leaves the Iteration's outcome
-  and final message unchanged (H1). It is a not-yet-migrated operator-facing write
-  registered as migration debt for the Run console program (register G13/G14; the
-  terminal-ownership test names it and #36 is told to adopt it).
+  completion (H7). The observation must also carry the *established* session id: a
+  foreign, missing, or empty id is a crossed stream and names no task, the same
+  class #49 tightened for assistant and licensing events (#50 I6); a duplicate
+  report of a task already recorded fabricates no second one. Once accepted, the
+  warning is delivered on every terminal path -- an ordinary completion and a
+  contract-failure handoff alike -- so a halt never hides the work the CLI said it
+  abandoned (#50 I7). The report is observational: it leaves the Iteration's
+  outcome and final message unchanged (H1). It is a not-yet-migrated operator-facing
+  write registered as migration debt for the Run console program (register G13/G14;
+  the terminal-ownership test names it and #36 is told to adopt it).
 - ``preflight`` returns a ``console.Deviation`` (or ``None``): when it admits the
   ``.claude/agents`` vector under ``--unsafe-allow-agents`` and otherwise clears, it
   hands back the fact so the caller states the relaxed subagent-isolation guarantee
@@ -536,9 +542,10 @@ class ClaudeEventResult:
         event_type = event.get("type")
         subtype = event.get("subtype")
         if event_type == "system" and subtype == "task_updated":
-            # Record an explicit killed-task report wherever it appears (H7): it is
+            # Consider an explicit killed-task report wherever it appears (H7): it is
             # observational, changes no turn attribution, and is warned about after
-            # the Iteration is judged. Noting it before the post-result shape gate
+            # the Iteration is judged. `_note_killed_task` records it only for the
+            # established session (I6); noting it before the post-result shape gate
             # keeps detection uniform at every stream position.
             self._note_killed_task(event)
         if self.results:
@@ -754,8 +761,15 @@ class ClaudeEventResult:
                 self.model_usage.append(model)
         self.results.append(result)
 
+    def _belongs_to_session(self, value: Any) -> bool:
+        # An id belongs to the established session only once an init has set the
+        # session id and the value matches it. A missing, empty, or foreign id is a
+        # crossed stream. The single predicate keeps the session gate identical
+        # wherever it is applied -- a raising caller and an observational one alike.
+        return self.session_id is not None and value == self.session_id
+
     def _require_session(self, value: Any) -> None:
-        if self.session_id is None or value != self.session_id:
+        if not self._belongs_to_session(value):
             raise RalphError("Claude stream contained inconsistent session metadata")
 
     def _note_killed_task(self, event: dict[str, Any]) -> None:
@@ -765,11 +779,25 @@ class ClaudeEventResult:
         # and would misreport it (H7). The report is observational (H1): the
         # abandoned task is recorded here and warned about after the Iteration is
         # judged, and changes neither the outcome nor the final message.
+        if not self._belongs_to_session(event.get("session_id")):
+            # I6: the observation must belong to the established session before it
+            # can reach the operator. A foreign, missing, or empty session id is a
+            # crossed stream -- the same class #49 tightened for assistant and
+            # licensing events -- so it cannot be attributed to this Iteration and
+            # produces no abandonment warning.
+            return
         patch = event.get("patch")
         if not isinstance(patch, dict) or patch.get("status") != "killed":
             return
         task_id = event.get("task_id")
-        self.killed_tasks.append(task_id if isinstance(task_id, str) and task_id else None)
+        label = task_id if isinstance(task_id, str) and task_id else None
+        if label not in self.killed_tasks:
+            # A duplicate explicit killed report for a task already recorded names
+            # no additional task (I6): follow the stream's evidence rather than
+            # fabricate a second abandonment from a repeated event. Reports that
+            # carry no id all coalesce to a single unnamed entry for the same
+            # reason -- there is nothing to tell two of them apart.
+            self.killed_tasks.append(label)
 
     @property
     def fallback_models(self) -> list[str]:
@@ -869,6 +897,25 @@ def execute_iteration(
         controller.finish()
 
 
+def report_killed_tasks(result: ClaudeEventResult) -> None:
+    # I7/H9: an accepted same-session explicit killed-task report is delivered to
+    # the operator on every terminal path -- an ordinary completion and a
+    # contract-failure handoff alike -- before the caller prints its outcome, so a
+    # halt never hides work the CLI said it abandoned (#50 finding 5). Attribution
+    # already required the established session id (`_note_killed_task`, I6); this
+    # only reports what was accepted. It is observational and changes neither the
+    # Iteration's outcome nor its final message (H1). Still a not-yet-migrated
+    # operator-facing write, registered as Run console migration debt (G13/G14; the
+    # terminal-ownership test names it and #36 is told to adopt and word it).
+    for task_id in result.killed_tasks:
+        print(
+            "ralph: warning: Claude Code killed a background task still running when "
+            "the backend ended its turn, so its work was left unverified: "
+            + killed_task_label(task_id),
+            file=sys.stderr,
+        )
+
+
 def _consume_claude_iteration(
     process: subprocess.Popen[str],
     controller: ProcessController,
@@ -921,6 +968,7 @@ def _consume_claude_iteration(
                 controller.force_kill()
                 thread.join()
                 write_claude_session(run_dir, result)
+                report_killed_tasks(result)
                 # A stopped backend can truncate its final output mid-character;
                 # blame Ralph's own timeout or interrupt before the contract.
                 raise_if_controlled_stop(controller, "Claude", result.session_id)
@@ -940,6 +988,7 @@ def _consume_claude_iteration(
                 controller.force_kill()
                 thread.join()
                 write_claude_session(run_dir, result)
+                report_killed_tasks(result)
                 raise_if_controlled_stop(controller, "Claude", result.session_id)
                 if result.session_id:
                     raise HandoffError(
@@ -952,6 +1001,7 @@ def _consume_claude_iteration(
                 controller.stop_gracefully()
                 thread.join()
                 write_claude_session(run_dir, result)
+                report_killed_tasks(result)
                 if isinstance(error, HandoffError):
                     raise
                 # An interrupted Claude session emits an error result event
@@ -970,6 +1020,7 @@ def _consume_claude_iteration(
                 controller.stop_gracefully()
                 thread.join()
                 write_claude_session(run_dir, result)
+                report_killed_tasks(result)
                 if not result.session_id:
                     raise RalphError("Claude attempted a question before session creation")
                 raise HandoffError(
@@ -980,6 +1031,10 @@ def _consume_claude_iteration(
     returncode = process.wait()
     thread.join()
     write_claude_session(run_dir, result)
+    # Deliver any accepted same-session kill before the outcome is judged, so a
+    # completion, a backend failure, a controlled stop, or a post-EOF contract
+    # failure below all still name the abandoned task (I7).
+    report_killed_tasks(result)
     raise_if_controlled_stop(controller, "Claude", result.session_id)
     if stderr_invalid:
         raise_backend_contract_failure(
@@ -1018,19 +1073,6 @@ def _consume_claude_iteration(
     # the final turn) establish that the final result is present, so `final` is
     # never None here; assert it so the marker scans below type-check.
     assert final is not None
-    for task_id in result.killed_tasks:
-        # H9: the killed-task observation emits from the adapter to stderr, matching
-        # the existing mid-run marker warnings, and is registered as migration debt
-        # (the terminal-ownership test's not-yet-migrated note names it, and #36 is
-        # told to adopt and word it under G14). It is emitted before the outcome is
-        # decided so a parked Iteration that also halts still gets its report, and it
-        # changes neither the outcome nor the final message (H1).
-        print(
-            "ralph: warning: Claude Code killed a background task still running when "
-            "the backend ended its turn, so its work was left unverified: "
-            + killed_task_label(task_id),
-            file=sys.stderr,
-        )
     explicit = explicit_needs_input(final)
     if explicit:
         # The final parent turn is authoritative for a needs-input halt.

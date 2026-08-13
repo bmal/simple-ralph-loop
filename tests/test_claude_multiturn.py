@@ -792,6 +792,147 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         _, outcome = self._read_outcome()
         self.assertEqual(outcome["outcome"], "complete")
 
+    def _killed_update(self, session_id: str, task_id: str) -> dict:
+        return {
+            "type": "system",
+            "subtype": "task_updated",
+            "session_id": session_id,
+            "task_id": task_id,
+            "patch": {"status": "killed", "end_time": 1},
+        }
+
+    def test_a_killed_update_outside_the_established_session_names_no_task(self) -> None:
+        # Finding 4 (#50 I6): a killed-task observation must belong to the
+        # established session before it can reach the operator. A killed
+        # `task_updated` whose session id is foreign, missing, or empty is a
+        # crossed stream -- the same class #49 tightened for assistant and
+        # licensing events -- so it fabricates no abandonment warning and cannot
+        # be attributed to this Iteration, which stays complete on its own answer.
+        answer = "Shipped; nothing left running.\n<promise>COMPLETE</promise>"
+        crossed = self._killed_update("claude-session-1", "task_crossed")
+        cases = {
+            "foreign session": {**crossed, "session_id": "claude-session-other"},
+            "empty session": {**crossed, "session_id": ""},
+            "missing session": {key: value for key, value in crossed.items() if key != "session_id"},
+        }
+        for name, killed in cases.items():
+            with self.subTest(case=name):
+                for path in self.calls.iterdir():
+                    path.unlink()
+                teardown = [
+                    {
+                        "type": "system",
+                        "subtype": "background_tasks_changed",
+                        "session_id": "claude-session-1",
+                        "tasks": [],
+                    },
+                    killed,
+                ]
+                result = self._run(
+                    self._claude_multiturn_events([{"text": answer}], teardown=teardown)
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("killed a background task", result.stderr)
+                self.assertNotIn("task_crossed", result.stderr)
+                _, outcome = self._read_outcome()
+                self.assertEqual(outcome["outcome"], "complete")
+
+    def test_a_same_session_non_killed_task_update_names_no_task(self) -> None:
+        # Finding 4 (#50 I6): detection is the explicit killed report alone. A
+        # same-session `task_updated` whose patch does not mark the task `killed`
+        # -- an ordinary status change -- is telemetry, not abandonment, so it
+        # raises no warning and leaves the Iteration complete.
+        answer = "Drained the helper and answered.\n<promise>COMPLETE</promise>"
+        teardown = [
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "session_id": "claude-session-1",
+                "task_id": "task_running",
+                "patch": {"status": "completed", "end_time": 1},
+            },
+        ]
+        result = self._run(self._claude_multiturn_events([{"text": answer}], teardown=teardown))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("killed a background task", result.stderr)
+        self.assertNotIn("task_running", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
+    def test_a_killed_task_warning_survives_a_later_contract_failure(self) -> None:
+        # Finding 5 (#50 I7): once a same-session explicit kill is accepted, its
+        # warning reaches the operator even when a later event fails the stream's
+        # contract. A valid killed `task_updated` is followed here by an illegal
+        # post-result assistant: the Iteration halts with a contract-failure
+        # handoff, and the killed-task warning is emitted before that report -- the
+        # halt does not hide the work the CLI said it abandoned. Reporting stays
+        # observational: it does not replace or reclassify the failure (H1).
+        answer = "Pushed to main; CI runs in the background.\n<promise>COMPLETE</promise>"
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_background_event("claude-session-1"),
+            self._claude_assistant_event(answer, "claude-session-1"),
+            self._claude_result_event(answer, "claude-session-1"),
+            self._killed_update("claude-session-1", "task_ci_verify"),
+            self._claude_assistant_event("Illegal continuation.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("killed a background task", result.stderr)
+        self.assertIn("task_ci_verify", result.stderr)
+        # The warning names the abandonment without reclassifying the halt.
+        self.assertIn("event after the terminal result", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+
+    def test_a_killed_task_warning_survives_a_malformed_continuation(self) -> None:
+        # Finding 5 (#50 I7): the delivery holds on a second failure path, proving
+        # it is not tied to one handler. A valid killed `task_updated` is followed
+        # by a line that is not valid JSON: the Iteration halts with a
+        # contract-failure handoff, and the killed-task warning is still emitted
+        # before that report.
+        answer = "Pushed to main; CI runs in the background.\n<promise>COMPLETE</promise>"
+        stream = self._claude_stream(
+            [
+                self._claude_init_event("claude-session-1"),
+                self._claude_background_event("claude-session-1"),
+                self._claude_assistant_event(answer, "claude-session-1"),
+                self._claude_result_event(answer, "claude-session-1"),
+                self._killed_update("claude-session-1", "task_ci_verify"),
+            ]
+        )
+        result = self._run(stream + "\n{not valid json")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("killed a background task", result.stderr)
+        self.assertIn("task_ci_verify", result.stderr)
+        self.assertIn("malformed structured output", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+
+    def test_a_duplicate_killed_report_names_the_task_once(self) -> None:
+        # Finding 4 (#50 I6): a repeated explicit killed report for a task already
+        # recorded fabricates no additional abandoned task. The stream's evidence
+        # is one killed task, so the operator is warned exactly once and no phantom
+        # second task appears -- follow the evidence, never invent metadata.
+        answer = "Done.\n<promise>COMPLETE</promise>"
+        killed = self._killed_update("claude-session-1", "task_dup")
+        teardown = [
+            {
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "session_id": "claude-session-1",
+                "tasks": [],
+            },
+            killed,
+            killed,
+        ]
+        result = self._run(self._claude_multiturn_events([{"text": answer}], teardown=teardown))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("killed a background task"), 1, result.stderr)
+        self.assertIn("task_dup", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
     def test_an_assistant_event_that_omits_the_origin_marker_is_refused(self) -> None:
         # #49: the origin marker (`parent_tool_use_id`) is present on every
         # observed assistant event -- null on the Backend's own, an id on a

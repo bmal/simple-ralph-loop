@@ -39,7 +39,10 @@ opened as a turn) — so either way the work is abandoned, not deliberately
 resumed. The Claude adapter prevents it with an adapter-local prompt directive that
 names both outcomes and forbids relying on a later delivery (never launching is fine
 — only abandoning is forbidden) and, when the CLI reports it killed a task anyway,
-names the abandoned task on stderr without changing the iteration's outcome.
+names the abandoned task on stderr without changing the iteration's outcome. That
+report is attributed only to the established session — a foreign, missing, or empty
+session id names no task — and, once accepted, is delivered on every terminal path,
+so a later contract failure cannot suppress a kill the CLI already reported.
 _Avoid_: continuation turn (reserved for a task delivered while the turn is open),
 dropped task
 
