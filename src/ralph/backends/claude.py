@@ -570,13 +570,21 @@ class ClaudeEventResult:
             # `system` subtype is teardown or telemetry, ignored whether or not
             # Ralph recognises it, so a later CLI addition is not another outage. A
             # result while results are still outstanding is the ordinary positional
-            # flush and passes through to be attributed below.
+            # flush and passes through to be attributed below -- but only while no
+            # post-result init came first. Behind one, a result is that follow-up
+            # wherever it lands: the remembered init makes it the flush of a turn
+            # Ralph cannot place, and reading it as the outstanding turn's would
+            # land that turn on one already spoken for. One rule at every result
+            # position (I2/I3), so a result still outstanding never buys the
+            # follow-up a pass a complete result block would deny it.
             results_complete = len(self.results) >= len(self.turns)
             if event_type == "system" and subtype == "init":
                 self._prove_init(event, opening_turn=False)
                 self.post_result_init = True
                 return
-            if event_type == "assistant" or (event_type == "result" and results_complete):
+            if event_type == "assistant" or (
+                event_type == "result" and (results_complete or self.post_result_init)
+            ):
                 raise RalphError(event_after_result_reason(self.post_result_init))
             if event_type != "result":
                 return

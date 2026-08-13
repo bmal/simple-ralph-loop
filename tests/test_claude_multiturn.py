@@ -23,6 +23,20 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         run_dir = max(runs, key=lambda path: path.name)
         return run_dir, json.loads((run_dir / "outcome.json").read_text())
 
+    def _assert_per_turn_flush_handoff(self, result) -> None:
+        # The one operator-visible shape every per-turn-flush stream must produce
+        # (H6/I3), asserted identically wherever the continuation is proven: fail
+        # closed, name the stream-shape change rather than the generic violation,
+        # and still hand the session off as a consuming, resumable
+        # backend_contract_failure with a working resume command.
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("a result per turn", result.stderr)
+        self.assertNotIn("event after the terminal result", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+        self.assertIn("manual resume:", result.stderr)
+        self.assertIn("--session claude-session-1", result.stderr)
+
     def test_two_and_three_turn_streams_complete_normally(self) -> None:
         # A background subagent that finishes after its launching turn opens a
         # second (and third) turn with a fresh init; Ralph reads to EOF, judges
@@ -601,16 +615,9 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
             self._claude_assistant_event("Turn two.", "claude-session-1"),
             self._claude_result_event("Turn two.", "claude-session-1"),
         ]
-        result = self._run(self._claude_stream(events))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("a result per turn", result.stderr)
-        self.assertNotIn("event after the terminal result", result.stderr)
         # Behaviour is unchanged: still fail closed, still a consuming resumable
         # handoff with a working resume command.
-        _, outcome = self._read_outcome()
-        self.assertEqual(outcome["outcome"], "backend_contract_failure")
-        self.assertIn("manual resume:", result.stderr)
-        self.assertIn("--session claude-session-1", result.stderr)
+        self._assert_per_turn_flush_handoff(self._run(self._claude_stream(events)))
 
     def test_a_background_registration_does_not_buy_a_continuation_turn_a_pass(self) -> None:
         # Tolerating the teardown init is not a blank cheque, and a background
@@ -628,13 +635,39 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
             self._claude_init_event("claude-session-1"),
             self._claude_assistant_event("Turn two.", "claude-session-1"),
         ]
-        result = self._run(self._claude_stream(events))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("a result per turn", result.stderr)
-        self.assertNotIn("event after the terminal result", result.stderr)
-        _, outcome = self._read_outcome()
-        self.assertEqual(outcome["outcome"], "backend_contract_failure")
-        self.assertIn("manual resume:", result.stderr)
+        self._assert_per_turn_flush_handoff(self._run(self._claude_stream(events)))
+
+    def test_a_post_result_init_a_turn_follows_fails_closed_with_a_result_outstanding(
+        self,
+    ) -> None:
+        # I3 holds at *every* result position (I2), not only once the result block
+        # is complete. Here the second turn's result is still to come when a valid,
+        # same-session, Trust-boundary-safe init arrives, and either follow-up
+        # behind it closes a turn Ralph cannot place: an assistant extends a turn
+        # that was already flushed, and the further result is no longer the
+        # ordinary positional flush -- reading it as one let an unplaceable
+        # continuation land on an already-spoken-for turn and passed the whole
+        # stream as `complete`.
+        answer = "Turn two.\n<promise>COMPLETE</promise>"
+        follow_ups = {
+            "further result": self._claude_result_event(answer, "claude-session-1"),
+            "continuation assistant": self._claude_assistant_event(answer, "claude-session-1"),
+        }
+        for signature, follow_up in follow_ups.items():
+            with self.subTest(signature=signature):
+                for path in self.calls.iterdir():
+                    path.unlink()
+                events = [
+                    self._claude_init_event("claude-session-1"),
+                    self._claude_assistant_event("Turn one.", "claude-session-1"),
+                    self._claude_background_event("claude-session-1"),
+                    self._claude_init_event("claude-session-1"),
+                    self._claude_assistant_event(answer, "claude-session-1"),
+                    self._claude_result_event("Turn one.", "claude-session-1"),
+                    self._claude_init_event("claude-session-1"),
+                    follow_up,
+                ]
+                self._assert_per_turn_flush_handoff(self._run(self._claude_stream(events)))
 
     def test_other_events_after_the_terminal_result_keep_the_original_message(self) -> None:
         # Only a *continuing* session gets the new diagnostic; a second result or
