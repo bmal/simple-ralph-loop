@@ -201,8 +201,10 @@ backend itself — a completion claim superseded by anything the backend said
 afterwards, in that turn or an earlier one, does not stop the run early, and a
 needs-input marker it superseded the same way warns on stderr and continues
 instead of halting. A second init is admitted only in a session that registered
-a background task while a turn was open; an unexplained duplicate init, and one
-explained only by a registration that preceded every turn, still fail closed.
+a background task, carrying the session's own id, while a turn was open; an
+unexplained duplicate init, one explained only by a registration that preceded
+every turn, and one explained only by a registration bearing a foreign id, still
+fail closed.
 What may follow the results is judged by *shape*, not by a list of tolerated
 subtypes: whenever a session has touched a background task, Claude Code emits
 teardown and telemetry after the result block (a task summary, a killed-task
@@ -214,9 +216,15 @@ iteration. It fails closed only when a turn actually *follows* it — an assista
 message or a further result, closing a continuation Ralph cannot place — and that
 follow-up is named as the per-turn result flush a build closing each turn with
 its own result would produce. A bare post-result assistant, or a result beyond
-the turn count, is an ordinary contract violation. A subagent's own messages stay in the retained stream
-evidence but never count as the Backend's answer or as a completion/needs-input
-marker. The honest
+the turn count, is an ordinary contract violation. Which messages are the
+Backend's own is read from an origin marker (`parent_tool_use_id`) present on every
+assistant event — null on the Backend's own, a tool-use id on a subagent's — so a
+subagent's own messages stay in the retained stream evidence but never count as the
+Backend's answer or as a completion/needs-input marker. Three malformed shapes the
+real CLI never emits are refused closed rather than credited: an assistant event
+that omits the marker entirely (it would default to the Backend and let a subagent
+assemble the answer), a subagent event carrying a foreign session id (a crossed
+stream), and the background registration above bearing a foreign id. The honest
 limit: the only bound on a background subagent that never drains is `--timeout`
 — Ralph adds no separate idle detection, so a wedged background task can hold an
 iteration open until the timeout fires. Resuming a handed-off session that still held a background task

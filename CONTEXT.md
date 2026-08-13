@@ -40,6 +40,18 @@ the abandoned task on stderr without changing the iteration's outcome.
 _Avoid_: continuation turn (reserved for a task delivered while the turn is open),
 dropped task
 
+**Origin marker**:
+The `parent_tool_use_id` field the Claude CLI puts on every assistant event —
+null on the Backend's own message, the launching tool-use id on a background
+subagent's — which the adapter reads to attribute a turn's response: only the
+Backend's own messages assemble the answer and are scanned for completion and
+needs-input markers, so a subagent speaking last is never mistaken for the answer.
+Measured present on every one of 815 assistant events across five sessions, so
+three shapes that never occurred are refused closed rather than credited: an event
+that omits the marker entirely, a subagent event carrying a foreign session id, and
+the background registration that licenses a second turn bearing a foreign id.
+_Avoid_: subagent tag, parent id
+
 **Interactive-only child**:
 A child issue carrying the configured label (default `may-ask-owner`) that
 embeds an owner decision and must be worked in an interactive session. Before the

@@ -12,8 +12,9 @@ Invariants:
   resumable handoff.
 - The stream is read to EOF and may carry multiple turns. A second (or later) init
   is admitted only in a session that registered a background task
-  (``background_tasks_changed``) while at least one turn was open — no turn, no
-  cause, so such a registration licenses nothing; an unexplained duplicate init
+  (``background_tasks_changed``) while at least one turn was open and the
+  registration carried the session's own id — no turn, no cause, and a foreign id
+  is a crossed stream, so neither licenses anything; an unexplained duplicate init
   stays the hard ``Claude emitted duplicate initialization metadata`` failure it is
   today. Results are flushed at EOF in turn order — a ``result`` does *not* close a
   turn. The i-th result belongs to the i-th turn; Ralph asserts equal counts and
@@ -71,12 +72,20 @@ Invariants:
   hands back the fact so the caller states the relaxed subagent-isolation guarantee
   loudly through the Run console — the adapter words no operator-facing warning of its
   own (register G7/G14). A refused run is not warned about isolation it never reaches.
-- ``parent_tool_use_id`` distinguishes the Backend's own messages (``None``) from a
-  background subagent's (the launching tool-use id). Only the Backend's own messages
-  assemble a turn's response and are scanned for completion/needs-input markers, so a
-  subagent speaking last is never mistaken for the answer; the subagent's messages
-  still stay in the retained stream evidence. The native question tool halts wherever
-  it appears, unfiltered by origin.
+- ``parent_tool_use_id`` is the origin marker, present on every assistant event
+  (null on the Backend's own, the launching tool-use id on a background subagent's).
+  It distinguishes the Backend's own messages from a subagent's: only the Backend's
+  own messages assemble a turn's response and are scanned for completion/needs-input
+  markers, so a subagent speaking last is never mistaken for the answer; the
+  subagent's messages still stay in the retained stream evidence. The native question
+  tool halts wherever it appears, unfiltered by origin. Three shapes are refused
+  closed rather than credited, each licensed by five observed sessions that never
+  showed them (#49): an assistant event that *omits* the marker entirely (it would
+  default to the Backend and let a subagent assemble the answer); a subagent
+  assistant event whose ``session_id`` is not the parent session's (a crossed
+  stream — enforced for every assistant event by the same ``_require_session`` guard
+  the Backend's own events pass); and, above, a ``background_tasks_changed`` bearing
+  a foreign id, which cannot open the second-turn relaxation.
 - ``--unsafe-allow-agents`` relaxes only the agent vectors (``.claude/agents`` and
   the settings ``agent`` key). Managed, server-managed, hooks, plugins, and every
   other unsafe settings key stay refused and are checked *before* the local
@@ -552,8 +561,11 @@ class ClaudeEventResult:
             # never emit this, so they never flip the gate. Neither does a
             # registration arriving before the first init: F1 licenses the
             # relaxation by observed *cause*, and no turn existed yet to launch
-            # anything, so such an event explains no later init.
-            if self.turns:
+            # anything, so such an event explains no later init. It licenses only
+            # when it carries the session's *own* id -- every one of the 10
+            # licensing events measured did, so an event bearing a foreign id is a
+            # crossed stream that must not open the multi-turn relaxation (#49).
+            if self.turns and event.get("session_id") == self.session_id:
                 self.background_seen = True
             return
         if event_type == "system" and subtype == "init":
@@ -608,6 +620,15 @@ class ClaudeEventResult:
 
     def _accept_assistant(self, event: dict[str, Any]) -> None:
         self._require_session(event.get("session_id"))
+        if "parent_tool_use_id" not in event:
+            # The origin marker distinguishes the Backend's own messages from a
+            # subagent's, and it was present on every one of the 815 assistant
+            # events measured across five sessions -- null on the Backend's own,
+            # an identifier on a subagent's. An event that omits it entirely gives
+            # no origin to read, so `.get()` would silently default it to the
+            # Backend and let a subagent's words assemble the Iteration's answer.
+            # Refuse it rather than guess (register H, #49).
+            raise RalphError("Claude assistant event omitted its origin marker")
         message = event.get("message")
         if not isinstance(message, dict) or not isinstance(message.get("model"), str):
             raise RalphError("Claude assistant event omitted required metadata")
@@ -627,11 +648,10 @@ class ClaudeEventResult:
         content = message.get("content")
         if not isinstance(content, list):
             raise RalphError("Claude assistant event omitted content")
-        # `parent_tool_use_id` is None for the Backend's own messages and the
-        # launching tool-use id for a background subagent's. Only the Backend's
-        # own text assembles the turn's response and is later scanned for markers,
-        # so a subagent speaking last is never mistaken for the answer; the
-        # subagent's output is still printed and retained as evidence.
+        # Only the Backend's own text (a null origin marker, refused above if the
+        # marker is absent) assembles the turn's response and is later scanned for
+        # markers, so a subagent speaking last is never mistaken for the answer;
+        # the subagent's output is still printed and retained as evidence.
         is_backend = event.get("parent_tool_use_id") is None
         # Each Claude stream-json assistant event carries a complete message
         # (there are no incremental text deltas without partial-message mode),

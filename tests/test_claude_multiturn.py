@@ -695,3 +695,74 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertNotIn("killed a background task", result.stderr)
         _, outcome = self._read_outcome()
         self.assertEqual(outcome["outcome"], "complete")
+
+    def test_an_assistant_event_that_omits_the_origin_marker_is_refused(self) -> None:
+        # #49: the origin marker (`parent_tool_use_id`) is present on every
+        # observed assistant event -- null on the Backend's own, an id on a
+        # subagent's. An event that omits it entirely gives no origin to read, so
+        # `.get()` would default it to the Backend and let it assemble the
+        # Iteration's answer. It must be refused closed, not credited. The observed
+        # valid shape (present and null) is exercised by every other test through
+        # the fixture builders, so this asserts only the malformed omission.
+        answer = "The real answer.\n<promise>COMPLETE</promise>"
+        without_marker = self._claude_assistant_event(answer, "claude-session-1")
+        del without_marker["parent_tool_use_id"]
+        events = [
+            self._claude_init_event("claude-session-1"),
+            without_marker,
+            self._claude_result_event(answer, "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("origin marker", result.stderr)
+        # Session id was established by the init, so the refusal is a consuming,
+        # resumable handoff rather than an outright failure.
+        self.assertIn("--session claude-session-1", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+
+    def test_a_subagent_event_carrying_a_foreign_session_id_is_refused(self) -> None:
+        # #49: every subagent assistant event observed carried its parent's
+        # session id. One that carries a foreign id is a crossed stream and must be
+        # refused, never allowed to contribute to the Iteration -- while a subagent
+        # event carrying the parent's id (the observed valid shape) is admitted, as
+        # test_subagent_messages_never_count_as_the_answer_or_a_marker exercises.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Working.", "claude-session-1"),
+            self._claude_assistant_event(
+                "Subagent from another session.",
+                "claude-session-other",
+                parent_tool_use_id="toolu_sub_1",
+            ),
+            self._claude_result_event("Working.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("inconsistent session metadata", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")
+
+    def test_a_registration_from_a_foreign_session_licenses_no_second_turn(self) -> None:
+        # #49: the event that licenses a second init is honoured only when it
+        # carries the session's own id. A `background_tasks_changed` bearing a
+        # foreign id must not open the multi-turn relaxation, so the later init is
+        # the unexplained duplicate it has always been -- exactly as when no
+        # registration was seen at all. The same shape carrying the session's own
+        # id licenses the second turn, as
+        # test_a_registration_after_the_first_init_licenses_a_later_init_as_today
+        # exercises.
+        events = [
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn one.", "claude-session-1"),
+            self._claude_background_event("claude-session-other"),
+            self._claude_init_event("claude-session-1"),
+            self._claude_assistant_event("Turn two.", "claude-session-1"),
+            self._claude_result_event("Turn one.", "claude-session-1"),
+            self._claude_result_event("Turn two.", "claude-session-1"),
+        ]
+        result = self._run(self._claude_stream(events))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("duplicate initialization metadata", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "backend_contract_failure")

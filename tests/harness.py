@@ -508,6 +508,9 @@ class RalphCliTestCase(unittest.TestCase):
             {
                 "type": "assistant",
                 "session_id": session_id,
+                # The Backend's own events carry the origin marker present and null,
+                # the observed shape the parser now requires (#49).
+                "parent_tool_use_id": None,
                 "message": {
                     "id": "msg_claude_1",
                     "role": "assistant",
