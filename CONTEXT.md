@@ -81,7 +81,10 @@ _Avoid_: log, output, UI, stderr (the stream it happens to write to)
 
 **Trust boundary**:
 The set of properties ralph proves before spending budget: subscription-only
-authentication, customization isolation, and host isolation.
+authentication, customization isolation, and host isolation. For a Claude session
+it is re-proved on every `system/init` event — including a post-result teardown
+init, which passes the identical proof but opens no turn — so a longer stream is a
+stronger proof, never a weaker one, and stream position cannot weaken validation.
 _Avoid_: security model, safety checks
 
 **Host isolation**:

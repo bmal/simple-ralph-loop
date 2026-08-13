@@ -139,6 +139,33 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         _, outcome = self._read_outcome()
         self.assertEqual(outcome["outcome"], "complete")
 
+    def test_a_valid_trailing_init_after_a_three_turn_stream_is_teardown(self) -> None:
+        # I1/I2: the tolerated trailing shape still works at depth. A three-turn
+        # background-subagent stream whose park teardown tail ends in a lone,
+        # same-session, Trust-boundary-safe re-init opens no turn and leaves the
+        # Iteration judged on its final message -- exactly as the one-turn park
+        # reinit does, so validating the trailing init did not narrow the shape
+        # the outage fix restored.
+        teardown = self._claude_park_teardown("claude-session-1") + [
+            self._claude_init_event("claude-session-1")
+        ]
+        events = self._claude_multiturn_events(
+            [
+                {"text": "Turn one done.", "subagents": ["Survey one finished."]},
+                {"text": "Turn two done."},
+                {"text": "All done.\n<promise>COMPLETE</promise>"},
+            ],
+            teardown=teardown,
+        )
+        result = self._run(events)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("All done.", result.stdout)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        self.assertNotIn("a result per turn", result.stderr)
+        self.assertNotIn("event after the terminal result", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
     def test_an_unrecognised_trailing_system_subtype_is_tolerated(self) -> None:
         # The rule is shape-based, not an allowlist (H4): a system subtype Ralph
         # has never seen, arriving after the result block, is teardown/telemetry
@@ -209,6 +236,63 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
                 result = self._run(self._bad_second_init(**override))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
+
+    def test_a_post_result_init_reproves_the_trust_boundary_at_every_position(self) -> None:
+        # Finding 1 (#50 I1/I2): a post-result init is tolerated as teardown, but
+        # only after it re-proves the established session and the full Trust
+        # boundary -- a crossed session id or any unsafe isolation metadata fails
+        # closed, exactly as a turn-opening init does. The rule holds at both
+        # result positions: after a complete result block and between two
+        # outstanding results, so stream position never weakens validation.
+        cases = [
+            ({"apiKeySource": "ANTHROPIC_API_KEY"}, "did not use subscription OAuth"),
+            ({"permissionMode": "default"}, "did not enter full-auto permission mode"),
+            ({"mcp_servers": [{"name": "external"}]}, "external MCP servers or plugins"),
+            ({"plugins": [{"name": "external"}]}, "external MCP servers or plugins"),
+            ({"tools": ["Bash", "UnknownExternalTool"]}, "unknown or external tool"),
+            ({"model": "claude-3-5-haiku"}, "did not match the selected model"),
+            ({"session_id": "claude-session-other"}, "inconsistent session metadata"),
+        ]
+
+        def after_complete_block(hostile: dict) -> list[dict]:
+            return [
+                self._claude_init_event("claude-session-1"),
+                self._claude_assistant_event("Turn one.", "claude-session-1"),
+                self._claude_result_event("Turn one.", "claude-session-1"),
+                hostile,
+            ]
+
+        def between_two_results(hostile: dict) -> list[dict]:
+            return [
+                self._claude_init_event("claude-session-1"),
+                self._claude_assistant_event("Turn one.", "claude-session-1"),
+                self._claude_background_event("claude-session-1"),
+                self._claude_init_event("claude-session-1"),
+                self._claude_assistant_event("Turn two.", "claude-session-1"),
+                self._claude_result_event("Turn one.", "claude-session-1"),
+                hostile,
+                self._claude_result_event("Turn two.", "claude-session-1"),
+            ]
+
+        positions = {
+            "after complete result block": after_complete_block,
+            "between two outstanding results": between_two_results,
+        }
+        for position, build in positions.items():
+            for override, message in cases:
+                with self.subTest(position=position, override=override):
+                    for path in self.calls.iterdir():
+                        path.unlink()
+                    hostile = self._claude_init_event("claude-session-1")
+                    hostile.update(override)
+                    result = self._run(self._claude_stream(build(hostile)))
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(message, result.stderr)
+                    # The leading init established the session id, so the refusal
+                    # is a consuming, resumable handoff, not an outright failure.
+                    self.assertIn("--session claude-session-1", result.stderr)
+                    _, outcome = self._read_outcome()
+                    self.assertEqual(outcome["outcome"], "backend_contract_failure")
 
     def test_duplicate_init_without_a_background_task_still_fails_closed(self) -> None:
         # The relaxation is licensed by observed cause: absent a

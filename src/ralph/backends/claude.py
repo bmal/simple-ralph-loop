@@ -2,14 +2,17 @@
 and host paths, event accumulation, iteration, and session persistence.
 
 Invariants:
-- Each ``system/init`` opens a turn and re-proves the subscription-safe session: it
-  must report ``apiKeySource == "none"`` (billing rides the proven pro/max OAuth
-  login, not a metered key), ``bypassPermissions`` full-auto mode, no external MCP
-  servers or plugins, a tool set that is a subset of ``CLAUDE_BUILTIN_TOOLS``, and
-  the same session id — every turn, so a longer stream is a stronger proof, not a
-  weaker one. Anything else fails closed. The session id is checkpointed on the
-  first init before the rest is validated so a later contract failure is still a
-  resumable handoff.
+- Every ``system/init`` re-proves the subscription-safe session: it must report
+  ``apiKeySource == "none"`` (billing rides the proven pro/max OAuth login, not a
+  metered key), ``bypassPermissions`` full-auto mode, no external MCP servers or
+  plugins, a tool set that is a subset of ``CLAUDE_BUILTIN_TOOLS``, and the same
+  session id — every time, so a longer stream is a stronger proof, not a weaker
+  one. Anything else fails closed. The session id is checkpointed on the first
+  init before the rest is validated so a later contract failure is still a
+  resumable handoff. A *pre-result* init opens a turn on this proof; a *post-result*
+  init passes the identical proof but opens no turn — it is teardown, not a new
+  turn (see the shape bullet; #50 I1/I2). The single ``_prove_init`` runs both,
+  so validation cannot weaken with stream position.
 - The stream is read to EOF and may carry multiple turns. A second (or later) init
   is admitted only in a session that registered a background task
   (``background_tasks_changed``) while at least one turn was open and the
@@ -33,11 +36,15 @@ Invariants:
   observed park tail is a drained ``background_tasks_changed``, ``task_updated``,
   ``task_notification``, then a re-``init``), and that trailing init opens no
   turn — nothing follows it — so failing on it closed every background-using
-  Iteration (#47). It is tolerated, and *proves* the per-turn-flush shape only if
-  an ``assistant`` or a further ``result`` then follows it, closing a real
-  continuation turn the parser cannot place; that follow-up is what fails closed,
-  and it alone names the per-turn-flush cause (H6). Every other ``system`` subtype
-  is teardown or telemetry (``task_summary`` and the rest of an open, growing
+  Iteration (#47). It is still validated exactly as any init: ``_prove_init``
+  re-proves the established session and the full Trust boundary at this position
+  too, so a crossed session id or unsafe metadata fails closed rather than
+  slipping in under teardown tolerance (#50 I1/I2). Once valid it opens no turn,
+  only remembered, and *proves* the per-turn-flush shape only if an ``assistant``
+  or a further ``result`` then follows it, closing a real continuation turn the
+  parser cannot place; that follow-up is what fails closed, and it alone names the
+  per-turn-flush cause (H6/I3). Every other ``system`` subtype is teardown or
+  telemetry (``task_summary`` and the rest of an open, growing
   vocabulary); it changes no attribution and is ignored, whether or not Ralph
   recognises it, so a later CLI addition is not another outage. A bare post-result
   assistant or a duplicate result keeps the generic wording.
@@ -534,17 +541,22 @@ class ClaudeEventResult:
             # on its own -- Claude Code 2.1.228 emits one at teardown after a
             # parked background task, and that trailing init opens no turn, so
             # rejecting it closed every background-using Iteration (#47). It is
-            # tolerated and remembered: it proves the per-turn-flush shape only if
-            # an assistant or a further result then follows it, closing a real
-            # continuation turn Ralph cannot place -- and that follow-up is what
-            # fails closed, with the wording reserved for it (H6). A lone trailing
-            # init, or one followed only by more telemetry, is teardown and passes.
-            # Every other `system` subtype is teardown or telemetry, ignored
-            # whether or not Ralph recognises it, so a later CLI addition is not
-            # another outage. A result while results are still outstanding is the
-            # ordinary positional flush and passes through to be attributed below.
+            # still re-proved: `_prove_init` re-checks the established session and
+            # the full Trust boundary at this position too (I1/I2), so a crossed
+            # session id or unsafe metadata fails closed here rather than slipping
+            # in as teardown. Once valid it opens no turn, only remembered: it
+            # proves the per-turn-flush shape solely if an assistant or a further
+            # result then follows it, closing a real continuation turn Ralph
+            # cannot place -- and that follow-up is what fails closed, with the
+            # wording reserved for it (H6/I3). A lone trailing init, or one
+            # followed only by more telemetry, is teardown and passes. Every other
+            # `system` subtype is teardown or telemetry, ignored whether or not
+            # Ralph recognises it, so a later CLI addition is not another outage. A
+            # result while results are still outstanding is the ordinary positional
+            # flush and passes through to be attributed below.
             results_complete = len(self.results) >= len(self.turns)
             if event_type == "system" and subtype == "init":
+                self._prove_init(event, opening_turn=False)
                 self.post_result_init = True
                 return
             if event_type == "assistant" or (event_type == "result" and results_complete):
@@ -578,21 +590,38 @@ class ClaudeEventResult:
             self._accept_result(event)
 
     def _accept_init(self, event: dict[str, Any]) -> None:
+        # A pre-result init opens a turn: it re-proves the Trust boundary and then
+        # appends the turn. A post-result init never reaches here -- `accept`
+        # routes it to `_prove_init(opening_turn=False)`, which re-proves the
+        # identical boundary but opens no turn (I1/I2).
+        model = self._prove_init(event, opening_turn=True)
+        self.turns.append(ClaudeTurn(model))
+
+    def _prove_init(self, event: dict[str, Any], *, opening_turn: bool) -> str:
+        # Re-prove the established session and the full Trust boundary for an
+        # initialization event, returning the model it reported. Applied
+        # uniformly to every init at every stream position (I1/I2): the same
+        # proof a turn-opening init passes is required of a post-result init that
+        # is only tolerated as teardown, so a crossed session id or unsafe
+        # isolation metadata fails closed wherever the init appears. `opening_turn`
+        # gates only the duplicate-init rule -- the question of whether *this* init
+        # may open a new turn -- which a post-result init, opening none, never
+        # poses.
         session_id = event.get("session_id")
         if isinstance(session_id, str) and session_id:
             # Checkpoint the session id before validating the rest of the event so
             # a later contract failure in a partially malformed init is still a
             # consuming, resumable handoff rather than an unrecoverable failure.
-            # Every turn must carry the same id.
+            # Every init must carry the same id.
             if self.session_id is not None and self.session_id != session_id:
                 raise RalphError("Claude stream contained inconsistent session metadata")
             self.session_id = session_id
         model = event.get("model")
         if not isinstance(session_id, str) or not session_id or not isinstance(model, str):
             raise RalphError("Claude initialization omitted required metadata")
-        if self.turns and not self.background_seen:
-            # A second (or later) init opens a new turn only in a session that
-            # registered a background task; otherwise it is the unexplained
+        if opening_turn and self.turns and not self.background_seen:
+            # A second (or later) turn-opening init is admitted only in a session
+            # that registered a background task; otherwise it is the unexplained
             # duplicate init that has always failed closed.
             raise RalphError("Claude emitted duplicate initialization metadata")
         if model != self.expected_model:
@@ -602,7 +631,8 @@ class ClaudeEventResult:
         # API key is in play, so billing rides the OAuth login preflight proved is
         # a pro/max subscription; `bypassPermissions` is full-auto mode; the MCP,
         # plugin, and tool sets prove no external customization loaded. Any other
-        # value fails closed -- on the first turn and on every turn after it.
+        # value fails closed -- on the first turn, on every turn after it, and on a
+        # post-result teardown init alike.
         if event.get("apiKeySource") != "none":
             raise RalphError("Claude session did not use subscription OAuth")
         if event.get("permissionMode") != "bypassPermissions":
@@ -616,7 +646,7 @@ class ClaudeEventResult:
             or not set(tools).issubset(CLAUDE_BUILTIN_TOOLS)
         ):
             raise RalphError("Claude loaded an unknown or external tool")
-        self.turns.append(ClaudeTurn(model))
+        return model
 
     def _accept_assistant(self, event: dict[str, Any]) -> None:
         self._require_session(event.get("session_id"))

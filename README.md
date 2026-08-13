@@ -212,11 +212,14 @@ update, a notification, a drained registration, and — after a parked task — 
 re-init), and Ralph ignores all of it — recognised or not — so a future release
 that adds another such event is not an outage. A post-result init on its own is
 teardown: it opens no turn, and failing on it once closed every background-using
-iteration. It fails closed only when a turn actually *follows* it — an assistant
-message or a further result, closing a continuation Ralph cannot place — and that
-follow-up is named as the per-turn result flush a build closing each turn with
-its own result would produce. A bare post-result assistant, or a result beyond
-the turn count, is an ordinary contract violation. Which messages are the
+iteration. It is still validated exactly as any init — the same session id and
+full trust boundary are re-proved at this position, so a crossed session id or
+unsafe metadata fails closed rather than slipping in as teardown — but once valid
+it opens no turn. It fails closed only when a turn actually *follows* it — an
+assistant message or a further result, closing a continuation Ralph cannot place
+— and that follow-up is named as the per-turn result flush a build closing each
+turn with its own result would produce. A bare post-result assistant, or a result
+beyond the turn count, is an ordinary contract violation. Which messages are the
 Backend's own is read from an origin marker (`parent_tool_use_id`) present on every
 assistant event — null on the Backend's own, a tool-use id on a subagent's — so a
 subagent's own messages stay in the retained stream evidence but never count as the
