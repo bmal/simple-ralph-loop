@@ -30,13 +30,16 @@ resolved facts, and its marker parser stay in one module.
 _Avoid_: prompt suffix, prompt template, system prompt
 
 **Parked turn**:
-A backend turn ended while a background task it launched is still running, on the
-false belief the session will be re-invoked when the task completes. It will not
-be: the session ends when the backend stops, the in-flight task is killed, and the
-notification never arrives, so the work is silently abandoned. The Claude adapter
-prevents it with an adapter-local prompt directive (never launching is fine — only
-abandoning is forbidden) and, when the CLI reports it killed a task anyway, names
-the abandoned task on stderr without changing the iteration's outcome.
+A backend turn ended while a background task it launched is still unresolved, on the
+false belief the session will be re-invoked when the task completes. It cannot bank
+on that: an unresolved task has two observed outcomes and neither is guaranteed —
+teardown may kill it, or it may finish and reappear as a fresh continuation Ralph
+cannot attribute to the ended turn (the trailing teardown init validated but not
+opened as a turn) — so either way the work is abandoned, not deliberately
+resumed. The Claude adapter prevents it with an adapter-local prompt directive that
+names both outcomes and forbids relying on a later delivery (never launching is fine
+— only abandoning is forbidden) and, when the CLI reports it killed a task anyway,
+names the abandoned task on stderr without changing the iteration's outcome.
 _Avoid_: continuation turn (reserved for a task delivered while the turn is open),
 dropped task
 

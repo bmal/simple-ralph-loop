@@ -713,20 +713,30 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertIn("at most one child issue", composed)
 
     def test_the_background_work_directive_is_appended_for_claude_only(self) -> None:
-        # #48/H3: the Claude adapter tells the backend it may launch background work
-        # but must not park a turn on it -- the session ends when it stops, an
-        # in-flight task is killed, and the notification never arrives. The
-        # mechanism is stated, not just the rule, and backgrounding stays supported.
-        # The directive is adapter-local: OpenCode, with no background-task runtime,
-        # never carries it.
+        # #48/H3 and #50 I5/finding 2: the Claude adapter tells the backend it may
+        # launch background work but must not park a turn on it. It states both
+        # observed outcomes of an unresolved task -- teardown may kill it, or it may
+        # finish and reappear as a continuation Ralph cannot attribute -- and tells
+        # the backend not to rely on a later delivery, rather than the disproved
+        # categorical guarantee that the task is always killed and the notification
+        # never arrives. Backgrounding stays supported. The directive is adapter-local:
+        # OpenCode, with no background-task runtime, never carries it.
         result = self.run_ralph(backend="claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         claude_prompt = json.loads(
             (self.calls / "claude-stdin").read_text()
         )["message"]["content"]
-        self.assertIn("must not end your turn while one is still running", claude_prompt)
+        self.assertIn("must not end your turn while one is still unresolved", claude_prompt)
         self.assertIn("left unverified", claude_prompt)
-        self.assertIn("false belief about this runtime", claude_prompt)
+        # Both observed outcomes are named, neither claimed to always happen.
+        self.assertIn("tear down and kill it", claude_prompt)
+        self.assertIn("continuation Ralph cannot attribute", claude_prompt)
+        # The Backend is told not to bank on a later delivery.
+        self.assertIn("do not stop expecting a later notification", claude_prompt)
+        # The disproved categorical runtime guarantee is gone.
+        self.assertNotIn("is never delivered", claude_prompt)
+        self.assertNotIn("any task still in flight is killed", claude_prompt)
+        self.assertNotIn("the moment you stop", claude_prompt)
         # Backgrounding itself stays supported -- the directive forbids abandoning.
         self.assertIn("launch background tasks where they help", claude_prompt)
         # It sits after the shared Loop protocol, which is still present unchanged.
@@ -738,6 +748,8 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         opencode_prompt = (self.calls / "stdin").read_text()
         self.assertNotIn("must not end your turn while", opencode_prompt)
         self.assertNotIn("left unverified", opencode_prompt)
+        self.assertNotIn("still unresolved", opencode_prompt)
+        self.assertNotIn("continuation Ralph cannot attribute", opencode_prompt)
 
     def test_a_killed_background_task_is_reported_by_name_without_changing_the_outcome(
         self,

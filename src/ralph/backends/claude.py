@@ -58,13 +58,17 @@ Invariants:
   warning is a bounded interruption, never the Backend's whole final message (#39).
 - The composed prompt carries an adapter-local ``BACKGROUND_TASK_DIRECTIVE`` after
   the shared Loop protocol (H3): the Backend may launch background work but must not
-  *park* on it -- end its turn while a task is still running, expecting to be
-  re-invoked when it completes. It will not be; the session ends when the Backend
-  stops, an in-flight task is killed, and the notification never arrives. The
-  directive is Claude-adapter-local because only Claude Code has a background-task
-  runtime and the Loop protocol is outcome signalling only; the OpenCode adapter
-  never appends it. Prevention is the mechanism (H2): the directive forbids
-  abandoning, never launching.
+  *park* on it -- end its turn while a task is still unresolved, expecting to be
+  re-invoked when it completes. It cannot bank on that: an unresolved task has two
+  observed outcomes and no guarantee of either -- teardown may kill it, or it may
+  finish and reappear as a fresh continuation Ralph cannot attribute to the
+  ended turn (the trailing teardown ``init`` #51 validates without opening a turn) --
+  so the directive names both and tells the Backend not to wait on a later delivery,
+  rather than claiming the task is always killed and the notification never arrives
+  (#50 I5). The directive is Claude-adapter-local because only Claude Code has a
+  background-task runtime and the Loop protocol is outcome signalling only; the
+  OpenCode adapter never appends it. Prevention is the mechanism (H2): the directive
+  forbids abandoning, never launching.
 - When the CLI's teardown explicitly reports it killed a background task (a
   ``system/task_updated`` whose ``patch`` marks the task ``killed``), the adapter
   names the abandoned task on stderr, the stream the operator already watches for
@@ -243,23 +247,29 @@ AGENT_OPT_OUT_HINT = (
 # adapter-local, not part of the shared Loop protocol, because only Claude Code has
 # a background-task runtime and the Loop protocol is outcome signalling only. A
 # Backend may launch background work but must not *park* on it -- end its turn while
-# a task is still running, expecting to be re-invoked when the task completes. It
-# will not be: the session ends the moment the Backend stops, a task still in flight
-# is killed, and the completion notification it is waiting for is never delivered.
-# The observed failure had the Backend explicitly reasoning it would wait for that
-# notification, so the directive names the mechanism, not just the rule -- it is a
-# false belief about the runtime, not carelessness. The directive forbids
-# abandoning, never launching (#48).
+# a task is still unresolved, expecting to be re-invoked when it completes. What
+# becomes of an unresolved task once the Backend stops has two observed outcomes and
+# no guarantee of either: teardown may kill it (the CLI's own ``task_updated``/
+# ``killed`` report), or it may finish and reappear as a fresh continuation Ralph
+# cannot attribute to the ended turn (the trailing teardown ``init`` the #47 H10
+# live-smoke tail carries, which #51 now validates without opening a turn). Neither
+# is a delivery the Backend can wait for, so the directive names both outcomes and
+# tells the Backend not to rely on a later notification, rather than the disproved
+# categorical "the task is killed and the notification never arrives" -- a directive
+# that misstates the runtime is worse than none (#50 I5). The observed failure had the
+# Backend explicitly reasoning it would wait for that notification. The directive
+# forbids abandoning, never launching (#48).
 BACKGROUND_TASK_DIRECTIVE = (
-    "\n\nBackground work must finish inside the turn that launched it. You may "
+    "\n\nBackground work must be resolved inside the turn that launched it. You may "
     "launch background tasks where they help (parallel review, a long survey), but "
-    "you must not end your turn while one is still running. This session ends the "
-    "moment you stop: any task still in flight is killed, and the completion "
-    "notification you were waiting for is never delivered -- waiting for it is a "
-    "false belief about this runtime, not a plan that will resume. Before you stop, "
-    "either bring the work back into the turn (wait for its result and act on it) or "
-    "cancel it and say what you left unverified, so the next iteration can pick it "
-    "up deliberately."
+    "you must not end your turn while one is still unresolved. What becomes of an "
+    "unresolved task once you stop is not yours to count on: the session may tear "
+    "down and kill it, or it may finish and reappear as a fresh continuation Ralph "
+    "cannot attribute to your turn. Neither outcome is a delivery you can wait "
+    "for, so do not stop expecting a later notification to resume the work. Before "
+    "you stop, either bring the work back into the turn (wait for its result and act "
+    "on it) or cancel it and say what you left unverified, so the next iteration can "
+    "pick it up deliberately."
 )
 
 

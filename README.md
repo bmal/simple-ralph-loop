@@ -235,14 +235,17 @@ replays that task's notification as a leading turn, harmless in the interactive
 `ralph resume` (which is why headless resume is not attempted).
 
 A background task the backend leaves running when it *ends its turn* is a
-different hazard: the session ends the moment the backend stops, so an in-flight
-task is killed and the completion notification the backend was waiting for is
-never delivered — the backend has silently abandoned its own work, typically at
-"pushed to main, now verify CI". Ralph works this from both ends. The Claude
-prompt carries an adapter-local directive (OpenCode, with no background-task
-runtime, does not): the backend may launch background work but must not end its
-turn while it is still running, and must instead bring the work into the turn or
-cancel it and say what it left unverified. And when the CLI's teardown explicitly
+different hazard. What happens to that task once the backend stops has two observed
+outcomes and neither is guaranteed: teardown may kill it, or it may finish and
+reappear as a fresh continuation Ralph cannot attribute to the ended turn (the
+post-result teardown init above, validated but never opened as a turn). Either
+way the backend has silently abandoned its own work, typically at "pushed to main,
+now verify CI", counting on a later notification that may never come. Ralph works
+this from both ends. The Claude prompt carries an adapter-local directive (OpenCode,
+with no background-task runtime, does not): the backend may launch background work
+but must not end its turn while it is still unresolved, must not rely on a later
+delivery to resume it, and must instead bring the work into the turn or cancel it
+and say what it left unverified. And when the CLI's teardown explicitly
 reports it killed a task anyway, Ralph names the abandoned task on the same stderr
 stream it uses for its other mid-run warnings, so the operator learns which work
 went unverified. That report is observational — detected only from the CLI's
