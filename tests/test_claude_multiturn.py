@@ -627,3 +627,71 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         self.assertNotIn("run synchronously", composed)
         # The Loop protocol is still appended unchanged.
         self.assertIn("at most one child issue", composed)
+
+    def test_the_background_work_directive_is_appended_for_claude_only(self) -> None:
+        # #48/H3: the Claude adapter tells the backend it may launch background work
+        # but must not park a turn on it -- the session ends when it stops, an
+        # in-flight task is killed, and the notification never arrives. The
+        # mechanism is stated, not just the rule, and backgrounding stays supported.
+        # The directive is adapter-local: OpenCode, with no background-task runtime,
+        # never carries it.
+        result = self.run_ralph(backend="claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        claude_prompt = json.loads(
+            (self.calls / "claude-stdin").read_text()
+        )["message"]["content"]
+        self.assertIn("must not end your turn while one is still running", claude_prompt)
+        self.assertIn("left unverified", claude_prompt)
+        self.assertIn("false belief about this runtime", claude_prompt)
+        # Backgrounding itself stays supported -- the directive forbids abandoning.
+        self.assertIn("launch background tasks where they help", claude_prompt)
+        # It sits after the shared Loop protocol, which is still present unchanged.
+        self.assertIn("at most one child issue", claude_prompt)
+        for path in self.calls.iterdir():
+            path.unlink()
+        result = self.run_ralph(backend="opencode")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        opencode_prompt = (self.calls / "stdin").read_text()
+        self.assertNotIn("must not end your turn while", opencode_prompt)
+        self.assertNotIn("left unverified", opencode_prompt)
+
+    def test_a_killed_background_task_is_reported_by_name_without_changing_the_outcome(
+        self,
+    ) -> None:
+        # H1/H7/H9: when the CLI's teardown explicitly reports it killed a
+        # background task the backend left running (a `task_updated` marked
+        # `killed`, never inferred from a task-list drain), Ralph names the
+        # abandoned task on the stream the operator already watches for warnings --
+        # and the Iteration keeps its ordinary outcome and final message, because
+        # this is a report, not a verdict.
+        answer = "Pushed to main; CI verifies in the background.\n<promise>COMPLETE</promise>"
+        events = self._claude_multiturn_events(
+            [{"text": answer}],
+            teardown=self._claude_park_teardown("claude-session-1", task_id="task_ci_verify"),
+        )
+        result = self._run(events)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("killed a background task", result.stderr)
+        # Named by the task id -- the identifier the observed killed event carries.
+        self.assertIn("task_ci_verify", result.stderr)
+        # The report neither reclassifies the Iteration nor touches its final message.
+        self.assertIn("Pushed to main", result.stdout)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")
+
+    def test_a_clean_drain_teardown_reports_no_killed_task(self) -> None:
+        # H7: detection is the explicit killed-task report, never the task-list
+        # drain. A session that drained its task cleanly mid-turn emits a drain and
+        # a summary but no `killed` update, so Ralph must not fabricate an
+        # abandonment warning for well-behaved work.
+        answer = "Drained the helper and answered.\n<promise>COMPLETE</promise>"
+        events = self._claude_multiturn_events(
+            [{"text": answer}],
+            teardown=self._claude_clean_drain_teardown("claude-session-1"),
+        )
+        result = self._run(events)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("killed a background task", result.stderr)
+        _, outcome = self._read_outcome()
+        self.assertEqual(outcome["outcome"], "complete")

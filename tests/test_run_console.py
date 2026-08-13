@@ -575,8 +575,9 @@ class TerminalOwnershipTest(unittest.TestCase):
         # failure help migrated to the Run console in #39; the run header, iteration
         # blocks, summary, and deviation warnings before it)
         "cli.py",
-        # the Backend feed, and the withdrawn/unmarked mid-run marker warnings (the
-        # --unsafe-allow-agents deviation migrated to the Run console in #39)
+        # the Backend feed, the withdrawn/unmarked mid-run marker warnings, and the
+        # killed-background-task report (#48) (the --unsafe-allow-agents deviation
+        # migrated to the Run console in #39)
         "backends/claude.py",
         "backends/opencode.py",
     }

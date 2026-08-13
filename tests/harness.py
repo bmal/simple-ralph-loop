@@ -617,13 +617,13 @@ class RalphCliTestCase(unittest.TestCase):
             },
         ]
 
-    def _claude_park_teardown(
-        self, session_id: str, task_id: str = "t1", description: str = "verify CI"
-    ) -> list[dict]:
+    def _claude_park_teardown(self, session_id: str, task_id: str = "t1") -> list[dict]:
         # The teardown tail after a park: the Backend ended its turn with a task
         # still in flight, so the CLI drained the task list, killed the task,
         # notified that it stopped, and summarised -- all after the result block.
         # Synthesised to the observed shape (H12); no captured stream is committed.
+        # The killed `patch` carries only `status` and `end_time`, exactly as the
+        # observed event does -- no human description lives there.
         return [
             {
                 "type": "system",
@@ -636,7 +636,7 @@ class RalphCliTestCase(unittest.TestCase):
                 "subtype": "task_updated",
                 "session_id": session_id,
                 "task_id": task_id,
-                "patch": {"status": "killed", "end_time": 1, "description": description},
+                "patch": {"status": "killed", "end_time": 1},
             },
             {
                 "type": "system",

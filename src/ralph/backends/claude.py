@@ -48,6 +48,24 @@ Invariants:
   the unmarked-question warning stay mid-run stderr lines, but the fragment each
   quotes back is redacted and then bounded through ``protocol.bounded_quote`` so a
   warning is a bounded interruption, never the Backend's whole final message (#39).
+- The composed prompt carries an adapter-local ``BACKGROUND_TASK_DIRECTIVE`` after
+  the shared Loop protocol (H3): the Backend may launch background work but must not
+  *park* on it -- end its turn while a task is still running, expecting to be
+  re-invoked when it completes. It will not be; the session ends when the Backend
+  stops, an in-flight task is killed, and the notification never arrives. The
+  directive is Claude-adapter-local because only Claude Code has a background-task
+  runtime and the Loop protocol is outcome signalling only; the OpenCode adapter
+  never appends it. Prevention is the mechanism (H2): the directive forbids
+  abandoning, never launching.
+- When the CLI's teardown explicitly reports it killed a background task (a
+  ``system/task_updated`` whose ``patch`` marks the task ``killed``), the adapter
+  names the abandoned task on stderr, the stream the operator already watches for
+  the mid-run marker warnings (H9). Detection is that explicit report alone, never
+  inference from a task-list drain, which also fires mid-stream on an ordinary
+  completion (H7). The report is observational: it leaves the Iteration's outcome
+  and final message unchanged (H1). It is a not-yet-migrated operator-facing write
+  registered as migration debt for the Run console program (register G13/G14; the
+  terminal-ownership test names it and #36 is told to adopt it).
 - ``preflight`` returns a ``console.Deviation`` (or ``None``): when it admits the
   ``.claude/agents`` vector under ``--unsafe-allow-agents`` and otherwise clears, it
   hands back the fact so the caller states the relaxed subagent-isolation guarantee
@@ -204,6 +222,28 @@ AGENT_OPT_OUT_HINT = (
     "--unsafe-allow-agents to admit the .claude/agents directory and the "
     "settings.json 'agent' key for this run (unsafe: Ralph then cannot prove "
     "Claude subagent isolation)"
+)
+# Appended by the Claude adapter alone to every composed prompt (H3): it is
+# adapter-local, not part of the shared Loop protocol, because only Claude Code has
+# a background-task runtime and the Loop protocol is outcome signalling only. A
+# Backend may launch background work but must not *park* on it -- end its turn while
+# a task is still running, expecting to be re-invoked when the task completes. It
+# will not be: the session ends the moment the Backend stops, a task still in flight
+# is killed, and the completion notification it is waiting for is never delivered.
+# The observed failure had the Backend explicitly reasoning it would wait for that
+# notification, so the directive names the mechanism, not just the rule -- it is a
+# false belief about the runtime, not carelessness. The directive forbids
+# abandoning, never launching (#48).
+BACKGROUND_TASK_DIRECTIVE = (
+    "\n\nBackground work must finish inside the turn that launched it. You may "
+    "launch background tasks where they help (parallel review, a long survey), but "
+    "you must not end your turn while one is still running. This session ends the "
+    "moment you stop: any task still in flight is killed, and the completion "
+    "notification you were waiting for is never delivered -- waiting for it is a "
+    "false belief about this runtime, not a plan that will resume. Before you stop, "
+    "either bring the work back into the turn (wait for its result and act on it) or "
+    "cancel it and say what you left unverified, so the next iteration can pick it "
+    "up deliberately."
 )
 
 
@@ -408,6 +448,17 @@ def event_after_result_reason(per_turn_flush: bool) -> str:
     return "Claude emitted an event after the terminal result"
 
 
+def killed_task_label(task_id: str | None) -> str:
+    # Name an abandoned background task for the operator by the one identifier the
+    # observed killed-task event carries: the top-level ``task_id`` (the ``patch``
+    # holds only ``status`` and ``end_time``, so no human description is available
+    # there -- H12). The id is CLI-generated structural metadata, printed as-is like
+    # the session id in a resume command; the task's full detail stays in the
+    # retained stream. A report with no id still names that something was killed
+    # rather than staying silent.
+    return f"task {task_id}" if task_id else "an unnamed background task"
+
+
 class ClaudeTurn:
     # One turn of a Claude session: the model its init reported, and the text of
     # each of the Backend's own (non-subagent) assistant messages in order. The
@@ -429,6 +480,7 @@ class ClaudeEventResult:
         self.results: list[str] = []
         self.model_usage: list[str] = []
         self.question: str | None = None
+        self.killed_tasks: list[str | None] = []
 
     @property
     def initial_model(self) -> str | None:
@@ -457,6 +509,12 @@ class ClaudeEventResult:
             return
         event_type = event.get("type")
         subtype = event.get("subtype")
+        if event_type == "system" and subtype == "task_updated":
+            # Record an explicit killed-task report wherever it appears (H7): it is
+            # observational, changes no turn attribution, and is warned about after
+            # the Iteration is judged. Noting it before the post-result shape gate
+            # keeps detection uniform at every stream position.
+            self._note_killed_task(event)
         if self.results:
             # Shape-based rule (H4/H5), applied uniformly once results have begun
             # -- between them and after them alike, so the inter-result window is
@@ -640,6 +698,19 @@ class ClaudeEventResult:
         if self.session_id is None or value != self.session_id:
             raise RalphError("Claude stream contained inconsistent session metadata")
 
+    def _note_killed_task(self, event: dict[str, Any]) -> None:
+        # Park detection uses the CLI's explicit killed-task report -- a
+        # `task_updated` whose patch marks the task `killed` -- never inference from
+        # a task-list drain, which also fires mid-stream on an ordinary completion
+        # and would misreport it (H7). The report is observational (H1): the
+        # abandoned task is recorded here and warned about after the Iteration is
+        # judged, and changes neither the outcome nor the final message.
+        patch = event.get("patch")
+        if not isinstance(patch, dict) or patch.get("status") != "killed":
+            return
+        task_id = event.get("task_id")
+        self.killed_tasks.append(task_id if isinstance(task_id, str) and task_id else None)
+
     @property
     def fallback_models(self) -> list[str]:
         models = self.assistant_models + self.model_usage
@@ -764,7 +835,10 @@ def _consume_claude_iteration(
     thread.start()
     message = {
         "type": "user",
-        "message": {"role": "user", "content": prompt + active_protocol()},
+        "message": {
+            "role": "user",
+            "content": prompt + active_protocol() + BACKGROUND_TASK_DIRECTIVE,
+        },
         "parent_tool_use_id": None,
     }
     try:
@@ -884,6 +958,19 @@ def _consume_claude_iteration(
     # the final turn) establish that the final result is present, so `final` is
     # never None here; assert it so the marker scans below type-check.
     assert final is not None
+    for task_id in result.killed_tasks:
+        # H9: the killed-task observation emits from the adapter to stderr, matching
+        # the existing mid-run marker warnings, and is registered as migration debt
+        # (the terminal-ownership test's not-yet-migrated note names it, and #36 is
+        # told to adopt and word it under G14). It is emitted before the outcome is
+        # decided so a parked Iteration that also halts still gets its report, and it
+        # changes neither the outcome nor the final message (H1).
+        print(
+            "ralph: warning: Claude Code killed a background task still running when "
+            "the backend ended its turn, so its work was left unverified: "
+            + killed_task_label(task_id),
+            file=sys.stderr,
+        )
     explicit = explicit_needs_input(final)
     if explicit:
         # The final parent turn is authoritative for a needs-input halt.

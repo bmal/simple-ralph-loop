@@ -29,6 +29,17 @@ the concrete children ralph resolves as carrying it, so the same contract, its
 resolved facts, and its marker parser stay in one module.
 _Avoid_: prompt suffix, prompt template, system prompt
 
+**Parked turn**:
+A backend turn ended while a background task it launched is still running, on the
+false belief the session will be re-invoked when the task completes. It will not
+be: the session ends when the backend stops, the in-flight task is killed, and the
+notification never arrives, so the work is silently abandoned. The Claude adapter
+prevents it with an adapter-local prompt directive (never launching is fine — only
+abandoning is forbidden) and, when the CLI reports it killed a task anyway, names
+the abandoned task on stderr without changing the iteration's outcome.
+_Avoid_: continuation turn (reserved for a task delivered while the turn is open),
+dropped task
+
 **Interactive-only child**:
 A child issue carrying the configured label (default `may-ask-owner`) that
 embeds an owner decision and must be worked in an interactive session. Before the
