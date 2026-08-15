@@ -53,7 +53,10 @@ Invariants:
 - The run's facts go to the injected ``RunConsole`` as value objects, never as text
   the loop worded itself (register G14): ``RunSettings`` for the header, an
   ``IterationOutcome`` for each Iteration's outcome block, and a ``RunSummary`` for
-  the terminal summary. The header is emitted once the run directory exists and
+  the terminal summary. The same console is injected into ``execute_iteration`` as the
+  narrow Observation sink (register G15), so the Backend reports live progress through
+  it while the loop is blocked in that call; the loop passes the console as an
+  abstraction and never itself observes. The header is emitted once the run directory exists and
   before host isolation is established, so the evidence path is on screen before any
   budget is spent or any failure reported. Each Iteration opens with a console rule
   and closes with its outcome block; the Trust boundary and the resolved
@@ -391,7 +394,10 @@ def run_protected(
             iteration_started_at = datetime.now(timezone.utc)
             iteration_started = iteration_started_at.isoformat()
             # A started session consumes its slot whatever the outcome; the loop
-            # never restarts a slot itself.
+            # never restarts a slot itself. The injected console doubles as the
+            # narrow Observation sink (register G15): the Backend reports live
+            # progress through it while the loop is blocked in this call, and the
+            # loop still drives only the Protocol and cannot tell the two apart.
             outcome, session_id, concluding_message = backend.execute_iteration(
                 worktree,
                 iteration_dir,
@@ -400,6 +406,7 @@ def run_protected(
                 env,
                 args.timeout,
                 sandbox_profile,
+                observe=console,
             )
             iterations.append(
                 {

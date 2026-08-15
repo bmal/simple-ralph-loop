@@ -35,7 +35,10 @@ Invariants:
 - ``execute_iteration`` returns the verified final message alongside the outcome and
   session id, so the Run console can show it in the Iteration's outcome block; it is
   the same text the completion/needs-input markers were read from, returned raw, and
-  the console truncates it for display only (register G14).
+  the console truncates it for display only (register G14). It accepts the injected
+  ``ObservationSink`` to keep the Backend Protocol signature uniform, but does not yet
+  emit Observations: reporting the same progress the Claude adapter does, and
+  migrating its own mid-run warning onto that sink, is a later ticket (#41).
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
@@ -60,7 +63,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from ..console import OPENCODE_AGENTS_DEVIATION, Deviation
 from ..environment import BACKEND_TIMEOUT_MS, clean_environment
@@ -83,6 +86,9 @@ from ..protocol import (
     inferred_needs_input,
 )
 from ..redaction import redact
+
+if TYPE_CHECKING:
+    from . import ObservationSink
 
 
 MIN_OPENCODE_VERSION = (1, 17, 20)
@@ -526,7 +532,12 @@ def execute_iteration(
     env: dict[str, str],
     timeout: float,
     sandbox_profile: Path | None = None,
+    observe: "ObservationSink | None" = None,
 ) -> tuple[str, str | None, str | None]:
+    # ``observe`` completes the Backend Protocol signature so the Loop drives both
+    # adapters identically; this adapter does not yet emit Observations (a later
+    # ticket #41 makes it report the same progress the Claude adapter does).
+    del observe
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = session_argv(

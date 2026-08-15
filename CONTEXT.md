@@ -85,6 +85,17 @@ the rule, and each is migrated in turn — and `cli` is the only module that con
 one.
 _Avoid_: log, output, UI, stderr (the stream it happens to write to)
 
+**Observation**:
+A single fact a Backend adapter emits about a running Iteration through the
+narrow one-method sink the Loop injects into `execute_iteration`, over a closed
+set of frozen value types — the orchestrator's tool use and live context gauge,
+the live subagent roster, and the mid-run warnings the adapter used to print
+itself. The adapter emits facts and the Run console decides wording and rendering,
+so neither the Loop nor an adapter constructs operator-facing text; a new kind of
+Observation is a new value type, never a wider interface, so the seam stays one
+method while what rides it grows.
+_Avoid_: event (reserved for a Backend's own stream events), log, message, progress bar
+
 **Trust boundary**:
 The set of properties ralph proves before spending budget: subscription-only
 authentication, customization isolation, and host isolation. For a Claude session

@@ -24,10 +24,20 @@ Invariants:
   same text the completion/needs-input markers were read from — which the Loop hands
   to the Run console for the Iteration's outcome block. The message is a raw fact, not
   formatted text; the console truncates it for display only (register G14).
+- ``execute_iteration`` also receives an ``ObservationSink``: the narrow one-method
+  seam (``observe``) declared here alongside the Backend Protocol and injected by the
+  Loop, over the closed set of frozen ``console.Observation`` value types (register
+  G15). The adapter emits facts through it -- tool use, orchestrator context, the
+  live subagent roster, and the mid-run warnings it used to print itself -- and the
+  Run console words and renders them. This is a value type, not a wider interface: a
+  new Observation is a new type, never a new method, so the adapters keep seeing one.
+  The default ``None`` sink is a no-op, so an adapter that emits nothing (or a caller
+  that injects none) still runs.
 
 Depends on / must not know: the two adapter modules (imported so the registry can
-name them) and ``console`` (only for the ``Deviation`` value type ``preflight``
-returns). It must not grow backend-specific logic — that belongs in the adapters.
+name them) and ``console`` (for the ``Deviation`` value type ``preflight`` returns
+and the ``Observation`` union the sink carries). It must not grow backend-specific
+logic — that belongs in the adapters.
 
 See also: ``backends.opencode`` / ``backends.claude`` (the adapters), ``loop`` and
 ``cli`` (resolve once, then drive the Backend through the five names), ``launch``
@@ -39,7 +49,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
-from ..console import Deviation
+from ..console import Deviation, Observation
 from . import claude, opencode
 
 
@@ -47,6 +57,15 @@ DEFAULT_MODELS = {
     "claude": "claude-opus-4-8",
     "opencode": "openai/gpt-5.6-sol",
 }
+
+
+class ObservationSink(Protocol):
+    """The narrow one-method seam the Backend adapters emit progress through
+    (register G14/G15). Declared alongside the Backend Protocol because it is
+    injected into ``execute_iteration``; the concrete sink is the Run console, which
+    the composition root injects, but the adapters depend only on this one method."""
+
+    def observe(self, observation: Observation) -> None: ...
 
 
 class Backend(Protocol):
@@ -69,6 +88,7 @@ class Backend(Protocol):
         env: dict[str, str],
         timeout: float,
         sandbox_profile: Path | None = ...,
+        observe: ObservationSink | None = ...,
     ) -> tuple[str, str | None, str | None]: ...
 
     def resume_argv(self, worktree: Path, model: str, session: str) -> list[str]: ...

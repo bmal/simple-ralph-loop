@@ -58,6 +58,28 @@ Invariants:
   ``ralph: `` prefix, but through the same redaction choke point (register G17). The
   Launch chain, not the console, produces the recovery commands ``operator_help`` and
   ``budget_continue`` render (register G14).
+- ``observe`` is the narrow one-method Observation sink the Backend adapters drive
+  during an Iteration (register G14/G15). It carries a closed set of frozen value
+  types -- progress facts (``ToolObserved``, ``ContextObserved``, ``SubagentsObserved``)
+  and the mid-run warnings an adapter used to print itself (``MarkerWithdrawn``,
+  ``UnmarkedQuestion``, ``KilledTask``); the adapter emits facts and the console
+  decides wording, so the load-bearing ``withdrew it``, ``unmarked operator-directed``,
+  and the killed-task phrase live here now, not in the adapter (register G19). The
+  progress facts feed a single status line that repaints in place on a terminal
+  (register G3/G4): Iteration and budget, the Iteration's elapsed time, the current
+  or last tool, the tool count, the orchestrator's live context size, and the live
+  subagent count. Its ticking elapsed clock is the only motion -- a background ticker
+  repaints it on a cadence so a long silent tool call still advances the clock, and a
+  frozen clock therefore means stalled rather than a spinner spinning over a hang.
+  The line is read against the terminal's live width and never wraps: it drops fields
+  right-to-left (``render_status``) and clips rather than folding. It is painted only
+  once the Iteration has produced at least one Observation, so an Iteration that emits
+  none never paints one. The status line is erased before any other operator line
+  prints and redrawn after, so a warning or a header fact never corrupts it. Off a
+  terminal there is no in-place line: the ticker degrades to slow append-only
+  heartbeat lines carrying the same facts and no ANSI, so a piped log stays clean
+  (register G3/G11). The status apparatus uses only ``\\r`` and spaces to repaint, never
+  cursor-control escapes, so ``NO_COLOR`` on a terminal still emits no escape at all.
 
 Depends on / must not know: ``redaction`` (functions only, never the active-redactor
 global). It must not know how a run is driven, which Backend it holds, or what any
@@ -72,6 +94,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import threading
+import time
 from typing import Protocol, TextIO
 
 from .redaction import redact
@@ -224,10 +248,132 @@ class OperatorHelp:
     continue_command: str | None = None
 
 
+# The closed set of Observation value types the narrow sink carries (register
+# G14/G15). Each is a frozen fact an adapter emits during an Iteration; the console
+# decides what to do with it. A new Observation is a new value type here, not a wider
+# interface, so the seam the adapters see stays one method while behaviour grows.
+@dataclass(frozen=True)
+class ToolObserved:
+    """The orchestrator reached for a tool. ``name`` is the tool the status line
+    shows as the current or last tool, and each one increments the tool count."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class ContextObserved:
+    """The orchestrator's live prompt size, in absolute tokens (register G5): never
+    a percentage, never cumulative across the run, never inclusive of the separate
+    subagent windows. The per-Backend arithmetic that produced it lives in the
+    adapter; the console only shows the latest gauge."""
+
+    tokens: int
+
+
+@dataclass(frozen=True)
+class SubagentsObserved:
+    """The live subagent roster -- the descriptions of the background subagents in
+    flight. The status line shows the count, which is what explains a silent
+    orchestrator waiting on them; the descriptions leave room for a later view."""
+
+    roster: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MarkerWithdrawn:
+    """The Backend raised a needs-input marker in a message other than the one the
+    Iteration was judged on, then spoke past it: a question it withdrew. ``quote`` is
+    the raw fragment; the console redacts, bounds, and words it (register G17/G19)."""
+
+    quote: str
+
+
+@dataclass(frozen=True)
+class UnmarkedQuestion:
+    """The Backend's final message ended on an operator-directed question with no
+    marker: a low-confidence signal the run warns on and continues past. ``quote`` is
+    the raw fragment the console redacts, bounds, and words (register G17/G19)."""
+
+    quote: str
+
+
+@dataclass(frozen=True)
+class KilledTask:
+    """The Backend's runtime reported it killed a background task the Backend left
+    running when it ended its turn. ``task_id`` is the CLI-generated identifier the
+    console names the abandoned task by, or ``None`` when the report carried none."""
+
+    task_id: str | None
+
+
+Observation = (
+    ToolObserved
+    | ContextObserved
+    | SubagentsObserved
+    | MarkerWithdrawn
+    | UnmarkedQuestion
+    | KilledTask
+)
+
+
+# The status line's fields, in left-to-right priority order (register G4). It drops
+# from the right as the window narrows, so the Iteration and elapsed always survive
+# and the subagent count is the first to go.
+STATUS_SEPARATOR = " · "
+# How often the background ticker repaints the in-place status line so its elapsed
+# clock keeps ticking through a long silent tool call -- the one motion that
+# distinguishes a live run from a hang (register G3).
+STATUS_TICK_SECONDS = 1.0
+# Off a terminal there is no in-place line to keep smooth, so the ticker degrades to
+# *slow* append-only heartbeats at this far coarser cadence (register G3): a live sign
+# for a piped log without one line a second flooding it. A run shorter than one
+# interval emits no heartbeat at all, which is fine -- a short run needs no liveness.
+HEARTBEAT_SECONDS = 30.0
+
+
+def render_status(
+    iteration: int,
+    iterations: int,
+    elapsed_seconds: float,
+    tool: str | None,
+    tool_count: int,
+    context_tokens: int | None,
+    subagents: int,
+    width: int | None,
+) -> str:
+    """Render the status line, dropping fields right-to-left until it fits *width*
+    and never wrapping (register G3/G4). A stream with no width (anything that is not
+    a terminal) keeps every field. The Iteration and elapsed are never dropped; when
+    even they do not fit the line is clipped rather than folded onto a second row."""
+    fields = [f"iteration {iteration}/{iterations}", format_duration(elapsed_seconds)]
+    if tool:
+        fields.append(tool)
+    fields.append(f"{tool_count} tool{'' if tool_count == 1 else 's'}")
+    if context_tokens is not None:
+        fields.append(f"context {context_tokens} tokens")
+    fields.append(f"{subagents} subagent{'' if subagents == 1 else 's'}")
+    # Drop from the right (subagents first) until the prefixed line fits the window.
+    while len(fields) > 2 and width is not None and (
+        len(PREFIX) + len(STATUS_SEPARATOR.join(fields)) > width
+    ):
+        fields.pop()
+    text = PREFIX + STATUS_SEPARATOR.join(fields)
+    if width is not None and len(text) > width:
+        # Even the Iteration and elapsed overflow a very narrow window: clip rather
+        # than fold, so the line still occupies exactly one row.
+        text = text[:width]
+    return text
+
+
 class RunConsole(Protocol):
     """The operator-facing seam. It widens as later tickets migrate their emit
     sites; it is structural, matched with no runtime class or ABC machinery, in the
-    style of the Backend Protocol."""
+    style of the Backend Protocol. ``observe`` is the narrow one-method Observation
+    sink (register G15) the wide interface also carries, so the composition root can
+    inject the same console into ``execute_iteration`` as the sink; the Backend
+    adapters see only that one method, typed as ``backends.ObservationSink``."""
+
+    def observe(self, observation: Observation) -> None: ...
 
     def run_started(self, settings: RunSettings) -> None: ...
 
@@ -306,6 +452,70 @@ class StreamRunConsole:
 
     def __init__(self, stream: TextIO) -> None:
         self._stream = stream
+        # All writes -- the main thread's operator lines and the ticker's repaints --
+        # go through one re-entrant lock so a repaint never interleaves with a line.
+        self._lock = threading.RLock()
+        # The status line's live state, reset each Iteration. ``_active`` spans an
+        # Iteration; ``_established`` turns on with the first Observation, gating the
+        # very first paint so an Iteration that emits none never shows one;
+        # ``_painted`` records whether an in-place status currently sits at the cursor.
+        self._status_active = False
+        self._status_established = False
+        self._status_painted = False
+        self._painted_width = 0
+        self._iteration = 0
+        self._iterations = 0
+        self._tool: str | None = None
+        self._tool_count = 0
+        self._context: int | None = None
+        self._subagents = 0
+        self._iteration_start: float | None = None
+        self._last_heartbeat = 0.0
+        self._ticker_thread: threading.Thread | None = None
+        self._ticker_stop: threading.Event | None = None
+
+    def observe(self, observation: Observation) -> None:
+        # The narrow sink the Backend adapters drive. Progress facts update the status
+        # line's fields and repaint it; the migrated warnings are worded and emitted
+        # as whole operator lines, erasing and redrawing the status around themselves
+        # like any other interruption (register G14/G15).
+        with self._lock:
+            if isinstance(observation, ToolObserved):
+                self._tool = observation.name
+                self._tool_count += 1
+                self._establish_locked()
+            elif isinstance(observation, ContextObserved):
+                self._context = observation.tokens
+                self._establish_locked()
+            elif isinstance(observation, SubagentsObserved):
+                self._subagents = len(observation.roster)
+                self._establish_locked()
+            elif isinstance(observation, MarkerWithdrawn):
+                self._message(
+                    "warning",
+                    "warning: the backend requested operator input earlier in the "
+                    "session but its final message withdrew it; continuing to the next "
+                    f"iteration: {summarize_message(redact(observation.quote))}",
+                )
+            elif isinstance(observation, UnmarkedQuestion):
+                self._message(
+                    "warning",
+                    "warning: final message ended on an unmarked operator-directed "
+                    "question; continuing to the next iteration (no "
+                    "<promise>NEEDS_INPUT</promise> marker and no question tool used): "
+                    f"{summarize_message(redact(observation.quote))}",
+                )
+            elif isinstance(observation, KilledTask):
+                label = (
+                    f"task {observation.task_id}"
+                    if observation.task_id
+                    else "an unnamed background task"
+                )
+                self._message(
+                    "warning",
+                    "warning: the backend killed a background task still running when "
+                    "it ended its turn, so its work was left unverified: " + label,
+                )
 
     def run_started(self, settings: RunSettings) -> None:
         self._fact("backend", f"{settings.backend}, model {settings.model}")
@@ -349,6 +559,10 @@ class StreamRunConsole:
         self._line("warning", DEVIATION_TEXTS[warning.kind])
 
     def iteration_started(self, number: int, iterations: int) -> None:
+        # Open the Iteration's status lifecycle: reset the fields and start the
+        # elapsed clock. The status line itself is not painted until the first
+        # Observation establishes it, so an Iteration that emits none never shows one.
+        self._begin_iteration(number, iterations)
         # A rule opening the Iteration (register G2/G9): a full-width divider on a
         # terminal, embedding the number and the budget; a plain labelled line when
         # the stream has no width, so a piped log stays readable without the fill.
@@ -370,6 +584,9 @@ class StreamRunConsole:
         self._fact("trust boundary", "proven: " + ", ".join(properties))
 
     def iteration_finished(self, outcome: IterationOutcome) -> None:
+        # The Iteration is over: stop the ticker and erase any painted status line
+        # before the outcome block prints, so nothing redraws a stale status below it.
+        self._finalize()
         session = outcome.session_id or "no session id"
         self._fact(
             f"iteration {outcome.number} of {outcome.iterations}",
@@ -382,10 +599,16 @@ class StreamRunConsole:
             self._content(summarize_message(outcome.concluding_message))
 
     def run_finished(self, summary: RunSummary) -> None:
+        # A terminal path may arrive without an ``iteration_finished`` (a failure mid
+        # session), so stop the ticker and erase any painted status here too before
+        # the summary prints.
+        self._finalize()
         # Ring the bell on a terminal only, so an operator who walked away is called
         # back on every terminal outcome and a piped log carries no control character.
         if self._is_terminal():
-            self._stream.write(BELL)
+            with self._lock:
+                self._stream.write(BELL)
+                self._stream.flush()
         self._fact(
             "outcome", OUTCOME_HEADLINES.get(summary.outcome, f"run ended: {summary.outcome}")
         )
@@ -459,6 +682,7 @@ class StreamRunConsole:
         )
 
     def failed(self, message: str) -> None:
+        self._finalize()
         self._message("failure", message)
 
     def _fact(self, label: str, value: str, *, keep_tail: bool = False) -> None:
@@ -511,7 +735,132 @@ class StreamRunConsole:
                 prefix = f"{PALETTE[prefix_role]}{prefix}{RESET}"
             if value and PALETTE[value_role]:
                 value = f"{PALETTE[value_role]}{value}{RESET}"
-        self._stream.write(prefix + value + "\n")
+        self._emit_raw(prefix + value)
+
+    def _emit_raw(self, text: str) -> None:
+        # Every operator line goes through here so the status line is erased before it
+        # and redrawn after it, and so the ticker cannot interleave a repaint with it
+        # (register G3). The erase and redraw are no-ops when nothing is painted or the
+        # stream is not a terminal, so an ordinary piped log is unchanged.
+        with self._lock:
+            self._erase_status_locked()
+            self._stream.write(text + "\n")
+            self._stream.flush()
+            self._paint_status_locked()
+
+    def _begin_iteration(self, number: int, iterations: int) -> None:
+        with self._lock:
+            self._status_active = True
+            self._status_established = False
+            self._iteration = number
+            self._iterations = iterations
+            self._tool = None
+            self._tool_count = 0
+            self._context = None
+            self._subagents = 0
+            self._iteration_start = time.monotonic()
+
+    def _establish_locked(self) -> None:
+        # The first Observation of an Iteration turns the status line on and starts
+        # the ticker that keeps its clock moving; later Observations only repaint it.
+        if not self._status_established:
+            self._status_established = True
+            # Anchor the heartbeat clock so the first append-only heartbeat is a full
+            # slow interval away, never one the instant progress begins.
+            self._last_heartbeat = time.monotonic()
+            self._start_ticker_locked()
+        if self._is_terminal():
+            self._erase_status_locked()
+            self._paint_status_locked()
+
+    def _finalize(self) -> None:
+        # End the status lifecycle: erase any painted line and stop the ticker. Join
+        # the ticker outside the lock, since the ticker takes the lock to repaint.
+        with self._lock:
+            self._status_active = False
+            self._status_established = False
+            self._erase_status_locked()
+            stop, thread = self._ticker_stop, self._ticker_thread
+            self._ticker_stop = self._ticker_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=2)
+
+    def _start_ticker_locked(self) -> None:
+        if self._ticker_thread is not None:
+            return
+        self._ticker_stop = threading.Event()
+        self._ticker_thread = threading.Thread(
+            target=self._run_ticker, args=(self._ticker_stop,), daemon=True
+        )
+        self._ticker_thread.start()
+
+    def _run_ticker(self, stop: threading.Event) -> None:
+        while not stop.wait(STATUS_TICK_SECONDS):
+            try:
+                self._tick()
+            except (ValueError, OSError):
+                # The stream was closed under us; stop rather than raising on a
+                # daemon thread the run no longer depends on.
+                return
+
+    def _tick(self) -> None:
+        with self._lock:
+            if not (self._status_active and self._status_established):
+                return
+            if self._is_terminal():
+                self._erase_status_locked()
+                self._paint_status_locked()
+            else:
+                # No in-place line off a terminal: the clock degrades to a *slow*
+                # append-only heartbeat carrying the same facts and no ANSI (G3/G11).
+                # The ticker still wakes each second for a terminal's smooth clock, so
+                # throttle the heartbeat to its own coarser cadence here.
+                now = time.monotonic()
+                if now - self._last_heartbeat >= HEARTBEAT_SECONDS:
+                    self._last_heartbeat = now
+                    self._stream.write(redact(self._status_text()) + "\n")
+                    self._stream.flush()
+
+    def _status_text(self) -> str:
+        elapsed = (
+            time.monotonic() - self._iteration_start
+            if self._iteration_start is not None
+            else 0.0
+        )
+        return render_status(
+            self._iteration,
+            self._iterations,
+            elapsed,
+            self._tool,
+            self._tool_count,
+            self._context,
+            self._subagents,
+            self._width(),
+        )
+
+    def _paint_status_locked(self) -> None:
+        # Repaint the in-place status line, but only on a terminal, only while the
+        # Iteration is live, and only once an Observation has established it. Uses a
+        # carriage return, never a cursor-control escape, so ``NO_COLOR`` on a terminal
+        # still emits no escape; colour is added only when colour is enabled.
+        if not (self._status_active and self._status_established and self._is_terminal()):
+            return
+        text = self._status_text()
+        self._painted_width = len(text)
+        painted = f"{PALETTE['chrome']}{text}{RESET}" if self._colour() else text
+        self._stream.write("\r" + painted)
+        self._status_painted = True
+        self._stream.flush()
+
+    def _erase_status_locked(self) -> None:
+        if not self._status_painted:
+            return
+        # Overwrite the painted characters with spaces and return to column zero, so
+        # the next line starts clean without any cursor-control escape.
+        self._stream.write("\r" + " " * self._painted_width + "\r")
+        self._status_painted = False
         self._stream.flush()
 
     def _is_terminal(self) -> bool:

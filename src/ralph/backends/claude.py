@@ -51,11 +51,24 @@ Invariants:
 - Marker semantics are per *message*, not per turn: the message the Iteration is
   judged on decides completion and the needs-input halt, and a needs-input marker
   in any other message of the Backend's own — an earlier turn's or an earlier
-  message of the final turn's — is one the Backend withdrew, so it warns on stderr
-  and continues rather than costing the Iteration. That withdrawn-marker warning and
-  the unmarked-question warning stay mid-run stderr lines, but the fragment each
-  quotes back is redacted and then bounded through ``protocol.bounded_quote`` so a
-  warning is a bounded interruption, never the Backend's whole final message (#39).
+  message of the final turn's — is one the Backend withdrew, so it warns and
+  continues rather than costing the Iteration. The withdrawn-marker warning and the
+  unmarked-question warning are emitted as facts (the raw fragment) through the
+  Observation sink -- ``console.MarkerWithdrawn`` and ``console.UnmarkedQuestion`` --
+  and the Run console redacts, bounds, and words them, so this adapter constructs no
+  operator-facing text and the fragment stays a bounded interruption rather than the
+  Backend's whole final message (#39, register G14/G17).
+- Progress is emitted as Observations through the injected sink during the stream
+  (register G4/G5, #40), so the status line can show that the run is alive and what
+  it is doing without this adapter writing to a terminal. The orchestrator's own
+  (null-origin) assistant events emit its tool use (``ToolObserved``) and its live
+  context gauge (``ContextObserved``) -- the sum of the input, cache-read, and
+  cache-creation tokens Claude reports on that event, this Backend's arithmetic for
+  the shared vocabulary, absent when the event carries no usage; a subagent's window
+  is separate and never counted. A ``background_tasks_changed`` for the established
+  session emits the live subagent roster (``SubagentsObserved``), whose count is what
+  explains a silent orchestrator. The Backend feed itself (the message text and the
+  bracketed tool markers) stays on stdout, a later ticket's migration.
 - The composed prompt carries an adapter-local ``BACKGROUND_TASK_DIRECTIVE`` after
   the shared Loop protocol (H3): the Backend may launch background work but must not
   *park* on it -- end its turn while a task is still unresolved, expecting to be
@@ -71,19 +84,19 @@ Invariants:
   forbids abandoning, never launching.
 - When the CLI's teardown explicitly reports it killed a background task (a
   ``system/task_updated`` whose ``patch`` marks the task ``killed``), the adapter
-  names the abandoned task on stderr, the stream the operator already watches for
-  the mid-run marker warnings (H9). Detection is that explicit report alone, never
-  inference from a task-list drain, which also fires mid-stream on an ordinary
-  completion (H7). The observation must also carry the *established* session id: a
-  foreign, missing, or empty id is a crossed stream and names no task, the same
-  class #49 tightened for assistant and licensing events (#50 I6); a duplicate
-  report of a task already recorded fabricates no second one. Once accepted, the
-  warning is delivered on every terminal path -- an ordinary completion and a
-  contract-failure handoff alike -- so a halt never hides the work the CLI said it
-  abandoned (#50 I7). The report is observational: it leaves the Iteration's
-  outcome and final message unchanged (H1). It is a not-yet-migrated operator-facing
-  write registered as migration debt for the Run console program (register G13/G14;
-  the terminal-ownership test names it and #36 is told to adopt it).
+  emits the abandoned task's id as a ``console.KilledTask`` Observation, and the Run
+  console words the warning on the stream the operator already watches (H9, #40).
+  Detection is that explicit report alone, never inference from a task-list drain,
+  which also fires mid-stream on an ordinary completion (H7). The observation must
+  also carry the *established* session id: a foreign, missing, or empty id is a
+  crossed stream and names no task, the same class #49 tightened for assistant and
+  licensing events (#50 I6); a duplicate report of a task already recorded fabricates
+  no second one. Once accepted, the warning is delivered on every terminal path -- an
+  ordinary completion and a contract-failure handoff alike -- so a halt never hides
+  the work the CLI said it abandoned (#50 I7). The report is observational: it leaves
+  the Iteration's outcome and final message unchanged (H1). Emitting it as an
+  Observation is the migration register G13/G14 called for: the console, not this
+  adapter, words the operator-facing line.
 - ``preflight`` returns a ``console.Deviation`` (or ``None``): when it admits the
   ``.claude/agents`` vector under ``--unsafe-allow-agents`` and otherwise clears, it
   hands back the fact so the caller states the relaxed subagent-isolation guarantee
@@ -116,10 +129,12 @@ Invariants:
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
 ``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``,
-``preflight``, and ``console`` (only for the ``Deviation`` value type ``preflight``
-returns — never a console instance). It must not know how the Loop schedules
-Iterations; the Loop must not know these helpers exist beyond the five Backend
-interface names.
+``preflight``, and ``console`` (the ``Deviation`` value type ``preflight`` returns
+and the frozen Observation value types it emits through the injected
+``ObservationSink`` — never a console instance, and it words none of them). It must
+not know how the Loop schedules Iterations, nor how the Run console renders an
+Observation; the Loop must not know these helpers exist beyond the Backend interface
+names.
 
 See also: ``backends`` (registry and the five-name Protocol), ``backends.opencode``
 (twin adapter), ``launch`` (``session_argv``, the wrapped argv), ``protocol``
@@ -132,11 +147,20 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import threading
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from ..console import CLAUDE_AGENTS_DEVIATION, Deviation
+from ..console import (
+    CLAUDE_AGENTS_DEVIATION,
+    ContextObserved,
+    Deviation,
+    KilledTask,
+    MarkerWithdrawn,
+    Observation,
+    SubagentsObserved,
+    ToolObserved,
+    UnmarkedQuestion,
+)
 from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import (
     HandoffError,
@@ -149,13 +173,15 @@ from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
     active_protocol,
-    bounded_quote,
     explicit_needs_input,
     extract_question,
     has_completion_marker,
     inferred_needs_input,
 )
 from ..redaction import redact
+
+if TYPE_CHECKING:
+    from . import ObservationSink
 
 
 MIN_CLAUDE_VERSION = (2, 1, 208)
@@ -480,15 +506,23 @@ def event_after_result_reason(per_turn_flush: bool) -> str:
     return "Claude emitted an event after the terminal result"
 
 
-def killed_task_label(task_id: str | None) -> str:
-    # Name an abandoned background task for the operator by the one identifier the
-    # observed killed-task event carries: the top-level ``task_id`` (the ``patch``
-    # holds only ``status`` and ``end_time``, so no human description is available
-    # there -- H12). The id is CLI-generated structural metadata, printed as-is like
-    # the session id in a resume command; the task's full detail stays in the
-    # retained stream. A report with no id still names that something was killed
-    # rather than staying silent.
-    return f"task {task_id}" if task_id else "an unnamed background task"
+def orchestrator_context(usage: Any) -> int | None:
+    # The orchestrator's live context size for the status gauge (register G5): the
+    # sum of the input, cache-read, and cache-creation tokens Claude reports on its
+    # own assistant event. This is Claude's arithmetic; the OpenCode adapter owns a
+    # different sum. Returns None when the event carries no usage (nothing to show),
+    # so a stream without token metadata simply leaves the gauge blank rather than
+    # asserting zero.
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    seen = False
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            total += value
+            seen = True
+    return total if seen else None
 
 
 class ClaudeTurn:
@@ -502,7 +536,7 @@ class ClaudeTurn:
 
 
 class ClaudeEventResult:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, observe: "ObservationSink | None" = None) -> None:
         self.expected_model = model
         self.session_id: str | None = None
         self.turns: list[ClaudeTurn] = []
@@ -513,6 +547,15 @@ class ClaudeEventResult:
         self.model_usage: list[str] = []
         self.question: str | None = None
         self.killed_tasks: list[str | None] = []
+        # The narrow Observation sink the Loop injects (the Run console). Progress
+        # facts and the migrated warnings are emitted through it so this adapter
+        # constructs no operator-facing text of its own (register G14). ``None`` is a
+        # no-op, so the accumulator still runs when no sink is injected.
+        self._observe = observe
+
+    def emit(self, observation: Observation) -> None:
+        if self._observe is not None:
+            self._observe.observe(observation)
 
     @property
     def initial_model(self) -> str | None:
@@ -604,6 +647,18 @@ class ClaudeEventResult:
             # crossed stream that must not open the multi-turn relaxation (#49).
             if self.turns and event.get("session_id") == self.session_id:
                 self.background_seen = True
+            if self.session_id is not None and event.get("session_id") == self.session_id:
+                # The live subagent roster, emitted for the established session only:
+                # a foreign id is a crossed stream and names no subagents (#49/#50 I6).
+                # The status line shows the count, which is what explains a silent
+                # orchestrator waiting on background work.
+                tasks = event.get("tasks")
+                roster = tuple(
+                    str(task.get("description") or task.get("task_id") or "subagent")
+                    for task in tasks
+                    if isinstance(task, dict)
+                ) if isinstance(tasks, list) else ()
+                self.emit(SubagentsObserved(roster))
             return
         if event_type == "system" and subtype == "init":
             self._accept_init(event)
@@ -708,6 +763,14 @@ class ClaudeEventResult:
         # markers, so a subagent speaking last is never mistaken for the answer;
         # the subagent's output is still printed and retained as evidence.
         is_backend = event.get("parent_tool_use_id") is None
+        if is_backend:
+            # The orchestrator's live context gauge, emitted from its own events only
+            # (a subagent's window is separate, register G5). The per-Backend
+            # arithmetic lives here: Claude's is the sum of the input, cache-read, and
+            # cache-creation tokens this event reports. Absent usage emits nothing.
+            context = orchestrator_context(message.get("usage"))
+            if context is not None:
+                self.emit(ContextObserved(context))
         # Each Claude stream-json assistant event carries a complete message
         # (there are no incremental text deltas without partial-message mode),
         # so print each part on its own line: text as a paragraph, tool use as a
@@ -728,6 +791,11 @@ class ClaudeEventResult:
                     # The native question tool halts wherever it appears, whether
                     # the Backend or a subagent reached for it.
                     self.question = extract_question(part.get("input")) or "Claude attempted to ask a question."
+                if is_backend:
+                    # Report the orchestrator's tool use as an Observation so the
+                    # status line shows the current tool and a running tool count
+                    # (register G4). A subagent's tool use is left to the roster count.
+                    self.emit(ToolObserved(name if isinstance(name, str) and name else "tool"))
                 print(redact(f"[{name if isinstance(name, str) and name else 'tool'}]"), flush=True)
         text = "".join(texts)
         if text and is_backend and self.turns:
@@ -840,6 +908,7 @@ def execute_iteration(
     env: dict[str, str],
     timeout: float,
     sandbox_profile: Path | None = None,
+    observe: "ObservationSink | None" = None,
 ) -> tuple[str, str | None, str | None]:
     # Confine the Claude session under Ralph's generated profile via the shared
     # `session_argv` wrap (register D6/D13): `caffeinate -im sandbox-exec -f
@@ -870,7 +939,7 @@ def execute_iteration(
         ],
         sandbox_profile,
     )
-    result = ClaudeEventResult(model)
+    result = ClaudeEventResult(model, observe)
     try:
         process = subprocess.Popen(
             args,
@@ -908,20 +977,15 @@ def execute_iteration(
 def report_killed_tasks(result: ClaudeEventResult) -> None:
     # I7/H9: an accepted same-session explicit killed-task report is delivered to
     # the operator on every terminal path -- an ordinary completion and a
-    # contract-failure handoff alike -- before the caller prints its outcome, so a
+    # contract-failure handoff alike -- before the caller reports its outcome, so a
     # halt never hides work the CLI said it abandoned (#50 finding 5). Attribution
     # already required the established session id (`_note_killed_task`, I6); this
     # only reports what was accepted. It is observational and changes neither the
-    # Iteration's outcome nor its final message (H1). Still a not-yet-migrated
-    # operator-facing write, registered as Run console migration debt (G13/G14; the
-    # terminal-ownership test names it and #36 is told to adopt and word it).
+    # Iteration's outcome nor its final message (H1). The report is a fact (the task
+    # id) emitted through the Observation sink; the Run console words the warning and
+    # erases the status line around it (register G14, #40).
     for task_id in result.killed_tasks:
-        print(
-            "ralph: warning: Claude Code killed a background task still running when "
-            "the backend ended its turn, so its work was left unverified: "
-            + killed_task_label(task_id),
-            file=sys.stderr,
-        )
+        result.emit(KilledTask(task_id))
 
 
 def _consume_claude_iteration(
@@ -1098,25 +1162,18 @@ def _consume_claude_iteration(
         if withdrawn:
             break
     if withdrawn:
-        # A bounded interruption, not an outlet for the whole final message: the
-        # fragment is redacted, then collapsed and capped for display (issue #39).
-        print(
-            "ralph: warning: the backend requested operator input earlier in the "
-            "session but its final message withdrew it; continuing to the next "
-            f"iteration: {bounded_quote(redact(withdrawn))}",
-            file=sys.stderr,
-        )
+        # A withdrawn question: the fact (the raw fragment) is emitted through the
+        # Observation sink, and the Run console redacts, bounds, and words it into a
+        # bounded interruption -- never an outlet for the whole final message (#39,
+        # register G14/G17). The retained stream still holds the fragment in full.
+        result.emit(MarkerWithdrawn(withdrawn))
     inferred = inferred_needs_input(final)
     if inferred:
         # An unmarked concluding question is a low-confidence signal; the loop must
-        # not take the irreversible operator-halt on a guess. Surface it and let the
-        # next iteration re-derive from the tracker.
-        print(
-            "ralph: warning: final message ended on an unmarked operator-directed "
-            "question; continuing to the next iteration (no <promise>NEEDS_INPUT</promise> "
-            f"marker and no question tool used): {bounded_quote(redact(inferred))}",
-            file=sys.stderr,
-        )
+        # not take the irreversible operator-halt on a guess. Emit the fact and let
+        # the Run console word the warning; the next iteration re-derives from the
+        # tracker (register G14).
+        result.emit(UnmarkedQuestion(inferred))
     complete = has_completion_marker(final)
     # The concluding message rides back with the outcome so the Run console can show
     # it in the Iteration's outcome block; it is the same final message the marker was

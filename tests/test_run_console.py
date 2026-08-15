@@ -13,6 +13,8 @@ import ast
 import io
 import os
 from pathlib import Path
+import re
+import time
 import unittest
 from unittest import mock
 
@@ -21,12 +23,19 @@ from ralph.console import (
     CLAUDE_AGENTS_DEVIATION,
     NO_SANDBOX_DEVIATION,
     OPENCODE_AGENTS_DEVIATION,
+    ContextObserved,
     Deviation,
     IterationOutcome,
+    KilledTask,
+    MarkerWithdrawn,
     OperatorHelp,
     RunSettings,
     RunSummary,
     StreamRunConsole,
+    SubagentsObserved,
+    ToolObserved,
+    UnmarkedQuestion,
+    render_status,
 )
 
 
@@ -165,6 +174,31 @@ class TerminalConsoleTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             shown = self._shown(80, lambda console: console.run_finished(summary))
         self.assertIn("\a", "".join(shown))
+
+    def test_the_status_line_repaints_in_place_carrying_the_progress_fields(self) -> None:
+        # The whole point of the program on a real terminal: progress Observations
+        # paint a status line in place, and each visual row (the pty overwrites with
+        # carriage returns) fits the window and never wraps (register G3/G4).
+        columns = 80
+
+        def drive(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 4)
+            console.observe(ToolObserved("Bash"))
+            console.observe(SubagentsObserved(("survey", "review")))
+            console.observe(ContextObserved(12483))
+            console.iteration_finished(
+                IterationOutcome(1, 4, 5.0, "complete", "ses_1", "Done.")
+            )
+
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            shown = "\n".join(self._shown(columns, drive))
+        self.assertIn("Bash", shown)
+        self.assertIn("2 subagents", shown)
+        self.assertIn("context 12483 tokens", shown)
+        for row in re.split(r"[\r\n]", shown):
+            self.assertLessEqual(len(without_ansi(row)), columns, f"{row!r} would wrap")
+        # The status line was erased before the outcome block, which stands clean.
+        self.assertIn("ralph: iteration 1 of 4 complete", shown)
 
     def test_the_iteration_and_summary_lines_never_wrap_a_narrow_terminal(self) -> None:
         columns = 44
@@ -563,6 +597,202 @@ class RunHeaderTest(RalphCliTestCase):
         self.assertIn("ralph: backend opencode, model openai/gpt-5.6-sol", result.stderr)
 
 
+class StatusLineRenderTest(unittest.TestCase):
+    """``render_status`` is a pure function, so its no-wrap and drop-right-to-left
+    behaviour is proven directly rather than through a terminal."""
+
+    def test_every_field_is_present_left_to_right_when_it_fits(self) -> None:
+        line = render_status(2, 4, 63.0, "Bash", 5, 12483, 3, 200)
+        self.assertEqual(
+            line,
+            "ralph: iteration 2/4 · 1m03s · Bash · 5 tools · context 12483 tokens · "
+            "3 subagents",
+        )
+
+    def test_fields_drop_right_to_left_and_the_line_never_exceeds_the_width(self) -> None:
+        for width in range(8, 100):
+            line = render_status(1, 4, 5.0, "Read", 2, 900, 1, width)
+            self.assertLessEqual(len(line), width, f"width {width}: {line!r}")
+        # A moderately narrow window keeps the Iteration and elapsed and drops the
+        # tail from the right: the subagent count goes before the context gauge.
+        narrow = render_status(1, 4, 5.0, "Read", 2, 900, 1, 34)
+        self.assertIn("iteration 1/4", narrow)
+        self.assertNotIn("subagent", narrow)
+        self.assertNotIn("context", narrow)
+
+    def test_a_stream_with_no_width_keeps_every_field(self) -> None:
+        line = render_status(1, 1, 0.0, "Edit", 1, 5, 0, None)
+        self.assertIn("context 5 tokens", line)
+        self.assertIn("0 subagents", line)
+        self.assertIn("1 tool", line)
+
+    def test_an_unknown_tool_or_context_is_simply_omitted(self) -> None:
+        line = render_status(1, 1, 0.0, None, 0, None, 0, None)
+        self.assertEqual(line, "ralph: iteration 1/1 · 0s · 0 tools · 0 subagents")
+
+
+class _FakeTerminal(io.StringIO):
+    """A stream that claims to be a terminal of a fixed width, for driving the
+    status-line rendering deterministically where a real pseudo-terminal is not
+    available. The width is honoured by patching ``os.get_terminal_size`` in the
+    console module; ``fileno`` only has to answer, since the patched call ignores it."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return 1
+
+
+class TerminalStatusLineTest(unittest.TestCase):
+    """Drives the status line onto a fake terminal of a known width and asserts what
+    lands there -- the fields it carries, that it repaints in place, that it fits each
+    visual row, and that an interruption erases and redraws it -- never how it was
+    painted."""
+
+    def _drive(self, say: object, *, columns: int = 80, colour: bool = False) -> str:
+        stream = _FakeTerminal()
+        size = os.terminal_size((columns, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            if colour:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = "1"
+            say(StreamRunConsole(stream))  # type: ignore[operator]
+        return stream.getvalue()
+
+    def test_the_status_line_repaints_in_place_and_carries_the_fields(self) -> None:
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 4)
+            console.observe(ToolObserved("Bash"))
+            console.observe(SubagentsObserved(("a", "b")))
+            console.observe(ContextObserved(12483))
+            console.iteration_finished(
+                IterationOutcome(1, 4, 5.0, "complete", "ses_1", "Done.")
+            )
+
+        out = self._drive(say)
+        self.assertIn("Bash", out)
+        self.assertIn("2 subagents", out)
+        self.assertIn("context 12483 tokens", out)
+        # Repainted in place with carriage returns, not one appended line per update.
+        self.assertIn("\r", out)
+        for row in re.split(r"[\r\n]", out):
+            self.assertLessEqual(len(without_ansi(row)), 80, f"{row!r} would wrap")
+        # Erased before the outcome block, which stands clean at the start of a row.
+        self.assertIn("ralph: iteration 1 of 4 complete", out)
+
+    def test_no_color_on_a_terminal_status_line_emits_no_escape(self) -> None:
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 1)
+            console.observe(ToolObserved("Bash"))
+            console.iteration_finished(
+                IterationOutcome(1, 1, 1.0, "complete", "ses_1", "Done.")
+            )
+
+        self.assertNotIn("\033", self._drive(say, colour=False))
+
+    def test_a_coloured_terminal_paints_the_status_line(self) -> None:
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 1)
+            console.observe(ToolObserved("Bash"))
+            console.iteration_finished(
+                IterationOutcome(1, 1, 1.0, "complete", "ses_1", "Done.")
+            )
+
+        self.assertIn("\033[", self._drive(say, colour=True))
+
+    def test_a_warning_erases_and_redraws_the_status_line(self) -> None:
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 2)
+            console.observe(ToolObserved("Bash"))
+            console.observe(MarkerWithdrawn("Should I pick option A?"))
+            console.iteration_finished(
+                IterationOutcome(1, 2, 1.0, "budget_exhausted", "ses_1", "Continuing.")
+            )
+
+        out = self._drive(say)
+        # The interruption is a whole line an operator greps for; like a deviation or
+        # a failure it is emitted whole and may wrap -- only the status line may not
+        # (register G19). So the warning survives word for word...
+        self.assertIn("withdrew it", out)
+        self.assertIn("Should I pick option A?", out)
+        # ...and the status line was redrawn after it (the tool reappears past the
+        # warning), each of its in-place segments still fitting the window.
+        after_warning = out.split("withdrew it", 1)[1]
+        self.assertIn("Bash", after_warning)
+        status_segments = [
+            segment
+            for segment in re.split(r"[\r\n]", out)
+            if segment.startswith("ralph: iteration ")
+        ]
+        for segment in status_segments:
+            self.assertLessEqual(len(without_ansi(segment)), 80, f"{segment!r} would wrap")
+
+    def test_a_narrow_terminal_drops_status_fields_rather_than_wrapping(self) -> None:
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 4)
+            console.observe(ToolObserved("Bash"))
+            console.observe(SubagentsObserved(("a", "b")))
+            console.observe(ContextObserved(12483))
+            console.iteration_finished(
+                IterationOutcome(1, 4, 5.0, "complete", "ses_1", "Done.")
+            )
+
+        out = self._drive(say, columns=32)
+        for row in re.split(r"[\r\n]", out):
+            self.assertLessEqual(len(without_ansi(row)), 32, f"{row!r} would wrap")
+        self.assertIn("iteration 1/4", out)
+
+
+class PipedProgressTest(unittest.TestCase):
+    """Off a terminal there is no in-place line: the ticker degrades to slow
+    append-only heartbeats carrying the same facts and no ANSI (register G3/G11)."""
+
+    def test_progress_degrades_to_append_only_heartbeats_with_no_ansi(self) -> None:
+        stream = io.StringIO()
+        console = StreamRunConsole(stream)
+        with mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.02), \
+                mock.patch("ralph.console.HEARTBEAT_SECONDS", 0.02):
+            console.iteration_started(1, 2)
+            console.observe(ToolObserved("Bash"))
+            console.observe(ContextObserved(500))
+            # Let the real ticker emit at least one periodic heartbeat.
+            time.sleep(0.2)
+            console.iteration_finished(
+                IterationOutcome(1, 2, 1.0, "complete", "ses_1", "Done.")
+            )
+        out = stream.getvalue()
+        # No in-place repaint and no escape off a terminal.
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\033", out)
+        # A heartbeat line carried the same progress facts, append-only.
+        self.assertTrue(
+            any(
+                "iteration 1/2" in line
+                and "Bash" in line
+                and "context 500 tokens" in line
+                for line in out.split("\n")
+            ),
+            out,
+        )
+
+    def test_an_iteration_that_emits_no_observations_prints_no_status_line(self) -> None:
+        # An Iteration that emits nothing never paints a status line or a heartbeat,
+        # so a Backend that reports no progress leaves the piped log exactly as before.
+        stream = io.StringIO()
+        console = StreamRunConsole(stream)
+        with mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.02):
+            console.iteration_started(1, 1)
+            time.sleep(0.1)
+            console.iteration_finished(
+                IterationOutcome(1, 1, 1.0, "complete", "ses_1", "Done.")
+            )
+        out = stream.getvalue()
+        self.assertNotIn("iteration 1/1 ·", out)
+
+
 class TerminalOwnershipTest(unittest.TestCase):
     """Register G13: the Run console is the only module permitted to write to a
     terminal. The rule cannot be true until every emit site has migrated, so the
@@ -575,10 +805,13 @@ class TerminalOwnershipTest(unittest.TestCase):
         # failure help migrated to the Run console in #39; the run header, iteration
         # blocks, summary, and deviation warnings before it)
         "cli.py",
-        # the Backend feed, the withdrawn/unmarked mid-run marker warnings, and the
-        # killed-background-task report (#48) (the --unsafe-allow-agents deviation
-        # migrated to the Run console in #39)
+        # the Backend feed alone: the message text and the bracketed tool markers on
+        # stdout (the withdrawn/unmarked marker warnings and the killed-background-task
+        # report migrated onto the Observation sink in #40, and the --unsafe-allow-
+        # agents deviation to the Run console in #39). The feed is a later ticket's.
         "backends/claude.py",
+        # the Backend feed and the unmarked-question warning (its --unsafe-allow-agents
+        # deviation migrated in #39; the warning and Observation reporting are #41)
         "backends/opencode.py",
     }
 

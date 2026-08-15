@@ -99,7 +99,24 @@ with an outcome block giving its duration, outcome, session id, and the backend'
 concluding message truncated for display. Once the first iteration's preflight
 has proven authentication and customization isolation — the sandbox self-test
 having already proven host isolation — the trust boundary is stated as proven
-rather than left silent. Every run ends with a summary, on every terminal path
+rather than left silent.
+
+While an iteration runs, a single status line repaints in place on a terminal,
+carrying the iteration and budget, the iteration's elapsed time, the current or
+last tool, a running tool count, the backend orchestrator's live context size in
+absolute tokens, and the number of live subagents — so a four-hour run and a
+four-minute run occupy the same one line instead of filling your scrollback. Its
+ticking clock is the only motion: there is no spinner, because a spinner that
+keeps spinning over a hang answers the wrong question, while a clock that stops
+tells you the run has stalled. The line is read against the terminal's live width
+and never wraps — it drops fields from the right as the window narrows. When
+stderr is not a terminal the line degrades to slow append-only heartbeats carrying
+the same facts and no escape sequences, so a piped log stays clean. The backend's
+own running commentary — its message text and bare tool markers — still prints on
+stdout, separate from this stderr dashboard; a later change moves it behind an
+opt-in so the default view is the dashboard alone.
+
+Every run ends with a summary, on every terminal path
 including a successful one that used to exit in silence: it names the final
 branch, whether the worktree is clean, whether the branch's commits reached their
 upstream, and the run directory where the evidence lives. A terminal bell rings
