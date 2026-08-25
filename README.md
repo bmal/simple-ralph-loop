@@ -104,8 +104,12 @@ rather than left silent.
 While an iteration runs, a single status line repaints in place on a terminal,
 carrying the iteration and budget, the iteration's elapsed time, the current or
 last tool, a running tool count, the backend orchestrator's live context size in
-absolute tokens, and the number of live subagents — so a four-hour run and a
-four-minute run occupy the same one line instead of filling your scrollback. Its
+absolute tokens, and the number of live subagents — the same fields with the same
+meanings whichever backend is running — so a four-hour run and a four-minute run
+occupy the same one line instead of filling your scrollback. A field the backend
+never reports is left absent rather than shown as a zero that reads as a fact: an
+OpenCode run, which has no subagents to report, simply carries no subagent count,
+and its context gauge is the input plus cache-read tokens it reports per step. Its
 ticking clock is the only motion: there is no spinner, because a spinner that
 keeps spinning over a hang answers the wrong question, while a clock that stops
 tells you the run has stalled. The line is read against the terminal's live width

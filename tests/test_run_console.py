@@ -630,6 +630,18 @@ class StatusLineRenderTest(unittest.TestCase):
         line = render_status(1, 1, 0.0, None, 0, None, 0, None)
         self.assertEqual(line, "ralph: iteration 1/1 · 0s · 0 tools · 0 subagents")
 
+    def test_an_absent_subagent_count_is_dropped_not_shown_as_zero(self) -> None:
+        # A Backend that never reports a roster (OpenCode) leaves the count absent, so
+        # the field is dropped entirely rather than inventing a "0 subagents" fact
+        # (register G4/G5). A reported empty roster -- a genuine zero -- still renders,
+        # so the two are never conflated.
+        absent = render_status(1, 1, 0.0, "Bash", 2, 900, None, None)
+        self.assertNotIn("subagent", absent)
+        self.assertIn("2 tools", absent)
+        self.assertIn("context 900 tokens", absent)
+        zero = render_status(1, 1, 0.0, "Bash", 2, 900, 0, None)
+        self.assertIn("0 subagents", zero)
+
 
 class _FakeTerminal(io.StringIO):
     """A stream that claims to be a terminal of a fixed width, for driving the
@@ -682,6 +694,26 @@ class TerminalStatusLineTest(unittest.TestCase):
             self.assertLessEqual(len(without_ansi(row)), 80, f"{row!r} would wrap")
         # Erased before the outcome block, which stands clean at the start of a row.
         self.assertIn("ralph: iteration 1 of 4 complete", out)
+
+    def test_an_opencode_style_run_carries_the_same_fields_minus_the_subagent_count(
+        self,
+    ) -> None:
+        # OpenCode reports tool use and context but never a subagent roster, so its
+        # status line carries the same fields with the same meanings as Claude's,
+        # minus the subagent count -- rendered absent, never a fabricated "0 subagents"
+        # (register G4/G5, #41).
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 4)
+            console.observe(ToolObserved("bash"))
+            console.observe(ContextObserved(22086))
+            console.iteration_finished(
+                IterationOutcome(1, 4, 5.0, "complete", "ses_1", "Done.")
+            )
+
+        out = self._drive(say)
+        self.assertIn("bash", out)
+        self.assertIn("context 22086 tokens", out)
+        self.assertNotIn("subagent", out)
 
     def test_no_color_on_a_terminal_status_line_emits_no_escape(self) -> None:
         def say(console: StreamRunConsole) -> None:
@@ -810,8 +842,10 @@ class TerminalOwnershipTest(unittest.TestCase):
         # report migrated onto the Observation sink in #40, and the --unsafe-allow-
         # agents deviation to the Run console in #39). The feed is a later ticket's.
         "backends/claude.py",
-        # the Backend feed and the unmarked-question warning (its --unsafe-allow-agents
-        # deviation migrated in #39; the warning and Observation reporting are #41)
+        # the Backend feed alone: the message text and the bracketed tool/step markers
+        # on stdout (its --unsafe-allow-agents deviation migrated to the Run console in
+        # #39, and its unmarked-question warning plus tool/context Observation reporting
+        # onto the Observation sink in #41). The feed is a later ticket's.
         "backends/opencode.py",
     }
 

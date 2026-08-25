@@ -68,7 +68,9 @@ Invariants:
   progress facts feed a single status line that repaints in place on a terminal
   (register G3/G4): Iteration and budget, the Iteration's elapsed time, the current
   or last tool, the tool count, the orchestrator's live context size, and the live
-  subagent count. Its ticking elapsed clock is the only motion -- a background ticker
+  subagent count -- each field absent, never zero, until a Backend supplies it, so an
+  OpenCode run (which reports no roster) simply carries no subagent field rather than
+  a fabricated zero (register G4/G5). Its ticking elapsed clock is the only motion -- a background ticker
   repaints it on a cadence so a long silent tool call still advances the clock, and a
   frozen clock therefore means stalled rather than a spinner spinning over a hang.
   The line is read against the terminal's live width and never wraps: it drops fields
@@ -274,7 +276,10 @@ class ContextObserved:
 class SubagentsObserved:
     """The live subagent roster -- the descriptions of the background subagents in
     flight. The status line shows the count, which is what explains a silent
-    orchestrator waiting on them; the descriptions leave room for a later view."""
+    orchestrator waiting on them; the descriptions leave room for a later view. Emitted
+    only by a Backend that has a roster to report (Claude): a Backend with no subagent
+    stream at all (OpenCode) never sends this, and the count stays absent rather than a
+    fabricated zero (register G5)."""
 
     roster: tuple[str, ...]
 
@@ -338,20 +343,28 @@ def render_status(
     tool: str | None,
     tool_count: int,
     context_tokens: int | None,
-    subagents: int,
+    subagents: int | None,
     width: int | None,
 ) -> str:
     """Render the status line, dropping fields right-to-left until it fits *width*
     and never wrapping (register G3/G4). A stream with no width (anything that is not
     a terminal) keeps every field. The Iteration and elapsed are never dropped; when
-    even they do not fit the line is clipped rather than folded onto a second row."""
+    even they do not fit the line is clipped rather than folded onto a second row.
+
+    A field the Backend never supplied is absent, not zero: ``context_tokens`` or
+    ``subagents`` of ``None`` drops that field entirely rather than asserting a zero
+    that reads as a fact (register G4/G5). A genuine count of zero -- a Backend that
+    reported an empty subagent roster -- still renders, so the two are not conflated.
+    OpenCode emits no subagent roster, so its status line simply carries no subagent
+    field, while a Claude run shows the count once its roster event supplies one."""
     fields = [f"iteration {iteration}/{iterations}", format_duration(elapsed_seconds)]
     if tool:
         fields.append(tool)
     fields.append(f"{tool_count} tool{'' if tool_count == 1 else 's'}")
     if context_tokens is not None:
         fields.append(f"context {context_tokens} tokens")
-    fields.append(f"{subagents} subagent{'' if subagents == 1 else 's'}")
+    if subagents is not None:
+        fields.append(f"{subagents} subagent{'' if subagents == 1 else 's'}")
     # Drop from the right (subagents first) until the prefixed line fits the window.
     while len(fields) > 2 and width is not None and (
         len(PREFIX) + len(STATUS_SEPARATOR.join(fields)) > width
@@ -468,7 +481,11 @@ class StreamRunConsole:
         self._tool: str | None = None
         self._tool_count = 0
         self._context: int | None = None
-        self._subagents = 0
+        # ``None`` until a Backend supplies a subagent roster: a Backend that never
+        # reports one (OpenCode) leaves the field absent rather than showing a zero
+        # that reads as a fact (register G4/G5). A reported empty roster is a genuine
+        # count of zero and does render.
+        self._subagents: int | None = None
         self._iteration_start: float | None = None
         self._last_heartbeat = 0.0
         self._ticker_thread: threading.Thread | None = None
@@ -757,7 +774,7 @@ class StreamRunConsole:
             self._tool = None
             self._tool_count = 0
             self._context = None
-            self._subagents = 0
+            self._subagents = None
             self._iteration_start = time.monotonic()
 
     def _establish_locked(self) -> None:

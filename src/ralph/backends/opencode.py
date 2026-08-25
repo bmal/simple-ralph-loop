@@ -11,9 +11,22 @@ Invariants:
   non-empty map, ``preflight`` returns a ``console.Deviation`` (else ``None``) so the
   caller states the relaxed agent-isolation guarantee loudly through the Run console;
   the adapter words no operator-facing warning of its own (register G7/G14).
-- The unmarked-question warning stays a mid-run stderr line, but the fragment it
-  quotes back is redacted and then bounded through ``protocol.bounded_quote`` so a
-  warning is a bounded interruption, never the Backend's whole final message (#39).
+- Progress is emitted as Observations through the injected sink during the stream
+  (register G4/G5, #41), so the status line means the same on an OpenCode run as on a
+  Claude one without this adapter writing to a terminal. Each tool call emits its tool
+  use (``ToolObserved``) once, deduplicated by part id so a tool part's several state
+  updates count as one; each step-finish part emits the orchestrator's live context
+  gauge (``ContextObserved``) -- the input plus cache-read tokens it reports, this
+  Backend's arithmetic for the shared vocabulary, absent when no usable token metadata
+  is present. OpenCode emits no subagent roster and no task progress, so this adapter
+  sends no ``SubagentsObserved`` at all and the Run console renders the subagent count
+  as absent rather than a fabricated zero (register G5). The Backend feed itself (the
+  message text and the bracketed tool/step markers) stays on stdout, a later ticket's.
+- The unmarked-question warning is emitted as an ``UnmarkedQuestion`` Observation (the
+  raw fragment), and the Run console redacts, bounds, and words it into a bounded
+  interruption, never the Backend's whole final message (#39/#41). This adapter
+  constructs no operator-facing text for it; the load-bearing ``unmarked
+  operator-directed`` phrase lives in the console now (register G14/G17/G19).
 - Live text is diffed redacted-against-redacted: the whole accumulated part is
   redacted, then compared to what was already shown, so a secret that only
   completes across streaming chunk boundaries can never leak to the console even
@@ -35,17 +48,17 @@ Invariants:
 - ``execute_iteration`` returns the verified final message alongside the outcome and
   session id, so the Run console can show it in the Iteration's outcome block; it is
   the same text the completion/needs-input markers were read from, returned raw, and
-  the console truncates it for display only (register G14). It accepts the injected
-  ``ObservationSink`` to keep the Backend Protocol signature uniform, but does not yet
-  emit Observations: reporting the same progress the Claude adapter does, and
-  migrating its own mid-run warning onto that sink, is a later ticket (#41).
+  the console truncates it for display only (register G14). It receives the injected
+  ``ObservationSink`` and drives it through the accumulator (the progress facts above).
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
 ceiling its ``environment`` layers on), ``errors``, ``launch`` (``session_argv``),
 ``process``, ``protocol``, ``redaction`` (functions only), ``gitcontext``,
-``preflight``, and ``console`` (only for the ``Deviation`` value type ``preflight``
-returns — never a console instance). It must not know how the Loop schedules
-Iterations; the Loop must not know these helpers exist beyond the five Backend
+``preflight``, and ``console`` (the ``Deviation`` value type ``preflight`` returns
+and the frozen Observation value types it emits through the injected
+``ObservationSink`` — never a console instance, and it words none of them). It must
+not know how the Loop schedules Iterations, nor how the Run console renders an
+Observation; the Loop must not know these helpers exist beyond the five Backend
 interface names.
 
 See also: ``backends`` (registry and the five-name Protocol), ``backends.claude``
@@ -59,13 +72,19 @@ import json
 from pathlib import Path
 import re
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from typing import Any, TYPE_CHECKING
 
-from ..console import OPENCODE_AGENTS_DEVIATION, Deviation
+from ..console import (
+    OPENCODE_AGENTS_DEVIATION,
+    ContextObserved,
+    Deviation,
+    Observation,
+    ToolObserved,
+    UnmarkedQuestion,
+)
 from ..environment import BACKEND_TIMEOUT_MS, clean_environment
 from ..errors import (
     HandoffError,
@@ -79,7 +98,6 @@ from ..preflight import common_preflight, version_tuple
 from ..process import ProcessController, raise_if_controlled_stop
 from ..protocol import (
     active_protocol,
-    bounded_quote,
     explicit_needs_input,
     extract_question,
     has_completion_marker,
@@ -226,8 +244,34 @@ def preflight(
     return reject_opencode_agents(config, allow_agents)
 
 
+def orchestrator_context(tokens: Any) -> int | None:
+    # The orchestrator's live context size for the status gauge (register G5): the
+    # input plus cache-read tokens OpenCode reports on a step-finish part. This is
+    # OpenCode's arithmetic; the Claude adapter owns a different sum. OpenCode's own
+    # reported total already folds cache reads in, so it is the wrong figure -- the
+    # gauge wants the size of the prompt the orchestrator will resend, which is the
+    # fresh input plus the cache it reads back. Returns None when no usable token
+    # metadata is present (nothing to show), so a stream without it simply leaves the
+    # gauge blank rather than asserting a zero.
+    if not isinstance(tokens, dict):
+        return None
+    total = 0
+    seen = False
+    value = tokens.get("input")
+    if isinstance(value, int) and not isinstance(value, bool):
+        total += value
+        seen = True
+    cache = tokens.get("cache")
+    if isinstance(cache, dict):
+        read = cache.get("read")
+        if isinstance(read, int) and not isinstance(read, bool):
+            total += read
+            seen = True
+    return total if seen else None
+
+
 class EventResult:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, observe: "ObservationSink | None" = None) -> None:
         self.expected_model = model
         self.session_id: str | None = None
         self.assistant_messages: list[str] = []
@@ -236,6 +280,19 @@ class EventResult:
         self.printed: dict[str, str] = {}
         self.question: str | None = None
         self.backend_error: str | None = None
+        # Part ids of tool calls already counted, so a tool part that streams several
+        # state updates (pending -> running -> completed) under one id is reported to
+        # the status line once, not once per update (register G4).
+        self.tool_calls_seen: set[str] = set()
+        # The narrow Observation sink the Loop injects (the Run console). Progress
+        # facts and the migrated warning are emitted through it so this adapter
+        # constructs no operator-facing text of its own (register G14). ``None`` is a
+        # no-op, so the accumulator still runs when no sink is injected.
+        self._observe = observe
+
+    def emit(self, observation: Observation) -> None:
+        if self._observe is not None:
+            self._observe.observe(observation)
 
     def accept(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -261,6 +318,8 @@ class EventResult:
             self._print_progress(event["type"], direct_part)
             if event.get("type") == "tool_use":
                 self._accept_tool(direct_part)
+            elif event.get("type") == "step_finish":
+                self._accept_step_finish(direct_part)
             return
         props = event.get("properties")
         if not isinstance(props, dict):
@@ -288,6 +347,9 @@ class EventResult:
             self._session(part.get("sessionID"))
             if part.get("type") == "tool":
                 self._accept_tool(part)
+                return
+            if part.get("type") == "step-finish":
+                self._accept_step_finish(part)
                 return
             if part.get("type") != "text" or not isinstance(part.get("text"), str):
                 return
@@ -342,9 +404,27 @@ class EventResult:
 
     def _accept_tool(self, part: dict[str, Any]) -> None:
         tool = part.get("tool")
+        part_id = part.get("id")
+        # Report the orchestrator's tool use as an Observation the first time each
+        # tool call is seen (register G4). OpenCode runs no orchestrator/subagent
+        # split, so every tool is the orchestrator's; a tool part streams several
+        # state updates under one id, so the seen-set keeps the status line's tool
+        # count one-per-call rather than one-per-update.
+        if isinstance(part_id, str) and part_id and part_id not in self.tool_calls_seen:
+            self.tool_calls_seen.add(part_id)
+            self.emit(ToolObserved(tool if isinstance(tool, str) and tool else "tool"))
         if not isinstance(tool, str) or tool.lower() not in {"question", "askuserquestion"}:
             return
         self.question = extract_question(part.get("state")) or "The backend attempted to ask a question."
+
+    def _accept_step_finish(self, part: dict[str, Any]) -> None:
+        # OpenCode reports its token counts on step-finish parts; the orchestrator's
+        # live context gauge is the input plus cache-read tokens there (register G5),
+        # the per-Backend arithmetic `orchestrator_context` owns. Absent or malformed
+        # token metadata emits nothing rather than a zero gauge.
+        context = orchestrator_context(part.get("tokens"))
+        if context is not None:
+            self.emit(ContextObserved(context))
 
     def _session(self, value: Any) -> None:
         if not isinstance(value, str):
@@ -534,10 +614,9 @@ def execute_iteration(
     sandbox_profile: Path | None = None,
     observe: "ObservationSink | None" = None,
 ) -> tuple[str, str | None, str | None]:
-    # ``observe`` completes the Backend Protocol signature so the Loop drives both
-    # adapters identically; this adapter does not yet emit Observations (a later
-    # ticket #41 makes it report the same progress the Claude adapter does).
-    del observe
+    # The injected Observation sink (the Run console): the accumulator emits the
+    # orchestrator's tool use and live context gauge through it so the status line
+    # means the same on an OpenCode run as on a Claude one (register G4/G5, #41).
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
     args = session_argv(
@@ -555,7 +634,7 @@ def execute_iteration(
         ],
         sandbox_profile,
     )
-    result = EventResult(model)
+    result = EventResult(model, observe)
     try:
         process = subprocess.Popen(
             args,
@@ -752,16 +831,12 @@ def _consume_opencode_iteration(
     inferred = inferred_needs_input(final_text)
     if inferred:
         # An unmarked concluding question is a low-confidence signal; the loop must
-        # not take the irreversible operator-halt on a guess. Surface it and let the
-        # next iteration re-derive from the tracker.
-        # A bounded interruption, not an outlet for the whole final message: the
-        # fragment is redacted, then collapsed and capped for display (issue #39).
-        print(
-            "ralph: warning: final message ended on an unmarked operator-directed "
-            "question; continuing to the next iteration (no <promise>NEEDS_INPUT</promise> "
-            f"marker and no question tool used): {bounded_quote(redact(inferred))}",
-            file=sys.stderr,
-        )
+        # not take the irreversible operator-halt on a guess. Emit the fact (the raw
+        # fragment) through the Observation sink and let the Run console redact, bound,
+        # and word the warning -- a bounded interruption, never an outlet for the whole
+        # final message -- so this adapter constructs no operator-facing text (#39/#41,
+        # register G14/G17/G19). The next iteration re-derives from the tracker.
+        result.emit(UnmarkedQuestion(inferred))
     complete = has_completion_marker(final_text)
     # The concluding message rides back with the outcome so the Run console can show
     # it in the Iteration's outcome block; it is the same final message the marker was
