@@ -330,7 +330,7 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
 
         # Without the flag, resuming an agents repository is refused before the
         # backend is relaunched.
-        refused = self.resume_ralph("claude", "claude-opus-4-8", "claude-session-1")
+        refused = self.resume_ralph("claude", "claude-opus-5", "claude-session-1")
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("Claude customizations", refused.stderr)
         self.assertFalse((self.calls / "claude-resume").exists())
@@ -344,7 +344,7 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
         # never carries the flag itself.
         allowed = self.resume_ralph(
             "claude",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "claude-session-1",
             "--unsafe-allow-agents",
         )

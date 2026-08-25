@@ -17,7 +17,7 @@ class ClaudePreflightTest(RalphCliTestCase):
         invocation = (self.calls / "claude").read_text()
         self.assertIn("-p --input-format stream-json --output-format stream-json", invocation)
         self.assertIn("--dangerously-skip-permissions", invocation)
-        self.assertIn("--model claude-opus-4-8", invocation)
+        self.assertIn("--model claude-opus-5", invocation)
         self.assertIn("--setting-sources project --strict-mcp-config", invocation)
         self.assertNotIn("--bare", invocation)
         child_env = (self.calls / "claude-env").read_text()
@@ -31,7 +31,7 @@ class ClaudePreflightTest(RalphCliTestCase):
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         session = json.loads((run_dir / "session.json").read_text())
         self.assertEqual(session["session_id"], "claude-session-1")
-        self.assertEqual(session["initial_model"], "claude-opus-4-8")
+        self.assertEqual(session["initial_model"], "claude-opus-5")
         self.assertEqual(session["fallback_models"], [])
         self.assertIn("claude diagnostic", (run_dir / "stderr.log").read_text())
 

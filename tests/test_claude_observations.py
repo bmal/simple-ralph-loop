@@ -34,7 +34,7 @@ class RecordingSink:
         self.observations.append(observation)
 
 
-def _init(session: str = "s1", model: str = "claude-opus-4-8") -> dict:
+def _init(session: str = "s1", model: str = "claude-opus-5") -> dict:
     return {
         "type": "system",
         "subtype": "init",
@@ -54,7 +54,7 @@ def _assistant(
     *,
     usage: dict | None = None,
     parent: str | None = None,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5",
 ) -> dict:
     message: dict = {"id": "m", "role": "assistant", "model": model, "content": parts}
     if usage is not None:
@@ -87,7 +87,7 @@ def _background(session: str, tasks: list[dict]) -> dict:
 class ClaudeObservationExtractionTest(unittest.TestCase):
     def _feed(self, events: list[dict]) -> RecordingSink:
         sink = RecordingSink()
-        result = ClaudeEventResult("claude-opus-4-8", sink)
+        result = ClaudeEventResult("claude-opus-5", sink)
         for event in events:
             result.accept(event)
         return sink
@@ -174,7 +174,7 @@ class ClaudeObservationExtractionTest(unittest.TestCase):
 
     def test_no_sink_is_a_no_op(self) -> None:
         # An accumulator with no sink still runs: the emits are silently dropped.
-        result = ClaudeEventResult("claude-opus-4-8")
+        result = ClaudeEventResult("claude-opus-5")
         result.accept(_init())
         result.accept(_assistant("s1", [_tool("Bash")]))  # must not raise
 
@@ -192,7 +192,7 @@ class ClaudeKilledTaskObservationTest(unittest.TestCase):
         from ralph.backends.claude import report_killed_tasks
 
         sink = RecordingSink()
-        result = ClaudeEventResult("claude-opus-4-8", sink)
+        result = ClaudeEventResult("claude-opus-5", sink)
         result.killed_tasks = ["task_ci_verify", None]
         report_killed_tasks(result)
         killed = [o for o in sink.observations if isinstance(o, KilledTask)]

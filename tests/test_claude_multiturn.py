@@ -705,7 +705,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
             self._claude_result_event(
                 "First pass.",
                 "claude-session-1",
-                model_usage={"claude-opus-4-8": {"inputTokens": 1, "outputTokens": 1}},
+                model_usage={"claude-opus-5": {"inputTokens": 1, "outputTokens": 1}},
             ),
             self._claude_result_event(
                 "Done.\n<promise>COMPLETE</promise>",
@@ -718,7 +718,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         run_dir, _ = self._read_outcome()
         session = json.loads((run_dir / "session.json").read_text())
         self.assertEqual(
-            set(session["model_usage"]), {"claude-opus-4-8", "claude-3-5-haiku"}
+            set(session["model_usage"]), {"claude-opus-5", "claude-3-5-haiku"}
         )
 
     def test_a_result_naming_a_non_claude_model_fails_closed(self) -> None:

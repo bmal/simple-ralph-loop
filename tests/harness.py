@@ -489,7 +489,7 @@ class RalphCliTestCase(unittest.TestCase):
     def _claude_events(
         self,
         text: str,
-        model: str = "claude-opus-4-8",
+        model: str = "claude-opus-5",
         session_id: str = "claude-session-1",
     ) -> str:
         events = [
@@ -543,7 +543,7 @@ class RalphCliTestCase(unittest.TestCase):
     # tagged subagent messages, results flushed at EOF -- is spelled out in the
     # test that depends on it.
     def _claude_init_event(
-        self, session_id: str, model: str = "claude-opus-4-8", **overrides: object
+        self, session_id: str, model: str = "claude-opus-5", **overrides: object
     ) -> dict:
         event = {
             "type": "system",
@@ -564,7 +564,7 @@ class RalphCliTestCase(unittest.TestCase):
         self,
         text: str,
         session_id: str,
-        model: str = "claude-opus-4-8",
+        model: str = "claude-opus-5",
         parent_tool_use_id: str | None = None,
     ) -> dict:
         # `parent_tool_use_id` is None for the Backend's own messages and a
@@ -594,7 +594,7 @@ class RalphCliTestCase(unittest.TestCase):
         self,
         text: str,
         session_id: str,
-        model: str = "claude-opus-4-8",
+        model: str = "claude-opus-5",
         model_usage: dict | None = None,
     ) -> dict:
         return {
@@ -664,7 +664,7 @@ class RalphCliTestCase(unittest.TestCase):
         self,
         turns: list[dict],
         session_id: str = "claude-session-1",
-        model: str = "claude-opus-4-8",
+        model: str = "claude-opus-5",
         teardown: list[dict] | None = None,
     ) -> str:
         # Compose an N-turn stream in the observed shape: each init opens a turn

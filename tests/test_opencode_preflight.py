@@ -48,7 +48,7 @@ class OpencodePreflightTest(RalphCliTestCase):
     def test_opencode_validates_every_exported_assistant_route_and_records_fallback(self) -> None:
         alternate = self._export_messages(
             "Done",
-            [("openai", "gpt-5.6-sol"), ("anthropic", "claude-opus-4-8")],
+            [("openai", "gpt-5.6-sol"), ("anthropic", "claude-opus-5")],
         )
         rejected = self.run_ralph(env={"FAKE_EXPORT": alternate})
         self.assertEqual(rejected.returncode, 2)
@@ -138,7 +138,7 @@ class OpencodePreflightTest(RalphCliTestCase):
                         "sessionID": "ses_1",
                         "role": "assistant",
                         "providerID": "anthropic",
-                        "modelID": "claude-opus-4-8",
+                        "modelID": "claude-opus-5",
                     }
                 },
             },

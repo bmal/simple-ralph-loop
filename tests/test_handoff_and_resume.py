@@ -28,12 +28,12 @@ class HandoffAndResumeTest(RalphCliTestCase):
 
         for path in self.calls.iterdir():
             path.unlink()
-        claude = self.resume_ralph("claude", "claude-opus-4-8", "claude-session-1")
+        claude = self.resume_ralph("claude", "claude-opus-5", "claude-session-1")
         self.assertEqual(claude.returncode, 0, claude.stderr)
         claude_call = (self.calls / "claude-resume").read_text()
         self.assertIn("--resume claude-session-1", claude_call)
         self.assertIn("--dangerously-skip-permissions", claude_call)
-        self.assertIn("--model claude-opus-4-8", claude_call)
+        self.assertIn("--model claude-opus-5", claude_call)
         self.assertIn("--setting-sources project --strict-mcp-config", claude_call)
         self.assertIn("-im", (self.calls / "caffeinate").read_text())
         claude_env = (self.calls / "claude-resume-env").read_text()
@@ -80,7 +80,7 @@ class HandoffAndResumeTest(RalphCliTestCase):
         settings = self.repo / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"apiKeyHelper": "paid-key-command"}), encoding="utf-8")
-        customized = self.resume_ralph("claude", "claude-opus-4-8", "claude-session-1")
+        customized = self.resume_ralph("claude", "claude-opus-5", "claude-session-1")
         self.assertNotEqual(customized.returncode, 0)
         self.assertIn("Claude customizations", customized.stderr)
         self.assertFalse((self.calls / "claude-resume").exists())

@@ -66,12 +66,12 @@ ralph run prompt.md --backend opencode --iterations 2 --timeout 5400
 ```
 
 OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
-`claude-opus-4-8`. Each run opens with a header stating the settings it
+`claude-opus-5`. Each run opens with a header stating the settings it
 resolved and the directory its evidence will be retained in, before any budget
 is spent:
 
 ```
-ralph: backend claude, model claude-opus-4-8
+ralph: backend claude, model claude-opus-5
 ralph: iterations 4, timeout 3600s
 ralph: repository example/project, branch main
 ralph: worktree /Users/you/code/project
