@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -28,11 +29,14 @@ from ralph.console import (
     IterationOutcome,
     KilledTask,
     MarkerWithdrawn,
+    Narrated,
     OperatorHelp,
     RunSettings,
     RunSummary,
+    StepObserved,
     StreamRunConsole,
     SubagentsObserved,
+    ToolActivity,
     ToolObserved,
     UnmarkedQuestion,
     render_status,
@@ -597,6 +601,109 @@ class RunHeaderTest(RalphCliTestCase):
         self.assertIn("ralph: backend opencode, model openai/gpt-5.6-sol", result.stderr)
 
 
+class BackendFeedRunTest(RalphCliTestCase):
+    """What a real run puts on each stream: the dashboard on stderr, the Backend's
+    commentary nowhere at all until ``--verbose`` puts it on stdout (register
+    G2/G11)."""
+
+    def test_the_default_view_carries_no_backend_commentary_on_stdout(self) -> None:
+        result = self.run_ralph()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        # The one utterance worth keeping survives, in the Iteration's outcome block
+        # on stderr, where the rest of Ralph's voice already is.
+        self.assertIn("Work complete.", result.stderr)
+
+    def test_verbose_restores_the_feed_on_stdout_with_its_speaker(self) -> None:
+        progress = json.dumps(
+            {
+                "type": "tool_use",
+                "sessionID": "ses_1",
+                "part": {"type": "tool", "tool": "bash", "state": {"status": "completed"}},
+            }
+        )
+        events = progress + "\n" + self._events(
+            "Work complete.\n<promise>COMPLETE</promise>"
+        )
+        result = self.run_ralph(
+            "--verbose",
+            env={
+                "FAKE_EVENTS": events,
+                "FAKE_EXPORT": self._export("Work complete.\n<promise>COMPLETE</promise>"),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("opencode: [bash (completed)]", result.stdout)
+        self.assertIn("opencode: Work complete.", result.stdout)
+        # The dashboard is untouched by the opt-in and stays on stderr.
+        self.assertIn("ralph: backend opencode", result.stderr)
+        self.assertNotIn("ralph: backend opencode", result.stdout)
+
+    def test_a_claude_subagent_is_named_apart_from_the_backend_it_serves(self) -> None:
+        events = self._claude_multiturn_events(
+            [
+                {
+                    "text": "Work complete.\n<promise>COMPLETE</promise>",
+                    "subagents": ["Survey finished."],
+                }
+            ]
+        )
+        result = self.run_ralph(
+            "--verbose", backend="claude", env={"FAKE_CLAUDE_EVENTS": events}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("claude: Work complete.", result.stdout)
+        self.assertIn("Survey finished.", result.stdout)
+        # The subagent's line is attributed to it, not to the Backend.
+        self.assertNotIn("claude: Survey finished.", result.stdout)
+
+    def test_the_feed_carries_no_ansi_when_redirected_off_the_terminal(self) -> None:
+        # stderr on a real terminal, stdout on a pipe: the dashboard is coloured and
+        # the captured transcript stays clean, which is the whole point of splitting
+        # the two streams. Ralph adds nothing to the feed, so with a backend that
+        # emits no escapes the redirected transcript carries none at all.
+        result = self.run_ralph_pty("--verbose")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("opencode: Work complete.", result.stdout)
+        self.assertNotIn("\033", result.stdout)
+        self.assertIn("\033[", result.stderr)
+
+
+class QuietRunTest(RalphCliTestCase):
+    """``--quiet`` for an unattended run: no status line and no Iteration blocks, but
+    never at the cost of the header, the summary, or the help (register G11)."""
+
+    def test_quiet_drops_the_iteration_blocks_but_keeps_header_and_summary(self) -> None:
+        result = self.run_ralph("--quiet")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("iteration 1 of 1", result.stderr)
+        self.assertNotIn("Work complete.", result.stderr)
+        self.assertIn("ralph: backend opencode", result.stderr)
+        self.assertIn("ralph: run directory", result.stderr)
+        self.assertIn("ralph: outcome run complete", result.stderr)
+
+    def test_quiet_never_costs_the_operator_their_help(self) -> None:
+        # A run that spends the budget without completing still gets its summary and
+        # the exact command that continues the work (register G10).
+        unfinished = "Still working on it."
+        result = self.run_ralph(
+            "--quiet",
+            env={
+                "FAKE_EVENTS": self._events(unfinished),
+                "FAKE_EXPORT": self._export(unfinished),
+            },
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("iteration budget exhausted", result.stderr)
+        self.assertIn("continue Ralph:", result.stderr)
+
+
 class StatusLineRenderTest(unittest.TestCase):
     """``render_status`` is a pure function, so its no-wrap and drop-right-to-left
     behaviour is proven directly rather than through a terminal."""
@@ -762,6 +869,29 @@ class TerminalStatusLineTest(unittest.TestCase):
         for segment in status_segments:
             self.assertLessEqual(len(without_ansi(segment)), 80, f"{segment!r} would wrap")
 
+    def test_a_feed_line_erases_and_redraws_the_status_line(self) -> None:
+        # An un-redirected ``--verbose`` puts the dashboard and the feed on the same
+        # terminal, so a feed line must be given the same treatment as an operator
+        # line: the status is cleared before it and redrawn after (register G3).
+        terminal = _FakeTerminal()
+        size = os.terminal_size((80, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            console = StreamRunConsole(terminal, feed=terminal)
+            console.run_started(_settings(backend="opencode"))
+            console.iteration_started(1, 2)
+            console.observe(ToolObserved("Bash"))
+            console.observe(Narrated("Reading the issue."))
+            console.iteration_finished(
+                IterationOutcome(1, 2, 1.0, "complete", "ses_1", "Done.")
+            )
+        out = terminal.getvalue()
+        # The feed line starts a row of its own rather than landing on the status...
+        rows = [row for row in re.split(r"[\r\n]", out) if row.strip()]
+        self.assertIn("opencode: Reading the issue.", rows)
+        # ...and the status line is back afterwards, so the clock keeps showing.
+        self.assertIn("Bash", out.split("Reading the issue.", 1)[1])
+
     def test_a_narrow_terminal_drops_status_fields_rather_than_wrapping(self) -> None:
         def say(console: StreamRunConsole) -> None:
             console.iteration_started(1, 4)
@@ -825,29 +955,255 @@ class PipedProgressTest(unittest.TestCase):
         self.assertNotIn("iteration 1/1 ·", out)
 
 
+class BackendFeedTest(unittest.TestCase):
+    """The Backend's running commentary: dropped from the default view (register G2)
+    and restored, with a speaker prefix on every line, only when the operator opts in
+    (register G11). Driven directly because the interleaving that makes the feed
+    unreadable -- a Backend and its subagents narrating at once -- cannot be staged
+    through a subprocess."""
+
+    def _say(self, say: object, *, feed: bool = True) -> tuple[str, str]:
+        dashboard = io.StringIO()
+        transcript = io.StringIO()
+        console = StreamRunConsole(dashboard, feed=transcript if feed else None)
+        console.run_started(_settings(backend="claude"))
+        say(console)  # type: ignore[operator]
+        return dashboard.getvalue(), transcript.getvalue()
+
+    def test_the_backend_commentary_is_silent_without_the_opt_in(self) -> None:
+        dashboard, _ = self._say(
+            lambda console: (
+                console.observe(Narrated("Reading the issue.")),
+                console.observe(ToolActivity("Read")),
+                console.observe(StepObserved(started=True)),
+            ),
+            feed=False,
+        )
+        self.assertNotIn("Reading the issue.", dashboard)
+        self.assertNotIn("[Read]", dashboard)
+        self.assertNotIn("step started", dashboard)
+
+    def test_the_feed_names_the_backend_or_the_subagent_that_spoke(self) -> None:
+        _, feed = self._say(
+            lambda console: (
+                console.observe(Narrated("Delegating the survey.")),
+                console.observe(Narrated("Survey done.", subagent="toolu_7")),
+                console.observe(Narrated("Thanks.")),
+            )
+        )
+        # Three concurrent monologues stay attributable line by line.
+        self.assertEqual(
+            feed.rstrip("\n").split("\n"),
+            [
+                "claude: Delegating the survey.",
+                "claude/toolu_7: Survey done.",
+                "claude: Thanks.",
+            ],
+        )
+
+    def test_every_row_of_a_multi_line_passage_carries_its_speaker(self) -> None:
+        _, feed = self._say(
+            lambda console: console.observe(Narrated("First.\nSecond.", subagent="toolu_1"))
+        )
+        self.assertEqual(
+            feed.rstrip("\n").split("\n"),
+            ["claude/toolu_1: First.", "claude/toolu_1: Second."],
+        )
+
+    def test_streamed_fragments_are_joined_rather_than_prefixed_mid_sentence(
+        self,
+    ) -> None:
+        _, feed = self._say(
+            lambda console: (
+                console.observe(Narrated("Work ", partial=True)),
+                console.observe(Narrated("complete.\n", partial=True)),
+            )
+        )
+        self.assertEqual(feed, "claude: Work complete.\n")
+
+    def test_an_unfinished_line_is_still_shown_when_the_iteration_ends(self) -> None:
+        _, feed = self._say(
+            lambda console: (
+                console.observe(Narrated("Trailing thought", partial=True)),
+                console.iteration_finished(
+                    IterationOutcome(1, 1, 1.0, "complete", "ses_1", "Done.")
+                ),
+            )
+        )
+        self.assertIn("claude: Trailing thought", feed)
+
+    def test_progress_markers_carry_their_speaker_and_their_state(self) -> None:
+        _, feed = self._say(
+            lambda console: (
+                console.observe(ToolActivity("Read")),
+                console.observe(ToolActivity("Bash", subagent="toolu_2")),
+                console.observe(ToolActivity("bash", state="completed")),
+                console.observe(StepObserved(started=True)),
+                console.observe(StepObserved(started=False)),
+            )
+        )
+        self.assertEqual(
+            feed.rstrip("\n").split("\n"),
+            [
+                "claude: [Read]",
+                "claude/toolu_2: [Bash]",
+                "claude: [bash (completed)]",
+                "claude: [step started]",
+                "claude: [step finished]",
+            ],
+        )
+
+    def test_a_marker_never_lands_in_the_middle_of_a_streamed_sentence(self) -> None:
+        _, feed = self._say(
+            lambda console: (
+                console.observe(Narrated("Now I will", partial=True)),
+                console.observe(ToolActivity("Read")),
+            )
+        )
+        self.assertEqual(
+            feed.rstrip("\n").split("\n"),
+            ["claude: Now I will", "claude: [Read]"],
+        )
+
+    def test_the_dashboard_and_the_feed_stay_on_separate_streams(self) -> None:
+        dashboard, feed = self._say(
+            lambda console: (
+                console.observe(Narrated("Backend chatter.")),
+                console.run_finished(
+                    RunSummary(
+                        outcome="complete",
+                        run_dir=Path("/w/.git/ralph/runs/r1"),
+                        initial_branch="main",
+                        final_branch="main",
+                        dirty=False,
+                        upstream=None,
+                        ahead=0,
+                    )
+                ),
+            )
+        )
+        # Redirecting one leaves the other whole: neither stream carries the other's.
+        self.assertIn("ralph: outcome run complete", dashboard)
+        self.assertNotIn("Backend chatter.", dashboard)
+        self.assertIn("claude: Backend chatter.", feed)
+        self.assertNotIn("ralph: outcome", feed)
+
+    def test_the_feed_is_redacted_like_every_other_operator_facing_line(self) -> None:
+        secret = "oauth-subscription-token-1234567890"
+        with mock.patch("ralph.console.redact", lambda text: text.replace(secret, "[redacted]")):
+            _, feed = self._say(
+                lambda console: console.observe(Narrated(f"Token {secret} used."))
+            )
+        self.assertNotIn(secret, feed)
+        self.assertIn("[redacted]", feed)
+
+    def test_ralph_paints_no_ansi_onto_the_feed_beside_a_coloured_dashboard(
+        self,
+    ) -> None:
+        # Ralph adds no colour to the feed (register G12), so nothing it writes there
+        # can be read as its own voice and a redirected transcript stays clean of
+        # Ralph's escapes whatever the dashboard is doing.
+        dashboard_stream = _FakeTerminal()
+        feed_stream = io.StringIO()
+        size = os.terminal_size((100, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            console = StreamRunConsole(dashboard_stream, feed=feed_stream)
+            console.run_started(_settings(backend="claude"))
+            console.observe(Narrated("Backend chatter."))
+        self.assertIn("\033[", dashboard_stream.getvalue())
+        self.assertNotIn("\033", feed_stream.getvalue())
+
+
+class QuietConsoleTest(unittest.TestCase):
+    """Quiet drops the status line and the Iteration blocks and nothing else, so an
+    unattended run stays quiet without the operator losing their help (register G11)."""
+
+    def _say(self, say: object) -> str:
+        stream = io.StringIO()
+        say(StreamRunConsole(stream, quiet=True))  # type: ignore[operator]
+        return stream.getvalue()
+
+    def test_quiet_drops_the_iteration_blocks(self) -> None:
+        out = self._say(
+            lambda console: (
+                console.iteration_started(1, 4),
+                console.iteration_finished(
+                    IterationOutcome(1, 4, 5.0, "complete", "ses_1", "Done.")
+                ),
+            )
+        )
+        self.assertEqual(out, "")
+
+    def test_quiet_keeps_the_header_the_summary_and_every_failure(self) -> None:
+        out = self._say(
+            lambda console: (
+                console.run_started(_settings()),
+                console.iteration_started(1, 4),
+                console.deviation(Deviation(NO_SANDBOX_DEVIATION)),
+                console.observe(UnmarkedQuestion("Which one?")),
+                console.run_finished(
+                    RunSummary(
+                        outcome="budget_exhausted",
+                        run_dir=Path("/w/.git/ralph/runs/r1"),
+                        initial_branch="main",
+                        final_branch="main",
+                        dirty=False,
+                        upstream=None,
+                        ahead=0,
+                    )
+                ),
+                console.budget_continue("ralph run prompt.md --iterations 4"),
+                console.failed("something went wrong"),
+            )
+        )
+        self.assertIn("ralph: backend opencode", out)
+        self.assertIn("--unsafe-no-sandbox is set", out)
+        self.assertIn("unmarked operator-directed", out)
+        self.assertIn("iteration budget exhausted", out)
+        self.assertIn("continue Ralph: ralph run prompt.md --iterations 4", out)
+        self.assertIn("something went wrong", out)
+
+    def test_quiet_and_the_feed_govern_different_streams(self) -> None:
+        # The two flags are orthogonal: quiet turns the dashboard down, the feed turns
+        # the commentary on, and asking for both gets exactly both (register G11).
+        dashboard = io.StringIO()
+        transcript = io.StringIO()
+        console = StreamRunConsole(dashboard, feed=transcript, quiet=True)
+        console.run_started(_settings())
+        console.iteration_started(1, 1)
+        console.observe(Narrated("Backend chatter."))
+        console.iteration_finished(
+            IterationOutcome(1, 1, 1.0, "complete", "ses_1", "Done.")
+        )
+        self.assertIn("opencode: Backend chatter.", transcript.getvalue())
+        # Quiet still drops the Iteration blocks while keeping the header.
+        self.assertIn("ralph: backend opencode", dashboard.getvalue())
+        self.assertNotIn("iteration 1 of 1", dashboard.getvalue())
+
+    def test_quiet_paints_no_status_line_and_appends_no_heartbeat(self) -> None:
+        stream = _FakeTerminal()
+        size = os.terminal_size((100, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.02), \
+                mock.patch("ralph.console.HEARTBEAT_SECONDS", 0.02):
+            console = StreamRunConsole(stream, quiet=True)
+            console.iteration_started(1, 2)
+            console.observe(ToolObserved("Bash"))
+            console.observe(ContextObserved(500))
+            time.sleep(0.2)
+            console.iteration_finished(
+                IterationOutcome(1, 2, 1.0, "complete", "ses_1", "Done.")
+            )
+        self.assertEqual(stream.getvalue(), "")
+
+
 class TerminalOwnershipTest(unittest.TestCase):
     """Register G13: the Run console is the only module permitted to write to a
-    terminal. The rule cannot be true until every emit site has migrated, so the
-    modules that still hold one are named here explicitly. Each later ticket in the
-    Run console program deletes its own entry; the last one deletes this test."""
-
-    # Modules with an unmigrated operator-facing write, and what still holds them.
-    NOT_YET_MIGRATED = {
-        # the resume full-auto warning (the handoff, budget-exhausted, and backend-
-        # failure help migrated to the Run console in #39; the run header, iteration
-        # blocks, summary, and deviation warnings before it)
-        "cli.py",
-        # the Backend feed alone: the message text and the bracketed tool markers on
-        # stdout (the withdrawn/unmarked marker warnings and the killed-background-task
-        # report migrated onto the Observation sink in #40, and the --unsafe-allow-
-        # agents deviation to the Run console in #39). The feed is a later ticket's.
-        "backends/claude.py",
-        # the Backend feed alone: the message text and the bracketed tool/step markers
-        # on stdout (its --unsafe-allow-agents deviation migrated to the Run console in
-        # #39, and its unmarked-question warning plus tool/context Observation reporting
-        # onto the Observation sink in #41). The feed is a later ticket's.
-        "backends/opencode.py",
-    }
+    terminal. Every emit site has now migrated -- the Loop's, the failure help,
+    ``resume``'s full-auto caveat, and last the two Backend feeds -- so the rule is
+    asserted unconditionally, with no allowlist of stragglers left to keep."""
 
     def _writes_to_a_terminal(self, source: str) -> bool:
         for node in ast.walk(ast.parse(source)):
@@ -867,9 +1223,7 @@ class TerminalOwnershipTest(unittest.TestCase):
                 return True
         return False
 
-    def test_only_the_run_console_and_the_named_stragglers_write_to_a_terminal(
-        self,
-    ) -> None:
+    def test_no_module_outside_the_run_console_writes_to_a_terminal(self) -> None:
         offenders = {
             str(path.relative_to(self._package()))
             for path in sorted(self._package().rglob("*.py"))
@@ -877,15 +1231,15 @@ class TerminalOwnershipTest(unittest.TestCase):
         }
         self.assertEqual(
             offenders,
-            self.NOT_YET_MIGRATED,
-            "a module gained or lost an operator-facing write: migrate it to the "
-            "Run console, or update the allowlist to name exactly what remains",
+            set(),
+            "a module gained an operator-facing write: emit the fact through the "
+            "injected Run console instead (register G13)",
         )
 
     def test_only_the_command_line_entry_point_constructs_a_run_console(self) -> None:
         # Register G16: everything below the composition root depends on the
-        # abstraction, so a later ticket can swap in a quiet or verbose renderer by
-        # changing one line in one module.
+        # abstraction, which is why both rendering choices an operator makes -- the
+        # opt-in feed and quiet -- are one construction in one module.
         constructors = {
             str(path.relative_to(self._package()))
             for path in sorted(self._package().rglob("*.py"))

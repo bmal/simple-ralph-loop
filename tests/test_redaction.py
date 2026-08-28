@@ -16,6 +16,9 @@ class RedactionTest(RalphCliTestCase):
             "Work complete.\n<promise>COMPLETE</promise>"
         )
         result = self.run_ralph(
+            # Streamed backend text only reaches a stream under the opt-in feed, so
+            # the leak this guards against is only reachable there (register G2/G11).
+            "--verbose",
             backend="claude",
             env={
                 "CLAUDE_CODE_OAUTH_TOKEN": token,
@@ -85,11 +88,12 @@ class RedactionTest(RalphCliTestCase):
             )
 
         result = self.run_ralph(
+            "--verbose",
             env={
                 "CLAUDE_CODE_OAUTH_TOKEN": token,
                 "FAKE_EVENTS": text_event(first) + "\n" + text_event(full),
                 "FAKE_EXPORT": self._export(full),
-            }
+            },
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -20,8 +20,16 @@ Invariants:
   Backend's arithmetic for the shared vocabulary, absent when no usable token metadata
   is present. OpenCode emits no subagent roster and no task progress, so this adapter
   sends no ``SubagentsObserved`` at all and the Run console renders the subagent count
-  as absent rather than a fabricated zero (register G5). The Backend feed itself (the
-  message text and the bracketed tool/step markers) stays on stdout, a later ticket's.
+  as absent rather than a fabricated zero (register G5). The Backend's running
+  commentary rides the same sink -- its streamed message text as a partial
+  ``console.Narrated``, each tool-use state update as a ``console.ToolActivity``, and
+  its step boundaries as ``console.StepObserved`` -- so this adapter no longer writes
+  to a terminal at all (register G13). Whether any of it is shown is the Run console's
+  decision: suppressed by default, restored only under the opt-in feed (register
+  G2/G11). The text is reported as *partial* because OpenCode streams deltas rather
+  than whole messages, so the console holds the speaker's line open until the text
+  completes it; the incremental redaction below still happens here, because only this
+  side knows what was already reported.
 - The unmarked-question warning is emitted as an ``UnmarkedQuestion`` Observation (the
   raw fragment), and the Run console redacts, bounds, and words it into a bounded
   interruption, never the Backend's whole final message (#39/#41). This adapter
@@ -81,7 +89,10 @@ from ..console import (
     OPENCODE_AGENTS_DEVIATION,
     ContextObserved,
     Deviation,
+    Narrated,
     Observation,
+    StepObserved,
+    ToolActivity,
     ToolObserved,
     UnmarkedQuestion,
 )
@@ -277,7 +288,7 @@ class EventResult:
         self.assistant_messages: list[str] = []
         self.assistant_models: list[str] = []
         self.parts: dict[str, tuple[str, str]] = {}
-        self.printed: dict[str, str] = {}
+        self.reported: dict[str, str] = {}
         self.question: str | None = None
         self.backend_error: str | None = None
         # Part ids of tool calls already counted, so a tool part that streams several
@@ -315,7 +326,7 @@ class EventResult:
             self._accept_text_part(direct_part, trusted=True)
             return
         if event.get("type") in {"tool_use", "step_start", "step_finish"} and isinstance(direct_part, dict):
-            self._print_progress(event["type"], direct_part)
+            self._report_progress(event["type"], direct_part)
             if event.get("type") == "tool_use":
                 self._accept_tool(direct_part)
             elif event.get("type") == "step_finish":
@@ -380,27 +391,35 @@ class EventResult:
             # retained log (redacted a whole line at a time) stayed safe.
             # Comparing redacted-to-redacted closes that gap.
             redacted = redact(text)
-            shown = self.printed.get(part_id, "")
+            shown = self.reported.get(part_id, "")
             if redacted.startswith(shown):
                 addition = redacted[len(shown) :]
             else:
                 # A secret only completed once this chunk arrived, so the
-                # already-shown prefix changed under redaction. Reprint the fully
+                # already-reported prefix changed under redaction. Report the fully
                 # redacted part on a fresh line rather than emit a raw fragment.
                 addition = ("\n" if shown else "") + redacted
             if addition:
-                print(addition, end="", flush=True)
-            self.printed[part_id] = redacted
+                # A fragment of a message still streaming, not a whole one: the Run
+                # console holds the speaker's line open until the text completes it,
+                # so a prefix never lands mid-sentence (register G11). The adapter
+                # emits the fact; the console decides whether the opt-in feed shows
+                # it and words the prefix (register G2/G14).
+                self.emit(Narrated(addition, partial=True))
+            self.reported[part_id] = redacted
 
-    def _print_progress(self, event_type: str, part: dict[str, Any]) -> None:
+    def _report_progress(self, event_type: str, part: dict[str, Any]) -> None:
+        # The feed's progress markers, reported as facts the Run console words: a
+        # tool-use update with whatever state the stream named, or one of OpenCode's
+        # own step boundaries. Every state update is reported, unlike the status
+        # line's one-per-call ``ToolObserved`` (register G4/G14).
         if event_type == "tool_use":
             tool = part.get("tool") if isinstance(part.get("tool"), str) else "tool"
             state = part.get("state")
             status = state.get("status") if isinstance(state, dict) else None
-            suffix = f" ({status})" if isinstance(status, str) else ""
-            print(redact(f"[{tool}{suffix}]"), flush=True)
+            self.emit(ToolActivity(tool, state=status if isinstance(status, str) else None))
             return
-        print("[step started]" if event_type == "step_start" else "[step finished]", flush=True)
+        self.emit(StepObserved(started=event_type == "step_start"))
 
     def _accept_tool(self, part: dict[str, Any]) -> None:
         tool = part.get("tool")
@@ -779,8 +798,6 @@ def _consume_opencode_iteration(
             {"final_result_received": False, "session_id": result.session_id},
         )
     raise_if_controlled_stop(controller, "OpenCode", result.session_id)
-    if result.printed:
-        print()
     if result.backend_error:
         if result.session_id:
             raise HandoffError(

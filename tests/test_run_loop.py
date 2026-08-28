@@ -15,7 +15,7 @@ class RunLoopTest(RalphCliTestCase):
         result = self.run_ralph(env={"OPENCODE_DISABLE_DEFAULT_PLUGINS": "true"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Work complete.", result.stdout)
+        self.assertIn("Work complete.", result.stderr)
         run_dirs = list((self.repo / ".git" / "ralph" / "runs").iterdir())
         self.assertEqual(len(run_dirs), 1)
         run_dir = run_dirs[0]
@@ -172,7 +172,7 @@ class RunLoopTest(RalphCliTestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Work complete.", result.stdout)
+        self.assertIn("Work complete.", result.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         self.assertEqual(json.loads((run_dir / "outcome.json").read_text())["outcome"], "complete")
 

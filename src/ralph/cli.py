@@ -27,17 +27,24 @@ Invariants:
   the one seam #19 edits. Recovery relaxes the same guarantees a run does, so it
   states them as loudly: an admitted agent vector (the ``Deviation`` ``preflight``
   hands back) and the sandbox opt-out are stated through the injected console
-  (register G7/G13), which is why ``main`` passes it in. The remaining resume line —
-  the dangerous full-auto warning — is a ``print`` a later ticket migrates; the
-  structural test names ``cli`` explicitly.
+  (register G7/G13), which is why ``main`` passes it in. The dangerous full-auto
+  caveat goes through it too (``relaunching_full_auto``), so this module holds no
+  terminal write of its own and the structural rule that only the Run console
+  addresses a terminal now holds without exception (register G13).
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
 - ``main`` is the composition root (register G16): it is the only module in the
   tree that constructs a concrete Run console, and it injects it into ``run`` and
-  uses it for that terminal error line. Everything below depends on the
-  ``RunConsole`` abstraction only, so a later rendering change — quiet, verbose,
-  plain — is a different concrete class selected here and nothing else.
+  ``resume`` and uses it for the terminal error line. Everything below depends on
+  the ``RunConsole`` abstraction only, so both rendering choices an operator makes
+  are made here and nowhere else. ``--verbose`` hands the console a second stream —
+  stdout — for the Backend feed, which is otherwise suppressed so the default view
+  is the dashboard alone (register G2); ``--quiet`` drops the status line and the
+  Iteration blocks while the header, the summary, and every failure still print
+  (register G11). Both are ``run`` flags, defaulted off on the shared parser so
+  ``clean`` and ``resume`` carry them too. Whether the console paints for a terminal
+  or plain is nobody's choice: it is read from the stream at emit time.
 
 Depends on / must not know: the ``backends`` package (defaults, the registry, and
 the resolved Backend's five interface names), ``console`` (the ``RunConsole``
@@ -48,7 +55,7 @@ only), ``protocol`` (the default interactive-only label),
 (timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
 through the interface; it must not contain any Backend, Launch chain, or Loop
 mechanism of its own, nor branch on the backend name. It words no operator-facing
-line of its own beyond the ones not yet migrated to the Run console.
+line of its own at all: every one goes through the injected Run console.
 
 See also: ``console`` (the Run console it constructs), ``loop`` (the budgeted
 Iteration loop), ``backends`` (the registry and adapters), ``launch`` (wrapped argv
@@ -195,11 +202,7 @@ def resume(args: argparse.Namespace, console: RunConsole) -> int:
     argv = session_argv(
         backend.resume_argv(worktree, args.model, args.session), sandbox_profile
     )
-    print(
-        "WARNING: Ralph is relaunching the backend session in dangerous full-auto mode; "
-        "it may edit files and run commands without confirmation.",
-        file=sys.stderr,
-    )
+    console.relaunching_full_auto()
     try:
         os.chdir(worktree)
         os.execvpe(argv[0], argv, env)
@@ -210,6 +213,9 @@ def resume(args: argparse.Namespace, console: RunConsole) -> int:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="ralph")
+    # The two rendering flags belong to ``run``, but every command constructs the
+    # console, so they are defaulted here rather than read back with a fallback.
+    result.set_defaults(verbose=False, quiet=False)
     subcommands = result.add_subparsers(dest="command", required=True)
     run_parser = subcommands.add_parser("run", help="run bounded coding-agent iterations")
     run_parser.add_argument("prompt")
@@ -259,6 +265,25 @@ def parser() -> argparse.ArgumentParser:
             "and orthogonal to --unsafe-allow-agents; relaxes only host isolation"
         ),
     )
+    run_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "restore the backend's running commentary on stdout, each line prefixed "
+            "with the backend or the specific subagent that produced it; the "
+            "dashboard stays on stderr, so redirecting one leaves the other on the "
+            "terminal"
+        ),
+    )
+    run_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "suppress the status line and the per-iteration blocks for an unattended "
+            "run; the run header, the run summary, warnings, and every failure block "
+            "still print"
+        ),
+    )
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")
     resume_parser = subcommands.add_parser(
@@ -296,7 +321,12 @@ def main() -> int:
     args = parser().parse_args()
     # The composition root: the one place a concrete Run console is selected and
     # injected (register G16). Every module below here depends on the abstraction.
-    console = StreamRunConsole(sys.stderr)
+    # The four concrete renderings -- terminal, plain, quiet, verbose -- are selected
+    # here and only here: the dashboard on stderr, the opt-in Backend feed on stdout
+    # (register G11). ``clean`` and ``resume`` carry neither flag, so both default off.
+    console = StreamRunConsole(
+        sys.stderr, feed=sys.stdout if args.verbose else None, quiet=args.quiet
+    )
     try:
         if args.command == "run":
             return run(args, console)

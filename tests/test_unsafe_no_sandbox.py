@@ -156,6 +156,9 @@ class UnsafeNoSandboxRunTest(RalphCliTestCase):
         text = f"Token is {token} inside output.\nDone.\n<promise>COMPLETE</promise>"
         result = self.run_ralph(
             "--unsafe-no-sandbox",
+            # The opt-in feed is where streamed backend text appears at all, so the
+            # redaction that protects it is asserted where it is on show.
+            "--verbose",
             backend="claude",
             env={
                 "CLAUDE_CODE_OAUTH_TOKEN": token,

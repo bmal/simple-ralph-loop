@@ -60,12 +60,15 @@ Invariants:
   ``budget_continue`` render (register G14).
 - ``observe`` is the narrow one-method Observation sink the Backend adapters drive
   during an Iteration (register G14/G15). It carries a closed set of frozen value
-  types -- progress facts (``ToolObserved``, ``ContextObserved``, ``SubagentsObserved``)
-  and the mid-run warnings an adapter used to print itself (``MarkerWithdrawn``,
-  ``UnmarkedQuestion``, ``KilledTask``); the adapter emits facts and the console
-  decides wording, so the load-bearing ``withdrew it``, ``unmarked operator-directed``,
-  and the killed-task phrase live here now, not in the adapter (register G19). The
-  progress facts feed a single status line that repaints in place on a terminal
+  types -- progress facts (``ToolObserved``, ``ContextObserved``,
+  ``SubagentsObserved``), the mid-run warnings an adapter used to print itself
+  (``MarkerWithdrawn``,
+  ``UnmarkedQuestion``, ``KilledTask``), and the Backend's running commentary
+  (``Narrated``, ``ToolActivity``, ``StepObserved``); the adapter emits facts and the
+  console decides wording, so the load-bearing ``withdrew it``, ``unmarked
+  operator-directed``, and the killed-task phrase live here now, not in the adapter
+  (register G19). The progress facts feed a single status line that repaints in
+  place on a terminal
   (register G3/G4): Iteration and budget, the Iteration's elapsed time, the current
   or last tool, the tool count, the orchestrator's live context size, and the live
   subagent count -- each field absent, never zero, until a Backend supplies it, so an
@@ -82,6 +85,27 @@ Invariants:
   heartbeat lines carrying the same facts and no ANSI, so a piped log stays clean
   (register G3/G11). The status apparatus uses only ``\\r`` and spaces to repaint, never
   cursor-control escapes, so ``NO_COLOR`` on a terminal still emits no escape at all.
+- The commentary Observations are the opt-in Backend feed and nothing else. With no
+  *feed* stream they are dropped, which is what makes the default view a dashboard
+  (register G2); with one they are written to it -- stdout in production, while the
+  dashboard keeps stderr, so redirecting either leaves the other on the terminal
+  (register G11). Every feed line opens with the speaker that produced it, the
+  Backend or one specific subagent, so concurrent monologues stay attributable. A
+  streamed fragment leaves its speaker's line open until the text completes it, so a
+  prefix only ever lands at the start of a line; ``_finalize`` closes any line still
+  open when the Iteration ends. Ralph paints no colour onto the feed at all, on a
+  terminal or off it (register G12), so nothing Ralph writes there can be read as its
+  own voice; Backend text passes through as the Backend wrote it, exactly as it did
+  when the feed was the default view, and through the same redaction choke point
+  (register G17). A feed line erases and redraws the status line around itself exactly
+  as an operator line does, because an un-redirected ``--verbose`` puts both streams
+  on one terminal.
+- *quiet* drops exactly the status line and the Iteration blocks (register G11). The
+  header, the Trust boundary, the resolved children, the run summary, the deviation
+  warnings, the mid-run warnings, and every failure block still print, so an
+  unattended run is quiet without the operator losing their help. With no status line
+  there is no clock to keep moving, so the ticker never starts and no heartbeat
+  appends either. *quiet* and *feed* are orthogonal: they govern different streams.
 
 Depends on / must not know: ``redaction`` (functions only, never the active-redactor
 global). It must not know how a run is driven, which Backend it holds, or what any
@@ -117,6 +141,18 @@ RESET = "\033[0m"
 # Ralph's voice off a terminal: the prefix that makes its own lines greppable and
 # distinguishable from Backend output in a piped log, where colour cannot.
 PREFIX = "ralph: "
+
+# The Backend feed's speaker prefix, and the separator that names one subagent
+# apart from the Backend that launched it (register G11). Every feed line carries
+# one, so a run under ``--unsafe-allow-agents`` -- where the Backend and each of
+# its subagents narrate at once -- stays attributable instead of braiding three
+# monologues into one. It is deliberately not ``PREFIX``: the feed is Backend
+# content, and nothing on it may read as Ralph's own voice (register G12).
+FEED_SUBAGENT_SEPARATOR = "/"
+FEED_SPEAKER_DELIMITER = ": "
+# What the feed calls the speaker before a run header has named the Backend: a real
+# run always states one first, so this stands in only for a console driven without it.
+UNNAMED_BACKEND = "backend"
 
 # Used only when the stream claims to be a terminal but refuses to report a usable
 # size; a real ioctl answer is always preferred, and a non-terminal has no width.
@@ -311,6 +347,46 @@ class KilledTask:
     task_id: str | None
 
 
+@dataclass(frozen=True)
+class Narrated:
+    """A passage of running narration from the Backend or one of its subagents --
+    the commentary that left the default view (register G2) and returns only under
+    the opt-in feed. ``subagent`` is ``None`` for the Backend's own words and the
+    identifier of the specific subagent otherwise, so three concurrent monologues
+    stay attributable instead of braiding into one. ``partial`` says the passage is
+    a fragment of a message still streaming rather than a whole one, so the console
+    holds the line open instead of ending it -- the difference between a Backend
+    that emits complete messages and one that emits deltas."""
+
+    text: str
+    subagent: str | None = None
+    partial: bool = False
+
+
+@dataclass(frozen=True)
+class ToolActivity:
+    """A tool-use update as the Backend's stream reported it, for the feed alone:
+    every state change, not one per call, and a subagent's as well as the
+    orchestrator's. It is deliberately not ``ToolObserved`` -- that one is the
+    status line's orchestrator-only, one-per-call fact, and counting these would
+    inflate it. ``state`` is the status the stream reported, absent when it named
+    none."""
+
+    name: str
+    subagent: str | None = None
+    state: str | None = None
+
+
+@dataclass(frozen=True)
+class StepObserved:
+    """A step boundary in a Backend stream that has them (OpenCode's step-start and
+    step-finish parts), for the feed alone. The word names that Backend's own events
+    and is reserved to them, which is why register G23 keeps the Stage vocabulary off
+    it."""
+
+    started: bool
+
+
 Observation = (
     ToolObserved
     | ContextObserved
@@ -318,6 +394,9 @@ Observation = (
     | MarkerWithdrawn
     | UnmarkedQuestion
     | KilledTask
+    | Narrated
+    | ToolActivity
+    | StepObserved
 )
 
 
@@ -390,6 +469,8 @@ class RunConsole(Protocol):
 
     def run_started(self, settings: RunSettings) -> None: ...
 
+    def relaunching_full_auto(self) -> None: ...
+
     def interactive_only_resolved(self, label: str, issues: list[int]) -> None: ...
 
     def deviation(self, warning: Deviation) -> None: ...
@@ -460,11 +541,30 @@ def fit_line(prefix: str, value: str, width: int | None, *, keep_tail: bool) -> 
 
 
 class StreamRunConsole:
-    """Renders the Run console onto one stream — stderr in production (register
-    G11). Only ``cli`` constructs it."""
+    """Renders the Run console onto one stream — stderr in production — and, when
+    the operator opts in, the Backend feed onto a second one — stdout in production
+    (register G11). Only ``cli`` constructs it, and the two rendering choices an
+    operator makes are its two keyword arguments: *feed* off is the default view and
+    on restores the Backend's running commentary with speaker prefixes, and *quiet*
+    drops the status line and the Iteration blocks while keeping the header, the
+    summary, and every failure. Whether the result is painted for a terminal or
+    plain is not chosen here at all — it is read from the stream at emit time."""
 
-    def __init__(self, stream: TextIO) -> None:
+    def __init__(
+        self, stream: TextIO, *, feed: TextIO | None = None, quiet: bool = False
+    ) -> None:
         self._stream = stream
+        # The opt-in Backend feed's stream, or ``None`` when the commentary stays
+        # suppressed (register G2). It is a *second* stream on purpose: the operator
+        # can redirect the transcript to a file and keep watching the dashboard.
+        self._feed = feed
+        self._quiet = quiet
+        # Per-speaker partial feed lines. A Backend that streams deltas hands over
+        # fragments of a line, and a prefix belongs at the start of a line, not in
+        # the middle of one -- so the fragments are held here until the line ends.
+        self._feed_pending: dict[str | None, str] = {}
+        # What the feed calls the Backend, learned from the run header.
+        self._backend = UNNAMED_BACKEND
         # All writes -- the main thread's operator lines and the ticker's repaints --
         # go through one re-entrant lock so a repaint never interleaves with a line.
         self._lock = threading.RLock()
@@ -522,6 +622,8 @@ class StreamRunConsole:
                     "<promise>NEEDS_INPUT</promise> marker and no question tool used): "
                     f"{summarize_message(redact(observation.quote))}",
                 )
+            elif isinstance(observation, (Narrated, ToolActivity, StepObserved)):
+                self._commentary(observation)
             elif isinstance(observation, KilledTask):
                 label = (
                     f"task {observation.task_id}"
@@ -535,6 +637,9 @@ class StreamRunConsole:
                 )
 
     def run_started(self, settings: RunSettings) -> None:
+        # The feed names its speakers after the resolved Backend, so a captured
+        # transcript says which one produced it without cross-referencing the header.
+        self._backend = settings.backend
         self._fact("backend", f"{settings.backend}, model {settings.model}")
         self._fact(
             "iterations",
@@ -580,6 +685,11 @@ class StreamRunConsole:
         # elapsed clock. The status line itself is not painted until the first
         # Observation establishes it, so an Iteration that emits none never shows one.
         self._begin_iteration(number, iterations)
+        if self._quiet:
+            # Quiet drops the Iteration blocks and the status line, and nothing else:
+            # the header, the summary, the warnings, and every failure still print,
+            # so an unattended run stays quiet without losing its help (register G11).
+            return
         # A rule opening the Iteration (register G2/G9): a full-width divider on a
         # terminal, embedding the number and the budget; a plain labelled line when
         # the stream has no width, so a piped log stays readable without the fill.
@@ -604,6 +714,8 @@ class StreamRunConsole:
         # The Iteration is over: stop the ticker and erase any painted status line
         # before the outcome block prints, so nothing redraws a stale status below it.
         self._finalize()
+        if self._quiet:
+            return
         session = outcome.session_id or "no session id"
         self._fact(
             f"iteration {outcome.number} of {outcome.iterations}",
@@ -684,6 +796,20 @@ class StreamRunConsole:
             self._line("failure", "No iterations remain to continue Ralph.")
         self._line("failure", "==========================================")
 
+    def relaunching_full_auto(self) -> None:
+        # ``resume`` hands control to an interactive session started in the same
+        # dangerous full-auto mode a run uses. A run states that caveat as a header
+        # setting (register G7); recovery has no header yet, so it stays the loud
+        # line it has always been -- worded here, like every other operator-facing
+        # string, so no module outside the Run console addresses a terminal
+        # (register G13/G14). Emitted whole through ``_line``: its ``WARNING:``
+        # opener is the first-column anchor, not the header's ``ralph: `` voice.
+        self._line(
+            "warning",
+            "WARNING: Ralph is relaunching the backend session in dangerous full-auto "
+            "mode; it may edit files and run commands without confirmation.",
+        )
+
     def failure_help(self, reason: str, run_dir: Path) -> None:
         # A failure that left a run directory behind is told what failed and where the
         # evidence is, not just one sentence (register G10). The reason keeps the
@@ -742,6 +868,82 @@ class StreamRunConsole:
         G17/G19)."""
         self._paint("", role, redact(text), role)
 
+    def _speaker(self, subagent: str | None) -> str:
+        """Who a feed line is attributed to: the Backend, or the specific subagent
+        that produced it (register G11)."""
+        who = self._backend
+        if subagent:
+            who = f"{who}{FEED_SUBAGENT_SEPARATOR}{subagent}"
+        return who + FEED_SPEAKER_DELIMITER
+
+    def _commentary(self, observation: Narrated | ToolActivity | StepObserved) -> None:
+        """The Backend's running commentary: the opt-in feed's business and nothing
+        else, so with no feed stream it is dropped here and never reaches the
+        dashboard (register G2). This is the one place that decision is taken."""
+        if self._feed is None:
+            return
+        if isinstance(observation, Narrated):
+            self._feed_narrated(observation)
+        elif isinstance(observation, ToolActivity):
+            state = f" ({observation.state})" if observation.state else ""
+            self._feed_marker(f"{observation.name}{state}", observation.subagent)
+        else:
+            self._feed_marker(
+                "step started" if observation.started else "step finished", None
+            )
+
+    def _feed_narrated(self, observation: Narrated) -> None:
+        """Append a passage of narration to its speaker's line and emit whatever
+        that completes. A whole message ends its line; a streamed fragment leaves it
+        open, so a prefix only ever lands at the start of a line and a sentence split
+        across deltas is not split across rows."""
+        pending = self._feed_pending.get(observation.subagent, "") + observation.text
+        if not observation.partial:
+            pending += "\n"
+        lines = pending.split("\n")
+        self._feed_pending[observation.subagent] = lines.pop()
+        for line in lines:
+            self._feed_write(observation.subagent, line)
+
+    def _feed_marker(self, label: str, subagent: str | None) -> None:
+        """A bracketed progress marker on the feed. Its speaker's open line is closed
+        first, so the marker starts a row of its own rather than landing mid-sentence."""
+        self._feed_flush_speaker(subagent)
+        self._feed_write(subagent, f"[{label}]")
+
+    def _feed_flush_speaker(self, subagent: str | None) -> None:
+        pending = self._feed_pending.pop(subagent, "")
+        if pending:
+            self._feed_write(subagent, pending)
+
+    def _feed_flush_locked(self) -> None:
+        # An Iteration can end with a message that never reached a line break; the
+        # operator is owed the last of it, so every open line is closed here.
+        if self._feed is None:
+            return
+        for subagent in list(self._feed_pending):
+            self._feed_flush_speaker(subagent)
+
+    def _feed_write(self, subagent: str | None, text: str) -> None:
+        # Ralph paints nothing onto the feed, on a terminal or off it (register G12):
+        # the speaker prefix is plain text and no palette role is applied, so a
+        # redirected transcript carries no ANSI of Ralph's own and nothing here can be
+        # read as Ralph's voice. Backend text is passed through as the Backend wrote
+        # it -- unchanged from when the feed was the default view -- through the same
+        # redaction choke point as every other operator-facing string (register G17).
+        if self._feed is None:
+            return
+        with self._lock:
+            # The status line is erased and redrawn around a feed line exactly as it
+            # is around an operator line: an un-redirected ``--verbose`` puts both
+            # streams on one terminal, where a feed line would otherwise land on top
+            # of the painted status (register G3). Both calls are no-ops when nothing
+            # is painted, so a redirected feed costs the dashboard nothing.
+            self._erase_status_locked()
+            self._feed.write(redact(self._speaker(subagent) + text) + "\n")
+            self._feed.flush()
+            self._paint_status_locked()
+
     def _paint(self, prefix: str, prefix_role: str, value: str, value_role: str) -> None:
         # The last stop before the stream. Everything above has already passed
         # through `redact`, the single choke point for operator-facing output
@@ -780,6 +982,10 @@ class StreamRunConsole:
     def _establish_locked(self) -> None:
         # The first Observation of an Iteration turns the status line on and starts
         # the ticker that keeps its clock moving; later Observations only repaint it.
+        # Quiet establishes nothing: with no status line there is no clock to keep
+        # moving and no heartbeat to append, so the ticker never starts (register G11).
+        if self._quiet:
+            return
         if not self._status_established:
             self._status_established = True
             # Anchor the heartbeat clock so the first append-only heartbeat is a full
@@ -796,6 +1002,7 @@ class StreamRunConsole:
         with self._lock:
             self._status_active = False
             self._status_established = False
+            self._feed_flush_locked()
             self._erase_status_locked()
             stop, thread = self._ticker_stop, self._ticker_thread
             self._ticker_stop = self._ticker_thread = None

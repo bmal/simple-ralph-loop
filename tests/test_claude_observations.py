@@ -18,7 +18,9 @@ from ralph.backends.claude import ClaudeEventResult, orchestrator_context
 from ralph.console import (
     ContextObserved,
     KilledTask,
+    Narrated,
     SubagentsObserved,
+    ToolActivity,
     ToolObserved,
 )
 
@@ -101,6 +103,43 @@ class ClaudeObservationExtractionTest(unittest.TestCase):
         )
         tools = [o.name for o in sink.observations if isinstance(o, ToolObserved)]
         self.assertEqual(tools, ["Bash", "Read"])
+
+    def test_narration_is_attributed_to_the_backend_or_the_subagent_that_spoke(
+        self,
+    ) -> None:
+        # The origin marker decides who a passage is attributed to, so the feed can
+        # name each voice rather than braiding them (register G11).
+        sink = self._feed(
+            [
+                _init(),
+                _assistant("s1", [_text("Delegating.")]),
+                _assistant("s1", [_text("Survey done.")], parent="toolu_9"),
+            ]
+        )
+        narration = [o for o in sink.observations if isinstance(o, Narrated)]
+        self.assertEqual(
+            [(o.text, o.subagent, o.partial) for o in narration],
+            [("Delegating.", None, False), ("Survey done.", "toolu_9", False)],
+        )
+
+    def test_a_subagents_tool_use_reaches_the_feed_but_not_the_status_count(
+        self,
+    ) -> None:
+        # Every tool use is reported to the feed with its speaker; only the
+        # orchestrator's counts toward the status line (register G4).
+        sink = self._feed(
+            [
+                _init(),
+                _assistant("s1", [_tool("Bash")]),
+                _assistant("s1", [_tool("Read")], parent="toolu_9"),
+            ]
+        )
+        activity = [o for o in sink.observations if isinstance(o, ToolActivity)]
+        self.assertEqual(
+            [(o.name, o.subagent) for o in activity], [("Bash", None), ("Read", "toolu_9")]
+        )
+        counted = [o.name for o in sink.observations if isinstance(o, ToolObserved)]
+        self.assertEqual(counted, ["Bash"])
 
     def test_orchestrator_context_sums_input_cache_read_and_cache_creation(self) -> None:
         sink = self._feed(

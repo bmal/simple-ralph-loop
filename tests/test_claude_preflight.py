@@ -13,7 +13,9 @@ class ClaudePreflightTest(RalphCliTestCase):
         result = self.run_ralph(backend="claude")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Work complete.", result.stdout)
+        # The concluding message rides the Iteration outcome block on stderr; the
+        # Backend feed itself is off unless the operator asks for it (register G2).
+        self.assertIn("Work complete.", result.stderr)
         invocation = (self.calls / "claude").read_text()
         self.assertIn("-p --input-format stream-json --output-format stream-json", invocation)
         self.assertIn("--dangerously-skip-permissions", invocation)

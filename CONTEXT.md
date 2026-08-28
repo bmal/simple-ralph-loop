@@ -79,19 +79,27 @@ guarantee, the full help block every failure gets once a run directory exists (t
 exhaustion continuation command), and the bell — and the rendering apparatus behind
 that small interface: the four-role palette, terminal and `NO_COLOR` detection,
 dynamic width, no-wrap truncation, and the single choke point every operator-facing
-string is redacted at. It is the only module permitted to write to a terminal — the
-emit sites still outside it are named explicitly by the structural test that enforces
-the rule, and each is migrated in turn — and `cli` is the only module that constructs
-one.
+string is redacted at. It is the only module permitted to write to a terminal, now
+without exception — every emit site has migrated and the structural test enforces the
+rule with no allowlist — and `cli` is the only module that constructs one, choosing
+between its four renderings there and nowhere else. It owns two streams: the
+dashboard on standard error, and the opt-in Backend feed on standard output, so
+redirecting a transcript to a file leaves the dashboard on the terminal. The feed is
+off by default, which is what makes the default view a dashboard rather than a feed;
+quiet drops the status line and the Iteration blocks and nothing else, so an
+unattended run never loses its header, its summary, or its help.
 _Avoid_: log, output, UI, stderr (the stream it happens to write to)
 
 **Observation**:
 A single fact a Backend adapter emits about a running Iteration through the
 narrow one-method sink the Loop injects into `execute_iteration`, over a closed
 set of frozen value types — the orchestrator's tool use and live context gauge,
-the live subagent roster, and the mid-run warnings the adapter used to print
-itself. The adapter emits facts and the Run console decides wording and rendering,
-so neither the Loop nor an adapter constructs operator-facing text; a new kind of
+the live subagent roster, the mid-run warnings the adapter used to print itself, and
+the Backend's own running commentary, each passage attributed to the Backend or to
+the specific subagent that produced it. The adapter emits facts and the Run console
+decides wording and rendering — including whether a fact is shown at all, which is
+how the commentary left the default view without any adapter knowing it had — so
+neither the Loop nor an adapter constructs operator-facing text; a new kind of
 Observation is a new value type, never a wider interface, so the seam stays one
 method while what rides it grows.
 _Avoid_: event (reserved for a Backend's own stream events), log, message, progress bar

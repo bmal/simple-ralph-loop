@@ -67,8 +67,14 @@ Invariants:
   the shared vocabulary, absent when the event carries no usage; a subagent's window
   is separate and never counted. A ``background_tasks_changed`` for the established
   session emits the live subagent roster (``SubagentsObserved``), whose count is what
-  explains a silent orchestrator. The Backend feed itself (the message text and the
-  bracketed tool markers) stays on stdout, a later ticket's migration.
+  explains a silent orchestrator. The Backend's running commentary rides the same
+  sink -- its message text as ``console.Narrated`` and each tool use as a
+  ``console.ToolActivity``, both carrying the origin marker's subagent so the feed
+  can name who spoke -- so this adapter no longer writes to a terminal at all
+  (register G13). Whether any of it is shown is the Run console's decision: it is
+  suppressed by default and restored only under the opt-in feed (register G2/G11).
+  The ``ToolActivity`` a subagent's tool use emits is deliberately not a
+  ``ToolObserved``: the status line's tool count stays the orchestrator's alone.
 - The composed prompt carries an adapter-local ``BACKGROUND_TASK_DIRECTIVE`` after
   the shared Loop protocol (H3): the Backend may launch background work but must not
   *park* on it -- end its turn while a task is still unresolved, expecting to be
@@ -156,8 +162,10 @@ from ..console import (
     Deviation,
     KilledTask,
     MarkerWithdrawn,
+    Narrated,
     Observation,
     SubagentsObserved,
+    ToolActivity,
     ToolObserved,
     UnmarkedQuestion,
 )
@@ -761,8 +769,12 @@ class ClaudeEventResult:
         # Only the Backend's own text (a null origin marker, refused above if the
         # marker is absent) assembles the turn's response and is later scanned for
         # markers, so a subagent speaking last is never mistaken for the answer;
-        # the subagent's output is still printed and retained as evidence.
-        is_backend = event.get("parent_tool_use_id") is None
+        # the subagent's output is still reported to the feed and retained as evidence.
+        origin = event.get("parent_tool_use_id")
+        is_backend = origin is None
+        # Who the feed attributes this event's lines to: the Backend itself, or the
+        # specific subagent the origin marker names (register G11).
+        subagent = origin if isinstance(origin, str) and origin else None
         if is_backend:
             # The orchestrator's live context gauge, emitted from its own events only
             # (a subagent's window is separate, register G5). The per-Backend
@@ -771,11 +783,13 @@ class ClaudeEventResult:
             context = orchestrator_context(message.get("usage"))
             if context is not None:
                 self.emit(ContextObserved(context))
-        # Each Claude stream-json assistant event carries a complete message
-        # (there are no incremental text deltas without partial-message mode),
-        # so print each part on its own line: text as a paragraph, tool use as a
-        # bracketed progress marker matching the OpenCode backend's style.
-        # Printing with end="" here would glue consecutive messages together.
+        # Each Claude stream-json assistant event carries a complete message (there
+        # are no incremental text deltas without partial-message mode), so each part
+        # is a whole passage rather than a fragment: reported as a complete
+        # ``Narrated``, which is what stops consecutive messages gluing together.
+        # The Run console decides whether the opt-in feed shows it and words its
+        # speaker prefix; this adapter emits the fact and no operator text
+        # (register G2/G14).
         texts: list[str] = []
         for part in content:
             if not isinstance(part, dict):
@@ -783,7 +797,7 @@ class ClaudeEventResult:
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 texts.append(part["text"])
                 if part["text"]:
-                    print(redact(part["text"]), flush=True)
+                    self.emit(Narrated(part["text"], subagent=subagent))
                 continue
             if part.get("type") == "tool_use":
                 name = part.get("name")
@@ -796,7 +810,15 @@ class ClaudeEventResult:
                     # status line shows the current tool and a running tool count
                     # (register G4). A subagent's tool use is left to the roster count.
                     self.emit(ToolObserved(name if isinstance(name, str) and name else "tool"))
-                print(redact(f"[{name if isinstance(name, str) and name else 'tool'}]"), flush=True)
+                # The feed's own marker, reported for a subagent's tool use as well
+                # as the orchestrator's -- the status line's count deliberately is
+                # not (register G4).
+                self.emit(
+                    ToolActivity(
+                        name if isinstance(name, str) and name else "tool",
+                        subagent=subagent,
+                    )
+                )
         text = "".join(texts)
         if text and is_backend and self.turns:
             self.turns[-1].parent_texts.append(text)

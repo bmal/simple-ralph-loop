@@ -604,12 +604,15 @@ class LoopProtocolTest(RalphCliTestCase):
         ]
         events = "\n".join(json.dumps(item) for item in progress) + "\n" + self._events("Finished")
         result = self.run_ralph(
-            env={"FAKE_EVENTS": events, "FAKE_EXPORT": self._export("Finished")}
+            "--verbose",
+            env={"FAKE_EVENTS": events, "FAKE_EXPORT": self._export("Finished")},
         )
 
-        self.assertIn("[step started]", result.stdout)
-        self.assertIn("[bash (completed)]", result.stdout)
-        self.assertIn("[step finished]", result.stdout)
+        # The markers are the opt-in feed's, and each names the speaker that produced
+        # it so a run with subagents reads as separate voices (register G11).
+        self.assertIn("opencode: [step started]", result.stdout)
+        self.assertIn("opencode: [bash (completed)]", result.stdout)
+        self.assertIn("opencode: [step finished]", result.stdout)
         # Backend progress stays on stdout; Ralph's own voice stays on stderr,
         # where the run header states the full-auto permissions as a setting.
         self.assertIn("ralph: permissions dangerous full-auto", result.stderr)

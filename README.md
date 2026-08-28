@@ -63,6 +63,8 @@ so `git pull` first.
 ralph run prompt.md --backend opencode --iterations 5
 ralph run prompt.md --backend claude --iterations 5
 ralph run prompt.md --backend opencode --iterations 2 --timeout 5400
+ralph run prompt.md --backend claude --iterations 5 --verbose > feed.log
+ralph run prompt.md --backend claude --iterations 5 --quiet
 ```
 
 OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
@@ -115,10 +117,26 @@ keeps spinning over a hang answers the wrong question, while a clock that stops
 tells you the run has stalled. The line is read against the terminal's live width
 and never wraps — it drops fields from the right as the window narrows. When
 stderr is not a terminal the line degrades to slow append-only heartbeats carrying
-the same facts and no escape sequences, so a piped log stays clean. The backend's
-own running commentary — its message text and bare tool markers — still prints on
-stdout, separate from this stderr dashboard; a later change moves it behind an
-opt-in so the default view is the dashboard alone.
+the same facts and no escape sequences, so a piped log stays clean.
+
+The backend's own running commentary — its message text and bare tool markers — does
+not print at all by default, which is what leaves room for the dashboard. Each
+iteration's concluding message survives in its outcome block, truncated for display.
+`--verbose` restores the full feed on stdout, every line prefixed with the backend or
+the specific subagent that produced it, so a run under `--unsafe-allow-agents` reads
+as separate voices rather than three braided monologues. The feed and the dashboard
+are deliberately different streams: `ralph run … --verbose > feed.log` captures the
+whole transcript to a file while you keep watching the dashboard on the terminal.
+Ralph paints nothing onto the feed: the speaker prefix is plain text and no colour is
+added, on a terminal or off it, so nothing Ralph put there can be read as its own
+voice. The backend's own text passes through as the backend wrote it, exactly as it
+did when the feed was the default view.
+
+`--quiet` is the other direction, for an unattended run: it drops the status line and
+the per-iteration blocks, and nothing else. The run header, the run summary, the
+deviation warnings, and every failure block still print, so quiet never costs you your
+help. The two flags are orthogonal — they govern different streams — and both are
+`ralph run` flags.
 
 Every run ends with a summary, on every terminal path
 including a successful one that used to exit in silence: it names the final

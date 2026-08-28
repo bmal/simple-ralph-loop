@@ -52,7 +52,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         )
         result = self._run(two_turn)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Work complete.", result.stdout)
+        self.assertIn("Work complete.", result.stderr)
         # Operator-facing stderr announces the run and stays clean of any halt.
         self.assertIn("ralph: backend claude", result.stderr)
         self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
@@ -100,7 +100,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
                 events = self._claude_multiturn_events([{"text": answer}], teardown=teardown)
                 result = self._run(events)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("Work complete.", result.stdout)
+                self.assertIn("Work complete.", result.stderr)
                 self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
                 self.assertNotIn("event after the terminal result", result.stderr)
                 _, outcome = self._read_outcome()
@@ -146,7 +146,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         ]
         result = self._run(self._claude_stream(events))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Launched in the background, not waiting.", result.stdout)
+        self.assertIn("Launched in the background, not waiting.", result.stderr)
         self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
         self.assertNotIn("event after the terminal result", result.stderr)
         self.assertNotIn("a result per turn", result.stderr)
@@ -173,7 +173,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         )
         result = self._run(events)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("All done.", result.stdout)
+        self.assertIn("All done.", result.stderr)
         self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
         self.assertNotIn("a result per turn", result.stderr)
         self.assertNotIn("event after the terminal result", result.stderr)
@@ -804,7 +804,7 @@ class ClaudeMultiTurnTest(RalphCliTestCase):
         # Named by the task id -- the identifier the observed killed event carries.
         self.assertIn("task_ci_verify", result.stderr)
         # The report neither reclassifies the Iteration nor touches its final message.
-        self.assertIn("Pushed to main", result.stdout)
+        self.assertIn("Pushed to main", result.stderr)
         self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
         _, outcome = self._read_outcome()
         self.assertEqual(outcome["outcome"], "complete")

@@ -19,7 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ralph.backends.opencode import EventResult, orchestrator_context
 from ralph.console import (
     ContextObserved,
+    Narrated,
+    StepObserved,
     SubagentsObserved,
+    ToolActivity,
     ToolObserved,
 )
 
@@ -74,6 +77,28 @@ def _wrapped_tool(tool: str, part_id: str, status: str = "running", session: str
                 "state": {"status": status},
             }
         },
+    }
+
+
+def _text(text: str, part_id: str = "part_1", session: str = "ses_1") -> dict:
+    return {
+        "type": "text",
+        "sessionID": session,
+        "part": {
+            "id": part_id,
+            "sessionID": session,
+            "messageID": "msg_1",
+            "type": "text",
+            "text": text,
+        },
+    }
+
+
+def _step_start(part_id: str = "prt_ss", session: str = "ses_1") -> dict:
+    return {
+        "type": "step_start",
+        "sessionID": session,
+        "part": {"id": part_id, "type": "step-start"},
     }
 
 
@@ -159,6 +184,35 @@ class OpenCodeObservationExtractionTest(unittest.TestCase):
             ]
         )
         self.assertFalse(any(isinstance(o, SubagentsObserved) for o in sink.observations))
+
+    def test_streamed_text_is_reported_as_a_partial_passage_of_narration(self) -> None:
+        # OpenCode streams a growing text part, so each report is the *addition* since
+        # the last one and is marked partial: the console holds the line open rather
+        # than breaking a sentence across rows (register G11).
+        sink = self._feed([_text("Work "), _text("Work complete.")])
+        narration = [o for o in sink.observations if isinstance(o, Narrated)]
+        self.assertEqual([(o.text, o.partial) for o in narration], [("Work ", True), ("complete.", True)])
+        # OpenCode runs no orchestrator/subagent split, so nothing is attributed away
+        # from the Backend itself.
+        self.assertEqual([o.subagent for o in narration], [None, None])
+
+    def test_every_tool_state_update_is_reported_to_the_feed(self) -> None:
+        # The feed shows the stream as it happened -- one marker per update -- while
+        # the status line's ``ToolObserved`` count stays one per call (register G4).
+        sink = self._feed(
+            [
+                _tool_use("bash", "prt_1", status="pending"),
+                _tool_use("bash", "prt_1", status="completed"),
+            ]
+        )
+        activity = [o for o in sink.observations if isinstance(o, ToolActivity)]
+        self.assertEqual([(o.name, o.state) for o in activity], [("bash", "pending"), ("bash", "completed")])
+        self.assertEqual(len([o for o in sink.observations if isinstance(o, ToolObserved)]), 1)
+
+    def test_step_boundaries_are_reported_as_their_own_fact(self) -> None:
+        sink = self._feed([_step_start(), _step_finish({"input": 1})])
+        steps = [o.started for o in sink.observations if isinstance(o, StepObserved)]
+        self.assertEqual(steps, [True, False])
 
     def test_no_sink_is_a_no_op(self) -> None:
         # An accumulator with no sink still runs: the emits are silently dropped.
