@@ -21,6 +21,15 @@ The ordered stack of wrappers every backend session starts under — the
 innermost — identical for automated iterations and handed-off recovery.
 _Avoid_: launcher, wrapper, command line
 
+**In-scope backend**:
+A Backend whose subscription credential this run is allowed to read. Always the
+Backend ralph launches; additionally, any the operator declares with
+`--in-scope-backend` because the run's own work dispatches to it. Every Backend
+*not* in the set has its credential denied by the host-isolation profile. The set
+is per-run and declared, not observed — host isolation confines the whole process
+tree at once, so a declared credential is readable by every command in the run.
+_Avoid_: allowed backend, secondary backend, extra backend
+
 **Loop protocol**:
 The contract ralph appends to every prompt telling the backend how to signal
 an iteration's outcome (complete, or needs operator input) via markers ralph

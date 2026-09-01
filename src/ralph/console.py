@@ -190,6 +190,8 @@ OUTCOME_HEADLINES = {
 NO_SANDBOX_DEVIATION = "no-sandbox"
 CLAUDE_AGENTS_DEVIATION = "claude-agents"
 OPENCODE_AGENTS_DEVIATION = "opencode-agents"
+IN_SCOPE_CLAUDE_DEVIATION = "in-scope-claude"
+IN_SCOPE_OPENCODE_DEVIATION = "in-scope-opencode"
 
 DEVIATION_TEXTS = {
     NO_SANDBOX_DEVIATION: (
@@ -205,6 +207,26 @@ DEVIATION_TEXTS = {
         "WARNING: --unsafe-allow-agents is set; Ralph is not proving "
         "OpenCode agent isolation for this run."
     ),
+    IN_SCOPE_CLAUDE_DEVIATION: (
+        "WARNING: --in-scope-backend claude is set; this run can read and write the "
+        "Claude subscription store. sandbox-exec confines the whole process tree at "
+        "once, so every command in the run can read that credential, not only the "
+        "Claude session. No other guarantee is relaxed."
+    ),
+    IN_SCOPE_OPENCODE_DEVIATION: (
+        "WARNING: --in-scope-backend opencode is set; this run can read the OpenCode "
+        "subscription credential and rewrite it on token refresh. sandbox-exec "
+        "confines the whole process tree at once, so every command in the run can "
+        "read that credential, not only the OpenCode session. No other guarantee is "
+        "relaxed."
+    ),
+}
+
+# Which deviation names a declared in-scope backend. The Loop and ``cli`` resume
+# name the backend; the wording stays here (register G14).
+IN_SCOPE_BACKEND_DEVIATIONS = {
+    "claude": IN_SCOPE_CLAUDE_DEVIATION,
+    "opencode": IN_SCOPE_OPENCODE_DEVIATION,
 }
 
 

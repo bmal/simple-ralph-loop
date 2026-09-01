@@ -114,6 +114,79 @@ class SandboxProfileTest(unittest.TestCase):
         # ~/.config/git/config (not a secret) is never swept up with it.
         self.assertNotIn(str(self.home / ".config" / "git" / "config"), denied)
 
+    # --- the in-scope backend set (D3/D4 owner amendment, 2026-09-01) ---------
+
+    def _claude_profile(self, **kwargs: object) -> str:
+        return launch.build_sandbox_profile(
+            "claude", self.worktree, self.ralph_dir, self.session_tmp, self.home, **kwargs
+        )
+
+    def test_declaring_nothing_denies_the_other_backend_exactly_as_before(self) -> None:
+        # The amendment is opt-in: a run that declares no additional backend must
+        # get the pre-amendment policy, so the guarantee every existing run relies
+        # on cannot drift as a side effect of adding the flag.
+        claude = self._claude_profile()
+        self.assertIn(
+            f'(deny file-read* (literal "{self.home}/.local/share/opencode/auth.json"))', claude
+        )
+        self.assertNotIn("auth.json", "\n".join(self._write_allow_lines(claude)))
+        self.assertIn(f'(deny file-read* (subpath "{self.home}/.claude"))', self._opencode_profile())
+
+    def test_declaring_a_backend_in_scope_grants_exactly_its_credential(self) -> None:
+        # A declaration lifts the deny on the single literal path D4 already names
+        # and makes that one file writable so a token refresh persists. It must not
+        # make the surrounding store writable: everything OpenCode writes other
+        # than the credential goes to the pinned per-run XDG directory.
+        profile = self._claude_profile(in_scope=("opencode",))
+        credential = f'{self.home}/.local/share/opencode/auth.json'
+        self.assertNotIn(f'(deny file-read* (literal "{credential}"))', profile)
+        self.assertIn(f'(allow file-write* (literal "{credential}"))', profile)
+        allowed = "\n".join(self._write_allow_lines(profile))
+        self.assertNotIn(f'(subpath "{self.home}/.local/share/opencode")', allowed)
+
+    def test_declaring_a_backend_in_scope_removes_no_other_deny(self) -> None:
+        # Scoped to one entry: the amendment conditions a single deny and leaves
+        # the rest of the famous-credential list byte-identical.
+        before = self._deny_read_lines(self._claude_profile())
+        after = self._deny_read_lines(self._claude_profile(in_scope=("opencode",)))
+        removed = [line for line in before if line not in after]
+        self.assertEqual(len(removed), 1, removed)
+        self.assertIn("auth.json", removed[0])
+        self.assertEqual([line for line in after if line not in before], [])
+
+    def test_the_declaration_is_symmetric_for_the_other_backend(self) -> None:
+        # D4's rule is mutual exclusion, so the amendment must lift it in both
+        # directions: an OpenCode run declaring Claude gets ~/.claude back, as the
+        # directory tree that store is.
+        profile = launch.build_sandbox_profile(
+            "opencode", self.worktree, self.ralph_dir, self.session_tmp, self.home,
+            in_scope=("claude",),
+        )
+        self.assertNotIn(f'(deny file-read* (subpath "{self.home}/.claude"))', profile)
+        self.assertIn(f'(allow file-write* (subpath "{self.home}/.claude"))', profile)
+
+    def test_declaring_the_running_backend_changes_nothing(self) -> None:
+        # Its store is in-scope by D4 already; naming it must not add a redundant
+        # grant or otherwise perturb the profile.
+        self.assertEqual(self._claude_profile(in_scope=("claude",)), self._claude_profile())
+
+    def test_opencode_store_write_root_follows_the_session_data_home(self) -> None:
+        # OpenCode honors $XDG_DATA_HOME for its whole store. Deriving the write
+        # root from the session environment instead of assuming ~/.local/share is
+        # what keeps an operator who exports the variable from getting a profile
+        # whose allow-list points at a directory OpenCode never touches.
+        data_home = Path("/work/project/.git/ralph/runs/stamp/xdg")
+        allowed = "\n".join(
+            self._write_allow_lines(
+                launch.build_sandbox_profile(
+                    "opencode", self.worktree, self.ralph_dir, self.session_tmp,
+                    self.home, (), data_home,
+                )
+            )
+        )
+        self.assertIn(f'(subpath "{data_home}/opencode")', allowed)
+        self.assertNotIn(f'(subpath "{self.home}/.local/share/opencode")', allowed)
+
     def test_write_allow_list_is_exactly_the_sanctioned_roots(self) -> None:
         profile = self._opencode_profile()
         self.assertIn("(deny file-write*)", profile)
@@ -706,3 +779,145 @@ class _patched_environ:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+class InScopeBackendStateTest(unittest.TestCase):
+    """The per-run state directory a declared in-scope OpenCode gets, and the
+    environment additions that point it there (register D3/D4, owner amendment
+    2026-09-01). Behavior only: what is seeded on disk and what the caller must
+    layer onto the session environment."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.run_dir = base / "run"
+        self.run_dir.mkdir()
+        self.home = base / "home"
+        (self.home / ".local" / "share" / "opencode").mkdir(parents=True)
+        self.credential = self.home / ".local" / "share" / "opencode" / "auth.json"
+        self.credential.write_text("{}\n", encoding="utf-8")
+
+    def test_declaring_nothing_seeds_nothing(self) -> None:
+        # The default run must not gain a state directory or an environment key it
+        # never asked for.
+        self.assertEqual(
+            launch.prepare_in_scope_state(self.run_dir, "claude", (), self.home), {}
+        )
+        self.assertEqual(list(self.run_dir.iterdir()), [])
+
+    def test_declaring_the_running_backend_seeds_nothing(self) -> None:
+        # An OpenCode run already owns its store; pinning it would relocate the
+        # operator's existing session history behind `ralph clean`.
+        self.assertEqual(
+            launch.prepare_in_scope_state(self.run_dir, "opencode", ("opencode",), self.home),
+            {},
+        )
+        self.assertEqual(list(self.run_dir.iterdir()), [])
+
+    def test_declared_opencode_gets_a_pinned_store_and_a_credential_symlink(self) -> None:
+        env = launch.prepare_in_scope_state(self.run_dir, "claude", ("opencode",), self.home)
+        xdg = self.run_dir / launch.SANDBOX_XDG_DIRNAME
+        self.assertEqual(env, {"XDG_DATA_HOME": str(xdg)})
+        link = xdg / "opencode" / "auth.json"
+        # A symlink, not a copy: a token refresh during the run must write through
+        # to the operator's real credential rather than strand a rotated token in
+        # the run directory.
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.readlink(), self.credential)
+
+    def test_seeding_is_idempotent(self) -> None:
+        # `resume` re-seeds the same directory a run already prepared; a second
+        # call must not fail on the existing symlink.
+        first = launch.prepare_in_scope_state(self.run_dir, "claude", ("opencode",), self.home)
+        second = launch.prepare_in_scope_state(self.run_dir, "claude", ("opencode",), self.home)
+        self.assertEqual(first, second)
+
+    def test_a_declared_lane_that_cannot_be_seeded_fails_closed(self) -> None:
+        # Losing a declared lane silently is worse than stopping: the run would
+        # spend budget producing half the work it was asked for (register D7).
+        blocked = self.run_dir / "blocked"
+        blocked.write_text("not a directory\n", encoding="utf-8")
+        with self.assertRaises(RalphError) as caught:
+            launch.prepare_in_scope_state(blocked, "claude", ("opencode",), self.home)
+        self.assertIn("in-scope OpenCode state directory", str(caught.exception))
+
+
+class InScopeBackendRealProfileSmokeTest(unittest.TestCase):
+    """Qualification that a *declared* in-scope backend is genuinely usable under
+    the live `/usr/bin/sandbox-exec`, and that declaring it widens nothing else
+    (register D3/D4, owner amendment 2026-09-01). No language model and no
+    subscription spend: plain shell commands under the generated profile."""
+
+    SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+    def setUp(self) -> None:
+        if not Path(self.SANDBOX_EXEC).is_file():
+            raise AssertionError(
+                "/usr/bin/sandbox-exec is required for the in-scope host-isolation "
+                "smoke and must not be silently skipped on macOS"
+            )
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name).resolve()
+        self.worktree = base / "worktree"
+        self.worktree.mkdir()
+        self.ralph_dir = base / "ralph"
+        self.ralph_dir.mkdir()
+        self.session_tmp = base / "session-tmp"
+        self.session_tmp.mkdir()
+        self.home = base / "home"
+        store = self.home / ".local" / "share" / "opencode"
+        store.mkdir(parents=True)
+        self.credential = store / "auth.json"
+        self.credential.write_text("OPENCODE-DECLARED\n", encoding="utf-8")
+        # A sibling inside the same store, to prove the grant is the credential
+        # and not the directory that contains it.
+        self.sibling = store / "opencode.db"
+        self.sibling.write_text("DB\n", encoding="utf-8")
+        (self.home / ".ssh").mkdir(parents=True)
+        self.unrelated = self.home / ".ssh" / "id_probe"
+        self.unrelated.write_text("SSH-LEAK\n", encoding="utf-8")
+        self.profile = base / "sandbox.sb"
+        self.profile.write_text(
+            launch.build_sandbox_profile(
+                "claude", self.worktree, self.ralph_dir, self.session_tmp,
+                self.home, ("opencode",),
+            ),
+            encoding="utf-8",
+        )
+
+    def _confined(self, *command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.SANDBOX_EXEC, "-f", str(self.profile), *command],
+            text=True,
+            capture_output=True,
+        )
+
+    def test_the_declared_credential_is_readable(self) -> None:
+        result = self._confined("cat", str(self.credential))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("OPENCODE-DECLARED", result.stdout)
+
+    def test_the_declared_credential_is_writable_so_a_refresh_persists(self) -> None:
+        result = self._confined(
+            "sh", "-c", f'printf refreshed > {shlex.quote(str(self.credential))}'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.credential.read_text(), "refreshed")
+
+    def test_the_rest_of_the_declared_store_stays_write_denied(self) -> None:
+        # The grant is one file. Everything else OpenCode writes goes to the
+        # pinned per-run XDG directory, so the surrounding store needs nothing.
+        result = self._confined(
+            "sh", "-c", f'echo leak > {shlex.quote(str(self.sibling))} 2>&1; echo "rc=$?"'
+        )
+        self.assertNotIn("rc=0", result.stdout)
+        self.assertEqual(self.sibling.read_text(), "DB\n")
+
+    def test_declaring_a_backend_widens_no_other_denial(self) -> None:
+        # Non-vacuous: the file exists and is readable outside the sandbox.
+        self.assertIn("SSH-LEAK", self.unrelated.read_text())
+        result = self._confined("cat", str(self.unrelated))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("SSH-LEAK", result.stdout)

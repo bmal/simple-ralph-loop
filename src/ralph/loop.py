@@ -92,6 +92,7 @@ import uuid
 
 from .backends import Backend
 from .console import (
+    IN_SCOPE_BACKEND_DEVIATIONS,
     NO_SANDBOX_DEVIATION,
     Deviation,
     IterationOutcome,
@@ -108,7 +109,9 @@ from .errors import (
 from .gitcontext import command, interactive_only_issues, write_json
 from .launch import (
     CaffeinateAssertion,
+    additional_in_scope,
     establish_sandbox,
+    prepare_in_scope_state,
     resume_command,
     restart_command,
 )
@@ -193,6 +196,7 @@ def handoff_help(
                 session_id,
                 args.unsafe_allow_agents,
                 args.unsafe_no_sandbox,
+                tuple(getattr(args, "in_scope_backend", None) or ()),
             )
             if session_id
             else None
@@ -207,6 +211,7 @@ def handoff_help(
                 args.timeout,
                 args.unsafe_allow_agents,
                 args.unsafe_no_sandbox,
+                tuple(getattr(args, "in_scope_backend", None) or ()),
             )
             if remaining
             else None
@@ -256,6 +261,7 @@ def run_protected(
     console: RunConsole,
 ) -> int:
     env = backend.environment(args.model)
+    in_scope = tuple(getattr(args, "in_scope_backend", None) or ())
     # Redact subscription credentials from every readable and retained stream in
     # case backend output echoes an environment value. This precedes the header so
     # the Run console's choke point already has a live redactor to scrub through.
@@ -326,6 +332,14 @@ def run_protected(
         # Launch chain runs the backend unconfined (register D7). Inside the try so a
         # self-test failure — a failure once the run directory exists — gets the same
         # summary and full help block as any other (register G10).
+        # A declared in-scope backend gets its state pinned into the run directory
+        # before the profile is generated, because the profile's write allow-list is
+        # derived from the environment the session will run under. Skipped entirely
+        # under the sandbox opt-out: with no boundary to fit there is nothing to pin,
+        # and relocating a backend's store would be a behavior change the opt-out
+        # never asked for (D3/D4 amendment).
+        if not args.unsafe_no_sandbox:
+            env.update(prepare_in_scope_state(run_dir, args.backend, in_scope))
         sandbox_profile = establish_sandbox(
             args.backend,
             run_dir,
@@ -333,7 +347,13 @@ def run_protected(
             git_dir / "ralph",
             env,
             no_sandbox=args.unsafe_no_sandbox,
+            in_scope=in_scope,
         )
+        for name in additional_in_scope(args.backend, in_scope):
+            # A second subscription credential readable by the whole process tree is
+            # a relaxed guarantee, stated as loudly as the sandbox opt-out is
+            # (register G7/G13) so it can never be a silent widening.
+            console.deviation(Deviation(IN_SCOPE_BACKEND_DEVIATIONS[name]))
         if args.unsafe_no_sandbox:
             # The gate is silent now; the run states the relaxed host-isolation
             # guarantee loudly here, beside the other deviation warnings (register

@@ -344,7 +344,8 @@ the session tmp, and the running backend's own state directory) and a **read
 deny-list** (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.azure`,
 `~/.kube`, `~/.netrc`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc`,
 `~/.git-credentials` and `~/.config/git/credentials`, browser profiles,
-`~/Library/Keychains`, and the *other* backend's auth store). Before
+`~/Library/Keychains`, and the auth store of every backend the run has not
+declared in-scope). Before
 spending budget Ralph runs a one-shot self-test that must observe a denied read
 and a denied write actually fail; if the sandbox cannot start or the self-test
 fails open, Ralph fails closed and spends no budget. `ralph resume` and
@@ -369,8 +370,26 @@ a default macOS `gh` install the in-scope GitHub token lives there and cannot be
 separated from it at the filesystem layer; every other keychain stays denied,
 and the file is encrypted at rest so an accidental read yields ciphertext.
 These are in-scope credentials the loop cannot function without, so this boundary
-inherently cannot protect them; the *other* backend's auth store is denied
-because the running session never needs it.
+inherently cannot protect them; the auth store of a backend the run has not
+declared in-scope is denied because the session never needs it.
+
+`--in-scope-backend BACKEND` (repeatable, on `run` and `resume`) declares that
+the run will also dispatch work to another backend — a run whose work sends one
+review leg to OpenCode/GPT and the other to Claude, say. Without it Ralph denies
+whichever backend it is not running, which assumes one backend per run and makes
+such work impossible. Declaring a backend lifts the denial on exactly the one
+credential path the deny-list already names and, for OpenCode, makes that single
+file writable so a mid-run token refresh persists; nothing around it is widened,
+and no other deny entry changes. Ralph also pins `$XDG_DATA_HOME` for a declared
+OpenCode into the run directory and seeds its `auth.json` as a symlink to the
+real credential, so its session database, logs and snapshots stay out of your
+home while a refresh still writes through.
+
+**A declaration is a relaxed guarantee and Ralph says so loudly**, beside the
+`--unsafe-*` warnings. `sandbox-exec` confines the whole process tree at once, so
+a declared credential is readable by *every* command in the run, not only by the
+backend that needs it — there is no way to grant it to one process alone.
+Declare a backend only for a run whose work actually uses it.
 
 `caffeinate` remains the **outer** wrap of the launch chain
 (`caffeinate -im sandbox-exec -f <profile> <backend> …`) so its power assertion
@@ -380,8 +399,8 @@ tracked source holds only a universal template, so no home path, username, or
 secret is ever committed to this repository.
 
 `--unsafe-no-sandbox` (see [Run](#run)) loudly disables host isolation for a
-project incompatible with Seatbelt. It is separate from `--unsafe-allow-agents`
-and relaxes only host isolation. [ADR-0001](docs/adr/0001-host-isolation-via-seatbelt.md)
+project incompatible with Seatbelt. It is separate from `--unsafe-allow-agents`,
+from `--in-scope-backend`, and relaxes only host isolation. [ADR-0001](docs/adr/0001-host-isolation-via-seatbelt.md)
 records why a Seatbelt sandbox was chosen over a container or VM (the industry
 default for unattended full-auto) and why malice is deliberately out of scope.
 

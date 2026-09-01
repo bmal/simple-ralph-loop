@@ -25,9 +25,21 @@ Invariants:
   can be interpolated (register D10) and the same inputs always yield the same
   profile. Reads are a deny-list of *famous* credential paths (not a completeness
   guarantee), writes an allow-list of the sanctioned roots, egress unrestricted;
-  the deny-list is backend-aware so the other backend's auth store is denied while
-  the running backend's own store stays readable (D4). The login keychain is
-  allowed back after the keychain deny so the allow wins (owner-amended D4).
+  the deny-list is backend-aware so the auth store of every backend the run has
+  not declared in-scope is denied, while the stores it needs stay readable (D4).
+  The login keychain is allowed back after the keychain deny so the allow wins
+  (owner-amended D4).
+- ``in_scope`` is the run's declared set of additional backends (D3/D4 owner
+  amendment, 2026-09-01). D4's original rule denied "the other backend", which
+  assumed one backend per run; a run whose work dispatches to both families needs
+  both credentials, so the deny is conditioned on what the run declared rather
+  than on what it launches. Declaring nothing yields a byte-identical profile to
+  before the amendment, and a declaration grants exactly the one credential path
+  D4 already names -- never a widened deny-list and never another entry removed.
+  ``prepare_in_scope_state`` pins ``$XDG_DATA_HOME`` into the run directory for a
+  declared OpenCode and seeds its ``auth.json`` as a symlink to the operator's
+  real credential, so a mid-run token refresh writes through and the store does
+  not accumulate in the operator's home.
 - The concrete filled-in profile is written only under the untracked ``.git/ralph``
   run directory (D10); tracked source holds only the universal generator.
 - ``run_sandbox_self_test`` fails closed before any budget is spent (register D8):
@@ -60,6 +72,7 @@ adapters (wrap their argv).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import os
 from pathlib import Path
 import shlex
@@ -145,6 +158,25 @@ SANDBOX_WRITE_PROBE = ".ralph-sandbox-selftest-write-probe"
 # separate valueless scratch root and is allowed via `session_tmp`.
 SANDBOX_WORLD_WRITABLE_TMP_ROOTS = (Path("/private/tmp"), Path("/tmp"))
 
+# The single credential each Backend authenticates from, home-relative, with the
+# Seatbelt filter its grant needs. OpenCode keeps its subscription OAuth in one
+# file, so a grant for it is one literal path; Claude's store is a directory
+# tree, so its grant is that subpath -- the same shape it already gets while it
+# is the running backend. A backend the run has not declared in-scope has this
+# exact path denied (register D4); a declared one has it granted, and nothing
+# wider (D3/D4 owner amendment, 2026-09-01).
+SANDBOX_BACKEND_CREDENTIAL = {
+    "claude": ("subpath", ".claude"),
+    "opencode": ("literal", ".local/share/opencode/auth.json"),
+}
+# Where Ralph pins $XDG_DATA_HOME for a run that declares OpenCode in-scope
+# without running it: a per-run directory under the run dir, seeded with an
+# auth.json symlink to the operator's real credential. This keeps the 2.6 GB
+# session database, logs and snapshots out of the operator's home, makes the
+# credential grant one literal file instead of a whole store, and leaves
+# evidence in the run dir that OpenCode actually ran.
+SANDBOX_XDG_DIRNAME = "xdg"
+
 # Self-test probe outcomes: the sandbox refused the operation (the profile bit),
 # permitted it (the profile parsed but failed open), or the probe could not be
 # run at all. Anything but BLOCKED stops the run fail-closed before budget.
@@ -174,12 +206,27 @@ def _sandbox_quote(path: Path) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _backend_store(backend: str, home: Path, data_home: Path | None) -> Path:
+    # A Backend's own state directory: the D3 write root it gets while it is the
+    # running backend. OpenCode's follows $XDG_DATA_HOME, which it honors for its
+    # whole store -- session database, logs, worktree snapshots and auth.json
+    # alike -- so the root is derived from the session environment rather than
+    # assumed at ~/.local/share. An operator who exports XDG_DATA_HOME would
+    # otherwise get a write allow-list pointing at a directory OpenCode is not
+    # using, and every run would die on its first startup write.
+    if backend == "claude":
+        return home / ".claude"
+    return (data_home or home / ".local" / "share") / "opencode"
+
+
 def build_sandbox_profile(
     backend: str,
     worktree: Path,
     ralph_dir: Path,
     session_tmp: Path,
     home: Path,
+    in_scope: Sequence[str] = (),
+    data_home: Path | None = None,
 ) -> str:
     # Produce the Seatbelt (`sandbox-exec`) profile text confining a backend
     # session (register D2/D3/D4/D5/D10). Pure: it maps already-resolved absolute
@@ -187,16 +234,19 @@ def build_sandbox_profile(
     # secret can be interpolated and the same inputs always yield the same
     # profile. Reads stay permissive with a deny-list of famous credential paths;
     # writes are an allow-list of the sanctioned roots; network egress is
-    # unrestricted. The deny-list is backend-aware: the *other* backend's auth
-    # store is denied while the running backend's own store stays readable (D4).
-    if backend == "claude":
-        backend_store = home / ".claude"
-        # The out-of-scope OpenCode credential is a single file; deny it exactly.
-        out_of_scope_deny = f'(deny file-read* (literal {_sandbox_quote(home / ".local/share/opencode/auth.json")}))'
-    else:
-        backend_store = home / ".local/share/opencode"
-        # The out-of-scope Claude store is a directory tree; deny it wholesale.
-        out_of_scope_deny = f'(deny file-read* (subpath {_sandbox_quote(home / ".claude")}))'
+    # unrestricted. The deny-list is backend-aware: the auth store of every
+    # backend the run has *not* declared in-scope is denied, while the stores the
+    # run actually needs stay readable (D4).
+    #
+    # `in_scope` names the additional backends this run declares it will use. D4
+    # originally denied "the other backend", which assumed a run uses exactly one
+    # -- true for an automated Iteration, false for a run whose work dispatches to
+    # both families (a two-model review panel). For such a run both credentials
+    # are in-scope by D4's own criterion: a credential the loop requires cannot be
+    # protected from it. Undeclared is the default, so a run that does not ask for
+    # a second backend gets a byte-identical profile to before the amendment.
+    declared = {backend, *in_scope}
+    backend_store = _backend_store(backend, home, data_home)
 
     lines = [
         "(version 1)",
@@ -213,10 +263,19 @@ def build_sandbox_profile(
     ]
     for root in (worktree, ralph_dir, session_tmp, backend_store, *SANDBOX_WORLD_WRITABLE_TMP_ROOTS):
         lines.append(f"(allow file-write* (subpath {_sandbox_quote(root)}))")
+    # A declared additional backend needs its credential writable, not just
+    # readable: a subscription OAuth access token expires and the CLI rewrites
+    # the file in place on refresh (measured: OpenCode preserves the inode and
+    # writes straight through a symlink). Without the write the refresh EPERMs
+    # mid-run. The grant is that one credential path and nothing around it -- the
+    # rest of the declared backend's store stays denied.
+    for name in sorted(declared - {backend}):
+        kind, relative = SANDBOX_BACKEND_CREDENTIAL[name]
+        lines.append(f"(allow file-write* ({kind} {_sandbox_quote(home / relative)}))")
     # Standard device nodes, not data locations: a `(deny file-write*)` policy
     # otherwise blocks the /dev/null write that basic tooling (git included)
     # depends on. These are the null and standard-output sinks, so allowing them
-    # widens no data-writable surface beyond the four sanctioned roots above.
+    # widens no data-writable surface beyond the sanctioned roots above.
     lines.append(
         '(allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))'
     )
@@ -234,7 +293,11 @@ def build_sandbox_profile(
     lines.append(
         f"(allow file-read* (literal {_sandbox_quote(home / SANDBOX_LOGIN_KEYCHAIN)}))"
     )
-    lines.append(out_of_scope_deny)
+    # Every backend this run did not declare in-scope: its credential is denied by
+    # the exact path D4 names, never by a widened or removed entry (D4 amendment).
+    for name in sorted(set(SANDBOX_BACKEND_CREDENTIAL) - declared):
+        kind, relative = SANDBOX_BACKEND_CREDENTIAL[name]
+        lines.append(f"(deny file-read* ({kind} {_sandbox_quote(home / relative)}))")
     return "\n".join(lines) + "\n"
 
 
@@ -261,7 +324,12 @@ def session_argv(backend_args: list[str], sandbox_profile: Path | None = None) -
 
 
 def write_sandbox_profile(
-    run_dir: Path, backend: str, worktree: Path, ralph_dir: Path, env: dict[str, str]
+    run_dir: Path,
+    backend: str,
+    worktree: Path,
+    ralph_dir: Path,
+    env: dict[str, str],
+    in_scope: Sequence[str] = (),
 ) -> Path:
     # Generate the concrete profile once per run (it is stable across a run's
     # iterations) and write it under the untracked .git/ralph run directory
@@ -269,7 +337,15 @@ def write_sandbox_profile(
     # filled-in profile carrying the operator's home path. `ralph clean` removes
     # the whole .git/ralph tree, so this file with it.
     session_tmp = Path(env.get("TMPDIR") or "/tmp").resolve()
-    profile_text = build_sandbox_profile(backend, worktree, ralph_dir, session_tmp, Path.home())
+    # OpenCode's whole store follows $XDG_DATA_HOME, so the write allow-list must
+    # be derived from the environment the session will actually run under -- the
+    # value Ralph pinned for a declared in-scope OpenCode, or the operator's own
+    # ambient setting -- rather than assumed at ~/.local/share.
+    raw_data_home = env.get("XDG_DATA_HOME")
+    data_home = Path(raw_data_home).resolve() if raw_data_home else None
+    profile_text = build_sandbox_profile(
+        backend, worktree, ralph_dir, session_tmp, Path.home(), in_scope, data_home
+    )
     path = run_dir / "sandbox.sb"
     try:
         path.write_text(profile_text, encoding="utf-8")
@@ -284,7 +360,12 @@ def write_sandbox_profile(
 
 
 def sandbox_profile_for(
-    backend: str, run_dir: Path, worktree: Path, ralph_dir: Path, env: dict[str, str]
+    backend: str,
+    run_dir: Path,
+    worktree: Path,
+    ralph_dir: Path,
+    env: dict[str, str],
+    in_scope: Sequence[str] = (),
 ) -> Path:
     # The Launch chain confines every backend under Ralph's own profile, once per
     # run — Ralph proves the boundary rather than trusting a backend to sandbox
@@ -294,7 +375,7 @@ def sandbox_profile_for(
     # The `--unsafe-no-sandbox` opt-out that can turn the wrap off is honored one
     # level up in `establish_sandbox`, which short-circuits before ever calling
     # this; a call here always means a confined session (register D7).
-    return write_sandbox_profile(run_dir, backend, worktree, ralph_dir, env)
+    return write_sandbox_profile(run_dir, backend, worktree, ralph_dir, env, in_scope)
 
 
 def _existing_denied_read_dir(home: Path) -> Path:
@@ -395,6 +476,7 @@ def establish_sandbox(
     env: dict[str, str],
     *,
     no_sandbox: bool,
+    in_scope: Sequence[str] = (),
 ) -> Path | None:
     # The single fail-closed gate that turns a session's host-isolation intent
     # into a proven boundary, shared by automated iterations (`run`) and
@@ -411,9 +493,59 @@ def establish_sandbox(
     # the Loop and ``cli`` resume — state the deviation through the console.
     if no_sandbox:
         return None
-    profile = sandbox_profile_for(backend, run_dir, worktree, ralph_dir, env)
+    profile = sandbox_profile_for(backend, run_dir, worktree, ralph_dir, env, in_scope)
     run_sandbox_self_test(profile)
     return profile
+
+
+def additional_in_scope(backend: str, in_scope: Sequence[str]) -> list[str]:
+    # The backends a run declared in-scope *beyond* the one it runs. Declaring the
+    # running backend is a no-op (its store is in-scope by D4 already), so it is
+    # folded out here once and every caller -- the profile, the state seeding, the
+    # console deviations, the recovery commands -- agrees on the same set.
+    return sorted(set(in_scope) - {backend})
+
+
+def prepare_in_scope_state(
+    run_dir: Path, backend: str, in_scope: Sequence[str], home: Path | None = None
+) -> dict[str, str]:
+    # Environment additions that pin a declared in-scope backend's state into the
+    # run directory, and the on-disk seeding that makes them work. Returned rather
+    # than applied so the caller layers them onto the sanitized session
+    # environment explicitly; an empty dict means the run declared nothing extra.
+    #
+    # Only OpenCode needs this. It honors $XDG_DATA_HOME for its entire store, so
+    # pinning the variable at `<run_dir>/xdg` keeps its session database, logs and
+    # worktree snapshots (2.6 GB on the author's machine) out of the operator's
+    # home, leaves per-run evidence that OpenCode actually ran, and -- because the
+    # only thing left in the real store is the credential -- lets the D3 grant be
+    # that one file instead of the whole directory tree. auth.json is seeded as a
+    # symlink to the operator's real credential so a token refresh during the run
+    # writes through to it (measured: OpenCode rewrites the file in place,
+    # preserving the inode) instead of stranding a rotated token in the run dir.
+    #
+    # The running backend's own store is deliberately left alone: pinning it would
+    # relocate an operator's existing OpenCode session history and put it behind
+    # `ralph clean`, a behavior change no reported problem asks for.
+    home = home or Path.home()
+    if "opencode" not in additional_in_scope(backend, in_scope):
+        return {}
+    xdg = run_dir / SANDBOX_XDG_DIRNAME
+    store = xdg / "opencode"
+    credential = home / SANDBOX_BACKEND_CREDENTIAL["opencode"][1]
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+        link = store / "auth.json"
+        if not link.is_symlink() and not link.exists():
+            link.symlink_to(credential)
+    except OSError as error:
+        # The declared backend cannot authenticate without this, and a session
+        # that silently loses a declared lane is worse than one that stops:
+        # fail closed here, before any budget is spent (register D7).
+        raise RalphError(
+            f"could not prepare the in-scope OpenCode state directory: {error.strerror}"
+        ) from None
+    return {"XDG_DATA_HOME": str(xdg)}
 
 
 def shell_command(args: list[str], worktree: Path) -> str:
@@ -427,6 +559,7 @@ def resume_command(
     session_id: str,
     allow_agents: bool = False,
     no_sandbox: bool = False,
+    in_scope: Sequence[str] = (),
 ) -> str:
     # A dedicated `ralph resume` re-establishes the full subscription trust
     # boundary (sanitized environment, per-session OAuth/routing proof, isolated
@@ -453,6 +586,11 @@ def resume_command(
         args.append("--unsafe-allow-agents")
     if no_sandbox:
         args.append("--unsafe-no-sandbox")
+    # Every declared in-scope backend reproduces too: without them the resumed
+    # session would re-confine a lane the run deliberately opened, and the
+    # handoff would fail on the half of its work the operator came back to finish.
+    for name in additional_in_scope(backend, in_scope):
+        args += ["--in-scope-backend", name]
     args += ["--session", session_id]
     return shell_command(args, worktree)
 
@@ -466,6 +604,7 @@ def restart_command(
     timeout: float,
     allow_agents: bool = False,
     no_sandbox: bool = False,
+    in_scope: Sequence[str] = (),
 ) -> str:
     args = [
         "ralph",
@@ -488,6 +627,8 @@ def restart_command(
         args.append("--unsafe-allow-agents")
     if no_sandbox:
         args.append("--unsafe-no-sandbox")
+    for name in additional_in_scope(backend, in_scope):
+        args += ["--in-scope-backend", name]
     return shell_command(args, worktree)
 
 

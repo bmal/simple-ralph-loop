@@ -73,10 +73,21 @@ import stat
 import sys
 
 from .backends import DEFAULT_MODELS, resolve
-from .console import NO_SANDBOX_DEVIATION, Deviation, RunConsole, StreamRunConsole
+from .console import (
+    IN_SCOPE_BACKEND_DEVIATIONS,
+    NO_SANDBOX_DEVIATION,
+    Deviation,
+    RunConsole,
+    StreamRunConsole,
+)
 from .errors import RalphError
 from .gitcontext import command, git_context, read_prompt
-from .launch import establish_sandbox, session_argv
+from .launch import (
+    additional_in_scope,
+    establish_sandbox,
+    prepare_in_scope_state,
+    session_argv,
+)
 from .locking import WorktreeLock, secure_state_directory
 from .loop import run_locked
 from .process import MAX_ITERATION_TIMEOUT_SECONDS
@@ -182,14 +193,25 @@ def resume(args: argparse.Namespace, console: RunConsole) -> int:
     # under the untracked .git/ralph (register D10), then wrapping it around the
     # interactive argv via session_argv. --unsafe-no-sandbox relaxes only this,
     # exactly as in `run`, so a session run unconfined resumes unconfined too.
+    in_scope = tuple(args.in_scope_backend or ())
+    resume_dir = secure_state_directory(git_dir, "ralph", "resume")
+    # Recovery re-establishes the identical boundary the run had, declared lanes
+    # included (register D9): the same state seeding, the same generator, the same
+    # self-test. Without this a handed-off session would be re-confined out of the
+    # very backend the run was using when it stopped.
+    if not args.unsafe_no_sandbox:
+        env.update(prepare_in_scope_state(resume_dir, args.backend, in_scope))
     sandbox_profile = establish_sandbox(
         args.backend,
-        secure_state_directory(git_dir, "ralph", "resume"),
+        resume_dir,
         worktree,
         git_dir / "ralph",
         env,
         no_sandbox=args.unsafe_no_sandbox,
+        in_scope=in_scope,
     )
+    for name in additional_in_scope(args.backend, in_scope):
+        console.deviation(Deviation(IN_SCOPE_BACKEND_DEVIATIONS[name]))
     if args.unsafe_no_sandbox:
         # The gate is silent; recovery states the relaxed host-isolation guarantee
         # loudly through the console, exactly as `run` does (register G7/G13).
@@ -266,6 +288,23 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--in-scope-backend",
+        action="append",
+        choices=["claude", "opencode"],
+        default=None,
+        metavar="BACKEND",
+        dest="in_scope_backend",
+        help=(
+            "declare that this run will also dispatch work to BACKEND, making that "
+            "backend's subscription credential readable (and, for OpenCode, "
+            "writable so a token refresh persists). Repeatable. Ralph otherwise "
+            "denies every backend it is not running, which assumes one backend per "
+            "run and blocks a run whose work uses both model families. sandbox-exec "
+            "confines the whole process tree, so a declared credential is readable "
+            "by every command in the run, not only by that backend"
+        ),
+    )
+    run_parser.add_argument(
         "--verbose",
         action="store_true",
         help=(
@@ -301,6 +340,23 @@ def parser() -> argparse.ArgumentParser:
             ".claude/agents and the settings.json 'agent' key; OpenCode: the "
             "effective configuration's agent map); Ralph then cannot prove "
             "agent isolation (unsafe)"
+        ),
+    )
+    resume_parser.add_argument(
+        "--in-scope-backend",
+        action="append",
+        choices=["claude", "opencode"],
+        default=None,
+        metavar="BACKEND",
+        dest="in_scope_backend",
+        help=(
+            "declare that this run will also dispatch work to BACKEND, making that "
+            "backend's subscription credential readable (and, for OpenCode, "
+            "writable so a token refresh persists). Repeatable. Ralph otherwise "
+            "denies every backend it is not running, which assumes one backend per "
+            "run and blocks a run whose work uses both model families. sandbox-exec "
+            "confines the whole process tree, so a declared credential is readable "
+            "by every command in the run, not only by that backend"
         ),
     )
     resume_parser.add_argument(

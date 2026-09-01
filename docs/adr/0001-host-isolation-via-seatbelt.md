@@ -31,6 +31,34 @@ cannot be separated from it at the filesystem layer (owner amendment to D4,
 2026-07-17); every other keychain stays denied, and the file is encrypted at
 rest so an accidental read yields ciphertext — consistent with the accident,
 not malice scope. Network egress stays fully open.
+
+**Owner amendment, 2026-09-01 (the in-scope backend set).** The read deny-list
+named "the *other* backend's auth store", which assumed a run uses exactly one
+backend. A run whose work dispatches to both model families — a two-family
+adversarial review panel, for instance — needs both credentials, and for such a
+run both are in-scope by D4's own criterion: a credential the loop requires
+cannot be protected from it. Ralph therefore denies the auth store of every
+backend the run has not **declared** in-scope, rather than every backend it is
+not running. The set is declared per run via `--in-scope-backend` (repeatable, on
+`run` and `resume`, reproduced into printed recovery commands), defaults to the
+running backend alone, and is stated through the Run console as a relaxed
+guarantee. A declaration lifts the denial on the single path the deny-list
+already names and grants write on that one file so a token refresh persists; the
+deny-list is never widened, shortened, or otherwise altered. Ralph additionally
+pins `$XDG_DATA_HOME` for a declared OpenCode into the run directory, seeding
+`auth.json` as a symlink to the operator's real credential — measured: OpenCode
+rewrites that file in place, through the symlink, so a refresh reaches the real
+credential rather than stranding a rotated token in the run directory.
+
+**Accepted consequence:** `sandbox-exec` confines the whole process tree and
+cannot nest (a second `sandbox-exec` inside a Ralph profile fails with
+`sandbox_apply: Operation not permitted`, even under a bare `(allow default)`),
+so a declared credential cannot be granted to one process alone — every command
+in the run can read it. This is the identical exposure D4 already accepts for the
+running backend's own token, with deliberate exfiltration out of scope per D1.
+The grant is therefore gated on the operator's declaration rather than on actual
+use, which Ralph cannot verify.
+
 Both backends are wrapped uniformly — ralph proves the boundary rather than
 trusting a backend to sandbox itself. Before spending budget ralph runs a
 one-shot self-test proving a denied read and a denied write actually fail. If
@@ -70,3 +98,14 @@ template, so no operator-specific path or secret is ever committed.
   otherwise block.
 - Apple has deprecated `sandbox-exec`; the mechanism is load-bearing across the
   industry (Codex, Claude Code) but carries long-term uncertainty.
+- **A declared in-scope credential is exposed to the whole run, not to one
+  process** — see the 2026-09-01 amendment. The declaration is honour-system:
+  Ralph cannot check that the run used the backend it named, only that the
+  operator asked for it, and it states the relaxed guarantee on every run.
+- **A token refresh is verified to write through the seeded symlink for
+  OpenCode's in-place credential writes, not for a hypothetical
+  write-temp-then-rename path.** Were OpenCode to change to an atomic rename, the
+  symlink would be replaced by a regular file inside the run directory and that
+  refresh would not reach the operator's real credential; the operator would
+  re-authenticate, and the run directory would hold the rotated token until
+  `ralph clean`. Not currently handled.
