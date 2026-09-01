@@ -169,3 +169,48 @@ class PackagingLifecycleTest(unittest.TestCase):
         self.assertEqual(metadata["Version"], "0.1.0")
         self.assertEqual(metadata["License-Expression"], "MIT")
         self.assertIsNone(metadata.get_all("Requires-Dist"))
+
+
+class ReadmeOptionsReferenceTest(unittest.TestCase):
+    """The README's Options table is the one place an operator can see every flag
+    without reading the prose, so it must not drift from the parser. A flag that
+    exists but is undocumented is a flag nobody finds."""
+
+    def _documented(self) -> str:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        start = readme.index("### Options")
+        return readme[start : readme.index("\n## ", start)]
+
+    def _flags(self, subcommand: str) -> set[str]:
+        from ralph.cli import parser
+
+        chosen = parser()._subparsers._group_actions[0].choices[subcommand]
+        return {
+            option
+            for action in chosen._actions
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+
+    def test_every_run_and_resume_flag_appears_in_the_options_table(self) -> None:
+        # Matched as a table *row*, not anywhere in the section: the surrounding
+        # prose mentions flag names, and a substring match would let an
+        # undocumented flag pass because it happened to be named in a sentence.
+        rows = [row for row in self._documented().splitlines() if row.startswith("| `--")]
+        documented = {row.split("`")[1].split()[0] for row in rows}
+        for subcommand in ("run", "resume"):
+            # `--help` is argparse's own and needs no row.
+            for flag in sorted(self._flags(subcommand) - {"--help"}):
+                self.assertIn(
+                    flag,
+                    documented,
+                    f"{flag} ({subcommand}) has no row in the README Options table",
+                )
+
+    def test_the_guarantee_relaxing_flags_are_marked_as_such(self) -> None:
+        # An operator scanning the table must be able to see which flags weaken
+        # what Ralph proves without reading the prose under Safety.
+        table = self._documented()
+        for flag in ("--in-scope-backend", "--unsafe-allow-agents", "--unsafe-no-sandbox"):
+            line = next(row for row in table.splitlines() if row.startswith(f"| `{flag}"))
+            self.assertIn("Relaxes a guarantee", line, flag)

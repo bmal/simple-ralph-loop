@@ -65,7 +65,34 @@ ralph run prompt.md --backend claude --iterations 5
 ralph run prompt.md --backend opencode --iterations 2 --timeout 5400
 ralph run prompt.md --backend claude --iterations 5 --verbose > feed.log
 ralph run prompt.md --backend claude --iterations 5 --quiet
+ralph run prompt.md --backend claude --iterations 5 --in-scope-backend opencode
 ```
+
+### Options
+
+Every flag, and when you reach for it. The prose below and under
+[Safety](#safety) explains each in full; `ralph run --help` and
+`ralph resume --help` are authoritative.
+
+| Flag | `run` | `resume` | Reach for it when |
+| --- | :-: | :-: | --- |
+| `--backend {claude,opencode}` | required | required | Always — picks the coding-agent CLI. |
+| `--iterations N` | required | — | Always — the budget, in fresh sessions. |
+| `--session ID` | — | required | Always on `resume` — the handed-off session to relaunch. |
+| `--model MODEL` | optional | required | Another model in the same subscription-backed provider. |
+| `--worktree PATH` | optional | optional | Targeting a worktree other than the current directory. |
+| `--timeout SECONDS` | optional | — | An iteration needs longer (or, with `0`, no) limit than the 3,600s default. |
+| `--interactive-label LABEL` | optional | — | Your tracker marks owner-decision children with something other than `may-ask-owner`. |
+| `--in-scope-backend BACKEND` | repeatable | repeatable | **The run's own work dispatches to a second backend** — e.g. a review panel sending one leg to OpenCode and one to Claude. Relaxes a guarantee; see below. |
+| `--unsafe-allow-agents` | optional | optional | The repo's loop legitimately depends on backend agents. Relaxes a guarantee. |
+| `--unsafe-no-sandbox` | optional | optional | The project is genuinely incompatible with Seatbelt. Relaxes a guarantee. |
+| `--verbose` | optional | — | You want the backend's running commentary back on stdout. |
+| `--quiet` | optional | — | An unattended run that should not repaint a status line. |
+
+`ralph clean --worktree PATH` removes Ralph's state for a worktree. The three
+flags marked *relaxes a guarantee* are the only ones that weaken what Ralph
+proves; each is default-off, independent of the others, announced loudly at
+launch, and reproduced into the recovery commands Ralph prints.
 
 OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
 `claude-opus-5`. Each run opens with a header stating the settings it
@@ -202,6 +229,34 @@ every other protection (subscription-only auth, customization isolation, secret
 redaction) is untouched. `ralph resume` accepts it too, and Ralph reproduces it
 verbatim in the `resume` and `run` commands it prints for a handed-off session
 so a recovered session re-establishes the identical relaxed boundary.
+
+Ralph denies every backend it is not running the credential of the *other*
+backend, which assumes one backend per run. Pass `--in-scope-backend BACKEND`
+(repeatable) when the run's own work dispatches to a second one — a review panel
+that sends the first leg to OpenCode/GPT and the second to Claude, say. Without
+it that second family cannot start and the work silently degrades to a single
+model family:
+
+```sh
+ralph run review.md --backend claude --iterations 4 --in-scope-backend opencode
+```
+
+Declaring a backend lifts the denial on exactly the one credential file the
+deny-list names, and — for OpenCode — makes that single file writable so a
+mid-run token refresh persists. Nothing around it is widened and no other
+denial changes. Ralph also pins `$XDG_DATA_HOME` for a declared OpenCode into
+the run directory, so its session database, logs and snapshots stay out of your
+home directory rather than accumulating there across runs.
+
+This relaxes a guarantee, and Ralph says so at launch. Host isolation confines
+the whole process tree at once and cannot grant a credential to one process
+alone, so a declared credential is readable by *every* command in the run, not
+only by the backend that needs it — declare a backend only for a run whose work
+actually uses it. The flag is accepted by `ralph resume` too and is reproduced
+in the `resume` and `run` commands Ralph prints for a handed-off session, so
+recovery keeps the same declared lanes. See
+[Host isolation](#host-isolation) for what the boundary does and does not
+protect.
 
 Ralph snapshots the prompt once, starts a fresh session per iteration, and
 stops early only when the final turn's last message from the backend itself
