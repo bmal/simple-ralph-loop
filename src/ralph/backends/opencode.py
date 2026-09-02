@@ -414,7 +414,8 @@ class EventResult:
         # own step boundaries. Every state update is reported, unlike the status
         # line's one-per-call ``ToolObserved`` (register G4/G14).
         if event_type == "tool_use":
-            tool = part.get("tool") if isinstance(part.get("tool"), str) else "tool"
+            name = part.get("tool")
+            tool = name if isinstance(name, str) else "tool"
             state = part.get("state")
             status = state.get("status") if isinstance(state, dict) else None
             self.emit(ToolActivity(tool, state=status if isinstance(status, str) else None))
