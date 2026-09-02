@@ -44,6 +44,14 @@ Invariants:
   written to disk from it, so the retained copy stays byte-identical (register G18).
   The Trust boundary line (``trust_boundary_established``) is emitted where its proof
   completes, after the first Iteration's preflight, never in the header (register G8).
+- The two commands that are not ``run`` address the operator here too (register G22).
+  ``state_removed`` reports what ``clean`` destroyed and, on its own line ahead of the
+  fitted path, whether there was anything there at all, so a command that irreversibly
+  deletes every run's evidence can never be mistaken for a no-op. ``resume_started``
+  is recovery's header: the session being entered, the trust boundary re-proven, and
+  the host-isolation status stated either way — never reported by omission. Only the
+  standing full-auto caveat follows it, and then ``resume`` replaces its own process,
+  so nothing can be rendered after the handover.
 - The full help block applies to every failure once a run directory exists (register
   G10): a resumable handoff and a consuming stop are worded by ``operator_help`` as the
   byte-identical ``RALPH NEEDS OPERATOR`` banner; a backend failure that left evidence
@@ -111,8 +119,9 @@ Depends on / must not know: ``redaction`` (functions only, never the active-reda
 global). It must not know how a run is driven, which Backend it holds, or what any
 value object it renders was computed from.
 
-See also: ``cli`` (the composition root; constructs the concrete console and passes
-it in), ``loop`` (emits the run's facts), CONTEXT.md (**Run console**).
+See also: ``cli`` (the composition root; constructs the concrete console, passes it
+in, and drives it directly for ``clean`` and ``resume``), ``loop`` (emits the run's
+facts), CONTEXT.md (**Run console**).
 """
 
 from __future__ import annotations
@@ -178,6 +187,16 @@ OUTCOME_HEADLINES = {
     "backend_failure": "run failed: backend error",
     "timeout": "run failed: iteration timed out",
 }
+
+# What a preflight proves, named once. A run states these after its first Iteration's
+# preflight clears and recovery re-states them before it hands over, so the two sites
+# name the same properties instead of drifting into two vocabularies for one proof.
+# Host isolation is not among them: it is proven elsewhere (the sandbox self-test) and
+# is the one property an operator can relax, so each site reports it in the way that
+# site can -- the run by including it in the proven list, recovery on a line of its own
+# that is printed whether or not it holds.
+PREFLIGHT_PROPERTIES = ("subscription-only authentication", "customization isolation")
+HOST_ISOLATION_PROPERTY = "host isolation"
 
 # The deviation warnings a run states loudly when a standing guarantee is relaxed
 # (register G7): ``--unsafe-no-sandbox`` drops host isolation, and
@@ -277,6 +296,36 @@ class RunSummary:
     dirty: bool
     upstream: str | None
     ahead: int
+
+
+@dataclass(frozen=True)
+class CleanOutcome:
+    """What ``clean`` destroyed: the state directory it was pointed at, and how many
+    runs' evidence went with it. ``runs`` is counted before the tree is deleted, so the
+    report names what was destroyed rather than what is left, and ``None`` says there
+    was nothing there to destroy at all — the one distinction an operator cannot afford
+    to have blurred, so it is a state the value cannot fail to carry rather than a
+    second field that means nothing half the time. ``cli`` supplies the facts, the
+    console words them (register G14/G22)."""
+
+    state_root: Path
+    runs: int | None
+
+
+@dataclass(frozen=True)
+class ResumeSettings:
+    """The compact header ``resume`` prints before it replaces its own process with
+    the interactive session: which session the operator is entering, and what the
+    handover re-proved. ``reproven`` names the properties preflight established;
+    host isolation rides its own flag because it is the one the operator can relax,
+    and it is stated either way rather than reported only by its absence (register
+    G8/G22)."""
+
+    backend: str
+    model: str
+    session_id: str
+    host_isolated: bool
+    reproven: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -491,6 +540,10 @@ class RunConsole(Protocol):
 
     def run_started(self, settings: RunSettings) -> None: ...
 
+    def resume_started(self, settings: ResumeSettings) -> None: ...
+
+    def state_removed(self, outcome: CleanOutcome) -> None: ...
+
     def relaunching_full_auto(self) -> None: ...
 
     def interactive_only_resolved(self, label: str, issues: list[int]) -> None: ...
@@ -689,6 +742,43 @@ class StreamRunConsole:
         )
         if settings.dirty:
             self._message("warning", "warning: worktree has uncommitted changes")
+
+    def resume_started(self, settings: ResumeSettings) -> None:
+        # Recovery's header, printed where its proof completes and immediately before
+        # the process is replaced by the interactive session (register G8/G22). It is
+        # deliberately three facts rather than the run's full header: everything else a
+        # run states is about budget it is going to spend, and recovery spends none --
+        # the operator is about to be sitting in the session themselves.
+        self._fact(
+            "resuming",
+            f"{settings.backend} session {settings.session_id}, model {settings.model}",
+        )
+        self._fact("trust boundary", "re-proven: " + ", ".join(settings.reproven))
+        # Stated either way. A relaxed guarantee already shouted itself through
+        # ``deviation`` just above, but the header must not report host isolation only
+        # by leaving it out, because an operator reading three lines cannot tell an
+        # omission from a guarantee they still have.
+        self._fact(
+            "host isolation",
+            "re-established; the resumed session is confined by the Seatbelt sandbox"
+            if settings.host_isolated
+            else "not enforced; the resumed session runs unconfined",
+        )
+
+    def state_removed(self, outcome: CleanOutcome) -> None:
+        # ``clean`` destroys every run's evidence, so it says what it destroyed
+        # (register G22). All three wordings open on ``removed`` so one habit reads
+        # them all, and each puts what distinguishes it -- the count, or the word
+        # ``nothing`` -- in its first few characters, ahead of the words a narrow
+        # window spends. The path follows on its own fitted line, so shortening it can
+        # never cost the operator the answer to "was there anything there?".
+        if outcome.runs is None:
+            self._fact("removed", "nothing; there was no Ralph state for this worktree")
+        elif outcome.runs:
+            self._fact("removed", f"{outcome.runs} run(s) of retained evidence")
+        else:
+            self._fact("removed", "Ralph state; it held no runs")
+        self._fact("state directory", str(outcome.state_root), keep_tail=True)
 
     def interactive_only_resolved(self, label: str, issues: list[int]) -> None:
         listed = ", ".join(f"#{issue}" for issue in issues) if issues else "none open"

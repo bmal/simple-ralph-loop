@@ -42,6 +42,33 @@ class HandoffAndResumeTest(RalphCliTestCase):
         self.assertNotIn("ANTHROPIC_API_KEY=", claude_env)
         self.assertTrue((self.calls / "claude-auth-count").exists())
 
+    def test_resume_states_the_session_it_is_entering_before_it_hands_over(self) -> None:
+        # ``resume`` replaces its own process with the interactive session, so
+        # everything the operator is told about the handover has to be said first.
+        result = self.resume_ralph("claude", "claude-opus-5", "claude-session-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("claude-session-1", result.stderr)
+        self.assertIn("claude-opus-5", result.stderr)
+        self.assertIn("subscription-only authentication", result.stderr)
+        self.assertIn("customization isolation", result.stderr)
+        self.assertIn("host isolation", result.stderr)
+        # The header precedes the handover, and the handover happened.
+        self.assertTrue((self.calls / "claude-resume").exists())
+
+    def test_resume_says_host_isolation_is_not_enforced_when_it_is_not(self) -> None:
+        confined = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_9")
+        self.assertEqual(confined.returncode, 0, confined.stderr)
+        unconfined = self.resume_ralph(
+            "opencode", "openai/gpt-5.6-sol", "ses_9", "--unsafe-no-sandbox"
+        )
+
+        self.assertEqual(unconfined.returncode, 0, unconfined.stderr)
+        # The relaxed guarantee stays loud, and the compact header states the status
+        # rather than leaving the operator to read it out of an omission.
+        self.assertIn("--unsafe-no-sandbox is set", unconfined.stderr)
+        self.assertIn("host isolation not enforced", unconfined.stderr)
+        self.assertNotIn("host isolation not enforced", confined.stderr)
+
     def test_resume_refuses_unsafe_recovery_environment(self) -> None:
         secret = "sk-live-secret-value"
         api = self.resume_ralph(

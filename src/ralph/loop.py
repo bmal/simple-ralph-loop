@@ -17,6 +17,12 @@ Invariants:
   returns the ``(branch, status)`` the summary is worded from; the console words the
   git outcome — branch, dirty state, and whether the branch's commits reached its
   upstream — from those facts (register G14).
+- This module names where a run's evidence sits *inside* the state root
+  (``RUNS_DIRECTORY``) because it is the module that creates those directories.
+  ``retained_runs`` counts them for ``clean``'s report (register G22), so the command
+  that destroys them never has to know that layout — it knows only the state root it
+  was already resolving. The count descends into nothing and follows no symlink, and a
+  state root that never held a run counts zero rather than failing.
 - The loop spends exactly one backend session per iteration: an iteration that
   starts a session consumes its budget slot whatever the outcome, and the loop
   never restarts a slot itself. Any future retry allowance must reset per
@@ -77,7 +83,8 @@ events, nor how the Run console words or paints anything it is handed.
 See also: ``console`` (the Run console and its rendering apparatus), ``launch``
 (owns the wrapped argv, the profile gate, and recovery-command formatting), ``cli``
 (``run`` resolves the Backend, acquires the lock, constructs the console, then
-calls ``run_locked``), ``backends`` (the registry and Protocol).
+calls ``run_locked``; ``clean`` borrows ``retained_runs`` to count what it is about
+to destroy), ``backends`` (the registry and Protocol).
 """
 
 from __future__ import annotations
@@ -87,13 +94,16 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any
 import uuid
 
 from .backends import Backend
 from .console import (
+    HOST_ISOLATION_PROPERTY,
     IN_SCOPE_BACKEND_DEVIATIONS,
     NO_SANDBOX_DEVIATION,
+    PREFLIGHT_PROPERTIES,
     Deviation,
     IterationOutcome,
     OperatorHelp,
@@ -118,6 +128,35 @@ from .launch import (
 from .locking import secure_state_directory
 from .protocol import build_protocol, set_active_protocol
 from .redaction import collect_secrets, set_active_redactor
+
+
+# Where a run's evidence is retained beneath the Ralph state root. Named once here,
+# in the module that creates those directories, so ``clean`` can count what it is
+# about to destroy without inventing a second copy of the layout.
+RUNS_DIRECTORY = "runs"
+
+
+def retained_runs(state_root: Path) -> int:
+    """How many runs' evidence *state_root* holds, for the report ``clean`` prints
+    before it removes the tree (register G22). A state root that has never held a run
+    counts zero rather than failing.
+
+    A ``runs`` entry that is a symlink or not a directory counts zero and is never
+    descended into. ``lstat`` decides that, because ``scandir`` would happily walk a
+    symlink: a run refuses a symlinked ``runs`` outright, and ``rmtree`` removes such a
+    link without touching what it points at, so counting through one would report
+    evidence destroyed that is still on disk — and would make the report a second way
+    to read outside the state root."""
+    runs_root = state_root / RUNS_DIRECTORY
+    try:
+        info = os.lstat(runs_root)
+    except FileNotFoundError:
+        return 0
+    # S_ISDIR is false for the symlink itself, so this rejects both cases at once.
+    if not stat.S_ISDIR(info.st_mode):
+        return 0
+    with os.scandir(runs_root) as entries:
+        return sum(1 for entry in entries if entry.is_dir(follow_symlinks=False))
 
 
 def record_final_git_state(worktree: Path, run_dir: Path) -> tuple[str, str]:
@@ -267,7 +306,7 @@ def run_protected(
     # the Run console's choke point already has a live redactor to scrub through.
     set_active_redactor(collect_secrets())
 
-    runs_root = secure_state_directory(git_dir, "ralph", "runs")
+    runs_root = secure_state_directory(git_dir, "ralph", RUNS_DIRECTORY)
     run_dir = runs_root / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
     )
@@ -387,9 +426,9 @@ def run_protected(
                 # self-test before the loop (omitted, and so not claimed, under
                 # --unsafe-no-sandbox). It prints where its proof completes, after the
                 # first Iteration's banner, rather than in the header (register G8).
-                properties = ["subscription-only authentication", "customization isolation"]
+                properties = list(PREFLIGHT_PROPERTIES)
                 if not args.unsafe_no_sandbox:
-                    properties.append("host isolation")
+                    properties.append(HOST_ISOLATION_PROPERTY)
                 console.trust_boundary_established(properties)
                 # Resolve the concrete interactive-only children once per run, now
                 # that preflight has proven the shared gh dependency, and publish

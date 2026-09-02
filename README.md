@@ -89,7 +89,9 @@ Every flag, and when you reach for it. The prose below and under
 | `--verbose` | optional | — | You want the backend's running commentary back on stdout. |
 | `--quiet` | optional | — | An unattended run that should not repaint a status line. |
 
-`ralph clean --worktree PATH` removes Ralph's state for a worktree. The three
+`ralph clean --worktree PATH` removes Ralph's state for a worktree and reports how
+many runs' evidence went with it, so a worktree that had nothing to clean reads
+differently from one whose fifty-five runs just went. The three
 flags marked *relaxes a guarantee* are the only ones that weaken what Ralph
 proves; each is default-off, independent of the others, announced loudly at
 launch, and reproduced into the recovery commands Ralph prints.
@@ -364,7 +366,12 @@ environment, re-proves authentication, effective routing, model availability,
 and customization isolation, then relaunches the interactive session under
 `caffeinate -im` with isolated configuration and full-auto permissions. It
 therefore refuses a recovery environment that has gained an API credential,
-custom endpoint, or unsafe backend customization since the handoff. A started
+custom endpoint, or unsafe backend customization since the handoff. Before it hands
+over it prints a compact header naming the session you are entering, the model and
+backend, what the handover re-proved, and whether host isolation is in force — the
+last stated either way, so a resumed session that is running unconfined says so
+rather than leaving you to notice the omission. That header is the last thing Ralph
+prints: the next step replaces its own process with the interactive session. A started
 handed-off session consumes its iteration. The first Ctrl-C requests graceful
 resumable shutdown; a second Ctrl-C force-kills the backend.
 
@@ -380,6 +387,10 @@ that repository-local state when no loop is active with:
 ```sh
 ralph clean --worktree PATH
 ```
+
+That deletes every run's retained evidence and cannot be undone, so it tells you
+what it took: the number of runs removed and the state directory they were in, or
+that there was no Ralph state there at all.
 
 ## Safety
 

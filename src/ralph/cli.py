@@ -16,7 +16,14 @@ Invariants:
   exists to demand.
 - ``clean`` removes only a real ``.git/ralph`` state directory, never following a
   symlink or deleting an unexpected file type, and refuses while a live loop holds
-  the worktree lock.
+  the worktree lock. It then reports what it destroyed through the console, counting
+  the runs while they still exist and distinguishing a real removal from a no-op, so
+  a command that irreversibly deletes every run's evidence is never silent about
+  having done it (register G22). It arms the redactor before it renders anything, as
+  ``run`` and ``resume`` do: the console's choke point only scrubs what a live
+  redactor knows about, so a command that prints a resolved path has to arm one
+  (register G17). The refusals reach the operator the same way every other failure
+  does, as a ``RalphError`` the console words.
 - ``resume`` re-establishes the full Trust boundary (sanitized environment,
   per-session OAuth/routing proof, isolated configuration, full-auto permissions,
   caffeinate, and host isolation) before ``exec``-ing the interactive backend, so
@@ -31,16 +38,25 @@ Invariants:
   caveat goes through it too (``relaunching_full_auto``), so this module holds no
   terminal write of its own and the structural rule that only the Run console
   addresses a terminal now holds without exception (register G13).
+- ``resume`` states its compact header — the session being entered, the trust
+  boundary re-proven, and the host-isolation status — after the sandbox is
+  established and immediately before it hands over, because the next statement
+  replaces this process and there is nothing left to render afterwards (register
+  G8/G22). It is where the proof completes, the same placement register G8 gives a
+  run's Trust boundary line, and host isolation is stated whether or not it holds:
+  an operator reading three lines cannot tell an omitted guarantee from a kept one.
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
 - ``main`` is the composition root (register G16): it is the only module in the
-  tree that constructs a concrete Run console, and it injects it into ``run`` and
-  ``resume`` and uses it for the terminal error line. Everything below depends on
-  the ``RunConsole`` abstraction only, so both rendering choices an operator makes
-  are made here and nowhere else. ``--verbose`` hands the console a second stream —
-  stdout — for the Backend feed, which is otherwise suppressed so the default view
-  is the dashboard alone (register G2); ``--quiet`` drops the status line and the
+  tree that constructs a concrete Run console, and it injects it into all three
+  commands and uses it for the terminal error line — ``clean`` and ``resume`` too,
+  since a command that destroys evidence or hands over a session addresses the
+  operator exactly as a run does. Everything below depends on the ``RunConsole``
+  abstraction only, so both rendering choices an operator makes are made here and
+  nowhere else. ``--verbose`` hands the console a second stream — stdout — for the
+  Backend feed, which is otherwise suppressed so the default view is the dashboard
+  alone (register G2); ``--quiet`` drops the status line and the
   Iteration blocks while the header, the summary, and every failure still print
   (register G11). Both are ``run`` flags, defaulted off on the shared parser so
   ``clean`` and ``resume`` carry them too. Whether the console paints for a terminal
@@ -51,11 +67,13 @@ the resolved Backend's five interface names), ``console`` (the ``RunConsole``
 abstraction and the one concrete renderer it selects), ``redaction`` (functions
 only), ``protocol`` (the default interactive-only label),
 ``gitcontext``, ``launch`` (``session_argv``, ``establish_sandbox``), ``locking``
-(the worktree lock and ``secure_state_directory``), ``loop``, ``process``
-(timeout ceiling), and ``errors``. It resolves the Backend once and drives it only
-through the interface; it must not contain any Backend, Launch chain, or Loop
-mechanism of its own, nor branch on the backend name. It words no operator-facing
-line of its own at all: every one goes through the injected Run console.
+(the worktree lock and ``secure_state_directory``), ``loop`` (``run_locked``, and
+``retained_runs`` so ``clean`` never has to know how runs are laid out inside the
+state root), ``process`` (timeout ceiling), and ``errors``. It resolves the Backend
+once and drives it only through the interface; it must not contain any Backend,
+Launch chain, or Loop mechanism of its own, nor branch on the backend name. It words
+no operator-facing line of its own at all: every one goes through the injected Run
+console.
 
 See also: ``console`` (the Run console it constructs), ``loop`` (the budgeted
 Iteration loop), ``backends`` (the registry and adapters), ``launch`` (wrapped argv
@@ -76,7 +94,10 @@ from .backends import DEFAULT_MODELS, resolve
 from .console import (
     IN_SCOPE_BACKEND_DEVIATIONS,
     NO_SANDBOX_DEVIATION,
+    PREFLIGHT_PROPERTIES,
+    CleanOutcome,
     Deviation,
+    ResumeSettings,
     RunConsole,
     StreamRunConsole,
 )
@@ -89,7 +110,7 @@ from .launch import (
     session_argv,
 )
 from .locking import WorktreeLock, secure_state_directory
-from .loop import run_locked
+from .loop import retained_runs, run_locked
 from .process import MAX_ITERATION_TIMEOUT_SECONDS
 from .protocol import DEFAULT_INTERACTIVE_LABEL
 from .redaction import collect_secrets, set_active_redactor
@@ -140,7 +161,12 @@ def run(args: argparse.Namespace, console: RunConsole) -> int:
         )
 
 
-def clean(args: argparse.Namespace) -> int:
+def clean(args: argparse.Namespace, console: RunConsole) -> int:
+    # Establish the redactor before anything is rendered, exactly as ``run`` and
+    # ``resume`` do. The console's choke point is only as good as the live redactor
+    # behind it, so a command that prints a resolved path has to arm it too
+    # (register G17).
+    set_active_redactor(collect_secrets())
     requested = Path(args.worktree or os.getcwd()).expanduser().resolve()
     if not requested.is_dir():
         raise RalphError("worktree is not a directory")
@@ -157,18 +183,26 @@ def clean(args: argparse.Namespace) -> int:
         try:
             info = os.lstat(state_root)
         except FileNotFoundError:
-            return 0
-        # Never follow a symlink or delete an unexpected file type: only a real
-        # Ralph state directory is removed, and shutil.rmtree does not follow
-        # symlinked children, so backend transcripts and source files outside
-        # .git/ralph are never touched.
-        if stat.S_ISLNK(info.st_mode):
-            raise RalphError("refusing to remove a symlinked Ralph state path")
-        if not stat.S_ISDIR(info.st_mode):
-            raise RalphError("Ralph state path is not a directory")
-        shutil.rmtree(state_root)
+            outcome = CleanOutcome(state_root, runs=None)
+        else:
+            # Never follow a symlink or delete an unexpected file type: only a real
+            # Ralph state directory is removed, and shutil.rmtree does not follow
+            # symlinked children, so backend transcripts and source files outside
+            # .git/ralph are never touched.
+            if stat.S_ISLNK(info.st_mode):
+                raise RalphError("refusing to remove a symlinked Ralph state path")
+            if not stat.S_ISDIR(info.st_mode):
+                raise RalphError("Ralph state path is not a directory")
+            # Count what is about to be destroyed while it still exists; the report
+            # names the evidence that went, not the empty space it left.
+            outcome = CleanOutcome(state_root, runs=retained_runs(state_root))
+            shutil.rmtree(state_root)
     finally:
         lock.release()
+    # Reported after the lock is released and only once the removal actually
+    # succeeded, so a failed rmtree raises instead of claiming a delete that did
+    # not happen.
+    console.state_removed(outcome)
     return 0
 
 
@@ -223,6 +257,20 @@ def resume(args: argparse.Namespace, console: RunConsole) -> int:
     # replaces Ralph's own loop-level assertion once control passes to the operator.
     argv = session_argv(
         backend.resume_argv(worktree, args.model, args.session), sandbox_profile
+    )
+    # The compact recovery header, printed where its proof completes and while there
+    # is still a process to print it from: the next statement replaces this one, so
+    # everything the operator is going to be told about the handover has to be said
+    # now (register G8/G22). The properties named are the ones ``backend.preflight``
+    # has just re-established; ``cli`` names which, the console words them (G14).
+    console.resume_started(
+        ResumeSettings(
+            backend=args.backend,
+            model=args.model,
+            session_id=args.session,
+            host_isolated=not args.unsafe_no_sandbox,
+            reproven=PREFLIGHT_PROPERTIES,
+        )
     )
     console.relaunching_full_auto()
     try:
@@ -387,7 +435,7 @@ def main() -> int:
         if args.command == "run":
             return run(args, console)
         if args.command == "clean":
-            return clean(args)
+            return clean(args, console)
         if args.command == "resume":
             return resume(args, console)
     except RalphError as error:

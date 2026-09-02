@@ -44,6 +44,74 @@ class WorktreeLockingTest(RalphCliTestCase):
         recovered = self.run_ralph()
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
 
+    def test_clean_reports_the_runs_it_destroyed_and_where_they_were(self) -> None:
+        # Destroying every run's evidence is irreversible, so the command that does it
+        # says so: the count of runs that went, and the state directory they were in.
+        for _ in range(2):
+            self.assertEqual(self.run_ralph().returncode, 0)
+        state_root = self.repo / ".git" / "ralph"
+
+        cleaned = self.clean_ralph()
+
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertIn("2 run(s)", cleaned.stderr)
+        self.assertIn(str(state_root.resolve()), cleaned.stderr)
+
+    def test_clean_says_plainly_when_there_was_nothing_to_remove(self) -> None:
+        # A worktree that never ran Ralph must not be confused with one whose fifty-
+        # five runs just went: both exit 0, so only the words tell them apart.
+        nothing = self.clean_ralph()
+        self.assertEqual(nothing.returncode, 0, nothing.stderr)
+        self.assertIn("nothing", nothing.stderr)
+
+        self.assertEqual(self.run_ralph().returncode, 0)
+        removed = self.clean_ralph()
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertIn("1 run(s)", removed.stderr)
+        self.assertNotIn("nothing", removed.stderr)
+
+    def test_clean_does_not_count_runs_through_a_symlinked_runs_directory(self) -> None:
+        # A run refuses a symlinked `runs` outright, and rmtree removes such a link
+        # without touching what it points at. Counting through one would report
+        # evidence destroyed that is still sitting on disk.
+        outside = self.base / "outside-runs-count"
+        outside.mkdir()
+        for name in ("r1", "r2"):
+            (outside / name).mkdir()
+        (self.repo / ".git" / "ralph").mkdir()
+        os.symlink(outside, self.repo / ".git" / "ralph" / "runs")
+
+        cleaned = self.clean_ralph()
+
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertNotIn("2 run(s)", cleaned.stderr)
+        self.assertIn("no runs", cleaned.stderr)
+        # What it declined to count, it also declined to delete.
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["r1", "r2"])
+
+    def test_clean_redacts_a_subscription_credential_from_what_it_prints(self) -> None:
+        # The console redacts at one choke point, but a choke point only scrubs what a
+        # live redactor knows about, and `clean` prints a resolved path it was handed.
+        secret = "sk-live-clean-token-value"
+        worktree = self.base / secret
+        worktree.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main"], cwd=worktree, check=True, capture_output=True
+        )
+        (worktree / ".git" / "ralph" / "runs" / "r1").mkdir(parents=True)
+
+        cleaned = subprocess.run(
+            self._command("clean", worktree=worktree),
+            cwd=self.base,
+            env=self._environment({"CLAUDE_CODE_OAUTH_TOKEN": secret}),
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertNotIn(secret, cleaned.stdout + cleaned.stderr)
+        self.assertIn("[redacted]", cleaned.stderr)
+
     def test_clean_removes_only_selected_repository_ralph_state(self) -> None:
         result = self.run_ralph()
         self.assertEqual(result.returncode, 0, result.stderr)

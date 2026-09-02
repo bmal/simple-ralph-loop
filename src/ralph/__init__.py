@@ -5,12 +5,15 @@ Module map — start here, then open only the module you need:
 
 - ``cli``          — argument parsing and the run/clean/resume commands; ``main``,
                      the composition root that selects the concrete Run console.
-- ``console``      — the Run console: the operator-facing seam, the run header, the
-                     palette, terminal detection and width, no-wrap truncation, and
-                     the redaction choke point for console output.
+- ``console``      — the Run console: the operator-facing seam for all three
+                     commands, the run header, the ``clean`` report and the
+                     ``resume`` header, the palette, terminal detection and width,
+                     no-wrap truncation, and the redaction choke point.
 - ``loop``         — the budgeted Iteration loop, handoff printing, outcome
-                     recording, and the once-per-run resolution of the concrete
-                     interactive-only children (after preflight proves ``gh``).
+                     recording, the run-directory layout (and the run count
+                     ``clean`` reports against it), and the once-per-run resolution
+                     of the concrete interactive-only children (after preflight
+                     proves ``gh``).
 - ``launch``       — the Launch chain: wrapped argv, the power-assertion seam and
                      ``CaffeinateAssertion``, host-isolation profile + sandbox wrap,
                      and recovery-command (resume/restart) formatting.

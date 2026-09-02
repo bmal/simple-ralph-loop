@@ -24,6 +24,7 @@ from ralph.console import (
     CLAUDE_AGENTS_DEVIATION,
     NO_SANDBOX_DEVIATION,
     OPENCODE_AGENTS_DEVIATION,
+    CleanOutcome,
     ContextObserved,
     Deviation,
     IterationOutcome,
@@ -31,6 +32,7 @@ from ralph.console import (
     MarkerWithdrawn,
     Narrated,
     OperatorHelp,
+    ResumeSettings,
     RunSettings,
     RunSummary,
     StepObserved,
@@ -522,6 +524,151 @@ class HelpAndDeviationConsoleTest(unittest.TestCase):
         self.assertIn(str(run_dir), joined)
         # A pre-session failure is not a resumable handoff, so the banner never shows.
         self.assertNotIn("RALPH NEEDS OPERATOR", joined)
+
+
+class CleanAndResumeConsoleTest(unittest.TestCase):
+    """The two commands that are not ``run``, rendered directly (register G22).
+    ``clean`` destroys every run's evidence irreversibly, so what it says afterwards
+    is the operator's only record of it; ``resume`` says its piece and then replaces
+    its own process, so there is no second chance to render. Both are driven onto a
+    plain stream here, where the wording is what matters, and onto a narrow pty below,
+    where the answer must survive the window."""
+
+    def _lines(self, say: object) -> list[str]:
+        stream = io.StringIO()
+        say(StreamRunConsole(stream))
+        return stream.getvalue().rstrip("\n").split("\n")
+
+    def _resume(self, **overrides: object) -> ResumeSettings:
+        defaults: dict[str, object] = {
+            "backend": "claude",
+            "model": "claude-opus-5",
+            "session_id": "claude-session-1",
+            "host_isolated": True,
+            "reproven": ("subscription-only authentication", "customization isolation"),
+        }
+        defaults.update(overrides)
+        return ResumeSettings(**defaults)  # type: ignore[arg-type]
+
+    def test_clean_names_the_runs_it_destroyed_and_where_they_were(self) -> None:
+        state_root = Path("/Users/operator/code/project/.git/ralph")
+        lines = self._lines(
+            lambda console: console.state_removed(
+                CleanOutcome(state_root, runs=55)
+            )
+        )
+        joined = "\n".join(lines)
+        self.assertIn("55 run(s)", joined)
+        self.assertIn(str(state_root), joined)
+
+    def test_clean_distinguishes_a_no_op_from_a_removal(self) -> None:
+        state_root = Path("/w/.git/ralph")
+        removed = "\n".join(
+            self._lines(
+                lambda console: console.state_removed(
+                    CleanOutcome(state_root, runs=3)
+                )
+            )
+        )
+        nothing = "\n".join(
+            self._lines(
+                lambda console: console.state_removed(
+                    CleanOutcome(state_root, runs=None)
+                )
+            )
+        )
+        # "Removed fifty-five runs" and "there was nothing there" are the two answers
+        # an operator needs told apart; neither may read as the other.
+        self.assertNotEqual(removed, nothing)
+        self.assertIn("nothing", nothing)
+        self.assertNotIn("nothing", removed)
+
+    def test_removing_state_that_held_no_runs_is_not_reported_as_a_no_op(self) -> None:
+        # A state directory holding a lock file and no runs was still destroyed. It
+        # must not borrow the wording of the case where there was nothing to destroy.
+        state_root = Path("/w/.git/ralph")
+        emptied = "\n".join(
+            self._lines(
+                lambda console: console.state_removed(
+                    CleanOutcome(state_root, runs=0)
+                )
+            )
+        )
+        nothing = "\n".join(
+            self._lines(
+                lambda console: console.state_removed(
+                    CleanOutcome(state_root, runs=None)
+                )
+            )
+        )
+        self.assertNotEqual(emptied, nothing)
+        self.assertNotIn("nothing", emptied)
+
+    def test_the_resume_header_names_the_session_and_what_was_reproven(self) -> None:
+        joined = "\n".join(self._lines(lambda console: console.resume_started(self._resume())))
+        self.assertIn("claude", joined)
+        self.assertIn("claude-opus-5", joined)
+        self.assertIn("claude-session-1", joined)
+        self.assertIn("subscription-only authentication", joined)
+        self.assertIn("customization isolation", joined)
+
+    def test_the_resume_header_states_host_isolation_either_way(self) -> None:
+        confined = "\n".join(
+            self._lines(lambda console: console.resume_started(self._resume()))
+        )
+        unconfined = "\n".join(
+            self._lines(
+                lambda console: console.resume_started(self._resume(host_isolated=False))
+            )
+        )
+        # Never reported by omission: an operator reading three lines cannot tell a
+        # guarantee that was dropped from one that was simply not mentioned.
+        self.assertIn("host isolation", confined)
+        self.assertIn("host isolation", unconfined)
+        self.assertNotEqual(confined, unconfined)
+
+    def test_both_headers_are_redacted_at_the_console(self) -> None:
+        from ralph.redaction import set_active_redactor
+
+        secret = "s3cr3t-subscription-token-value"
+        set_active_redactor([secret])
+        self.addCleanup(set_active_redactor, [])
+        joined = "\n".join(
+            self._lines(
+                lambda console: (
+                    console.resume_started(self._resume(session_id=f"ses-{secret}")),
+                    console.state_removed(
+                        CleanOutcome(Path(f"/w/{secret}/.git/ralph"), runs=1)
+                    ),
+                )
+            )
+        )
+        self.assertNotIn(secret, joined)
+        self.assertIn("[redacted]", joined)
+
+    def test_neither_header_wraps_a_narrow_terminal(self) -> None:
+        columns = 44
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}), PtyCapture(columns) as terminal:
+            stream = terminal.text_stream()
+            try:
+                console = StreamRunConsole(stream)
+                console.resume_started(self._resume())
+                console.state_removed(
+                    CleanOutcome(Path("/Users/operator/code/project/.git/ralph"), runs=55)
+                )
+            finally:
+                stream.close()
+        lines = terminal.text.rstrip("\n").split("\n")
+        for line in lines:
+            self.assertLessEqual(
+                len(without_ansi(line)), columns, f"{line!r} would wrap at {columns} columns"
+            )
+        # The path is what a narrow window spends; the answer to "what happened?"
+        # survives whole on its own line.
+        self.assertTrue(
+            any(line.startswith("ralph: removed") and "55 run(s)" in line for line in lines),
+            lines,
+        )
 
 
 class RunHeaderTest(RalphCliTestCase):
