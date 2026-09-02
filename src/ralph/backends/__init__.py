@@ -28,12 +28,13 @@ Invariants:
   seam (``observe``) declared here alongside the Backend Protocol and injected by the
   Loop, over the closed set of frozen ``console.Observation`` value types (register
   G15). The adapter emits facts through it -- tool use, orchestrator context, the
-  live subagent roster, the mid-run warnings it used to print itself, and its own
-  running commentary -- and the Run console words and renders them, including whether
-  the commentary is shown at all (suppressed by default, restored under the opt-in
-  feed, register G2/G11). No adapter writes to a terminal (register G13). This is a
-  value type, not a wider interface: a new Observation is a new type, never a new
-  method, so the adapters keep seeing one.
+  live subagent roster, the Stage it declared through the Loop protocol, the mid-run
+  warnings it used to print itself, and its own running commentary -- and the Run
+  console words and renders them, including whether the commentary is shown at all
+  (suppressed by default, restored under the opt-in feed, register G2/G11). No
+  adapter writes to a terminal (register G13). This is a value type, not a wider
+  interface: a new Observation is a new type, never a new method, so the adapters
+  keep seeing one.
   The default ``None`` sink is a no-op, so an adapter that emits nothing (or a caller
   that injects none) still runs.
 

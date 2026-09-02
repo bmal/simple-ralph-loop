@@ -7,8 +7,13 @@ Invariants:
   is the concrete renderer and ``cli`` is the only module that constructs one
   (register G16). The Loop and the Backend adapters hand over value objects and
   plain facts and never construct operator-facing text (register G14).
-- Every operator-facing string this module emits passes through ``redact`` in
-  ``_write``, the single choke point for console output (register G17). Retained
+- Every operator-facing string this module emits passes through ``redact`` (register
+  G17): operator lines in ``_write``, and the status line in ``_status_text``, which
+  redacts its two Backend-authored fields before the width fitting measures them so a
+  placeholder can never be clipped back into a secret. The status line has its own
+  choke point rather than sharing ``_write`` because it is painted, not written --
+  ``\r`` and spaces, no trailing newline -- but nothing reaches a stream without one
+  of the two. Retained
   artifacts keep their own redaction; console truncation is display-only and never
   reduces what is written to disk (register G18).
 - The palette has four roles (register G12). ``chrome`` marks Ralph's own voice,
@@ -68,7 +73,7 @@ Invariants:
   ``budget_continue`` render (register G14).
 - ``observe`` is the narrow one-method Observation sink the Backend adapters drive
   during an Iteration (register G14/G15). It carries a closed set of frozen value
-  types -- progress facts (``ToolObserved``, ``ContextObserved``,
+  types -- progress facts (``StageObserved``, ``ToolObserved``, ``ContextObserved``,
   ``SubagentsObserved``), the mid-run warnings an adapter used to print itself
   (``MarkerWithdrawn``,
   ``UnmarkedQuestion``, ``KilledTask``), and the Backend's running commentary
@@ -77,11 +82,18 @@ Invariants:
   operator-directed``, and the killed-task phrase live here now, not in the adapter
   (register G19). The progress facts feed a single status line that repaints in
   place on a terminal
-  (register G3/G4): Iteration and budget, the Iteration's elapsed time, the current
-  or last tool, the tool count, the orchestrator's live context size, and the live
+  (register G3/G4): Iteration and budget, the Iteration's elapsed time, what the
+  Backend is doing, the tool count, the orchestrator's live context size, and the live
   subagent count -- each field absent, never zero, until a Backend supplies it, so an
   OpenCode run (which reports no roster) simply carries no subagent field rather than
-  a fabricated zero (register G4/G5). Its ticking elapsed clock is the only motion -- a background ticker
+  a fabricated zero (register G4/G5). One field answers what the Backend is doing, and
+  the Stage it declared through the Loop protocol is the better answer than the tool
+  whenever there is one -- it names where the Backend is in the operator's own prompt.
+  The console never infers a Stage from the tool mix, and stops asserting one that has
+  gone stale (``STAGE_STALE_SECONDS`` since it was declared), giving the field back to
+  the last tool, so a Backend that declared a Stage and then forgot to announce the
+  transition degrades to a lower-confidence truth rather than a confident untruth
+  (register G6). Its ticking elapsed clock is the only motion -- a background ticker
   repaints it on a cadence so a long silent tool call still advances the clock, and a
   frozen clock therefore means stalled rather than a spinner spinning over a hang.
   The line is read against the terminal's live width and never wraps: it drops fields
@@ -362,6 +374,18 @@ class OperatorHelp:
 # decides what to do with it. A new Observation is a new value type here, not a wider
 # interface, so the seam the adapters see stays one method while behaviour grows.
 @dataclass(frozen=True)
+class StageObserved:
+    """The Backend declared which stage of the operator's own prompt it has reached,
+    through the Loop protocol (register G6). Never inferred from tool use: the stages
+    live in the prompt, which Ralph snapshots but never reads, so a guess would
+    confidently report the wrong one. ``label`` is the free text the protocol accepts,
+    already bounded and sanitized by the parser; the console redacts it like every
+    other operator-facing string and decides when it has gone stale."""
+
+    label: str
+
+
+@dataclass(frozen=True)
 class ToolObserved:
     """The orchestrator reached for a tool. ``name`` is the tool the status line
     shows as the current or last tool, and each one increments the tool count."""
@@ -459,7 +483,8 @@ class StepObserved:
 
 
 Observation = (
-    ToolObserved
+    StageObserved
+    | ToolObserved
     | ContextObserved
     | SubagentsObserved
     | MarkerWithdrawn
@@ -479,6 +504,17 @@ STATUS_SEPARATOR = " · "
 # clock keeps ticking through a long silent tool call -- the one motion that
 # distinguishes a live run from a hang (register G3).
 STATUS_TICK_SECONDS = 1.0
+# How long a declared Stage is believed before the status line stops asserting it and
+# falls back to the last tool (register G6). The Backend declares a Stage as it enters
+# one; the failure this guards is the Backend that declares once and never announces a
+# transition, leaving a four-hour Iteration claiming it is still selecting a task. A
+# fixed bound, deliberately not scaled to the run's ``--timeout``: the failure only
+# bites a long Iteration, and on a short one a Stage declared at the top is still
+# plausibly true when the Iteration ends. Fifteen minutes is long enough that a real
+# transition beats it by a wide margin and short enough that a forgotten one stops
+# misleading well inside a long Iteration. Falling back loses information but never
+# states an untruth, which is the trade register G6 makes.
+STAGE_STALE_SECONDS = 900.0
 # Off a terminal there is no in-place line to keep smooth, so the ticker degrades to
 # *slow* append-only heartbeats at this far coarser cadence (register G3): a live sign
 # for a piped log without one line a second flooding it. A run shorter than one
@@ -495,6 +531,9 @@ def render_status(
     context_tokens: int | None,
     subagents: int | None,
     width: int | None,
+    *,
+    stage: str | None = None,
+    stage_age_seconds: float | None = None,
 ) -> str:
     """Render the status line, dropping fields right-to-left until it fits *width*
     and never wrapping (register G3/G4). A stream with no width (anything that is not
@@ -506,10 +545,21 @@ def render_status(
     that reads as a fact (register G4/G5). A genuine count of zero -- a Backend that
     reported an empty subagent roster -- still renders, so the two are not conflated.
     OpenCode emits no subagent roster, so its status line simply carries no subagent
-    field, while a Claude run shows the count once its roster event supplies one."""
+    field, while a Claude run shows the count once its roster event supplies one.
+
+    One field answers "what is it doing", and the declared Stage is the better answer
+    than the tool whenever there is one: it names where the Backend is in the
+    operator's own prompt rather than which file it happened to open. It gives that
+    field back once it has gone stale -- ``stage_age_seconds`` past
+    ``STAGE_STALE_SECONDS`` -- so a Backend that declared a Stage and then forgot to
+    announce the transition degrades to the lower-confidence but always-true last tool
+    rather than going on asserting something untrue (register G6). An age of ``None``
+    is an undeclared age, not an infinite one, and reads as fresh."""
     fields = [f"iteration {iteration}/{iterations}", format_duration(elapsed_seconds)]
-    if tool:
-        fields.append(tool)
+    stale = stage_age_seconds is not None and stage_age_seconds > STAGE_STALE_SECONDS
+    activity = stage if stage and not stale else tool
+    if activity:
+        fields.append(activity)
     fields.append(f"{tool_count} tool{'' if tool_count == 1 else 's'}")
     if context_tokens is not None:
         fields.append(f"context {context_tokens} tokens")
@@ -655,6 +705,10 @@ class StreamRunConsole:
         self._iterations = 0
         self._tool: str | None = None
         self._tool_count = 0
+        # The Stage the Backend last declared and when, so the status line can stop
+        # asserting it once it goes stale and fall back to the tool (register G6).
+        self._stage: str | None = None
+        self._stage_at: float | None = None
         self._context: int | None = None
         # ``None`` until a Backend supplies a subagent roster: a Backend that never
         # reports one (OpenCode) leaves the field absent rather than showing a zero
@@ -672,7 +726,11 @@ class StreamRunConsole:
         # as whole operator lines, erasing and redrawing the status around themselves
         # like any other interruption (register G14/G15).
         with self._lock:
-            if isinstance(observation, ToolObserved):
+            if isinstance(observation, StageObserved):
+                self._stage = observation.label
+                self._stage_at = time.monotonic()
+                self._establish_locked()
+            elif isinstance(observation, ToolObserved):
                 self._tool = observation.name
                 self._tool_count += 1
                 self._establish_locked()
@@ -1087,6 +1145,8 @@ class StreamRunConsole:
             self._iterations = iterations
             self._tool = None
             self._tool_count = 0
+            self._stage = None
+            self._stage_at = None
             self._context = None
             self._subagents = None
             self._iteration_start = time.monotonic()
@@ -1156,10 +1216,16 @@ class StreamRunConsole:
                 now = time.monotonic()
                 if now - self._last_heartbeat >= HEARTBEAT_SECONDS:
                     self._last_heartbeat = now
-                    self._stream.write(redact(self._status_text()) + "\n")
+                    self._stream.write(self._status_text() + "\n")
                     self._stream.flush()
 
     def _status_text(self) -> str:
+        """The status line, already through the redaction choke point (register G17).
+        The two free-text fields -- the Stage the Backend declared and the tool it
+        named -- are redacted *before* rendering rather than after, so a ``[redacted]``
+        placeholder is what the no-wrap fitting measures and a secret can never be
+        clipped back into view by the width logic. Both painters read this one text, so
+        neither the terminal repaint nor the off-terminal heartbeat can bypass it."""
         elapsed = (
             time.monotonic() - self._iteration_start
             if self._iteration_start is not None
@@ -1169,11 +1235,15 @@ class StreamRunConsole:
             self._iteration,
             self._iterations,
             elapsed,
-            self._tool,
+            redact(self._tool) if self._tool else None,
             self._tool_count,
             self._context,
             self._subagents,
             self._width(),
+            stage=redact(self._stage) if self._stage else None,
+            stage_age_seconds=(
+                time.monotonic() - self._stage_at if self._stage_at is not None else None
+            ),
         )
 
     def _paint_status_locked(self) -> None:

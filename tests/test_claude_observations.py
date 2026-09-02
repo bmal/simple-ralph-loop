@@ -19,6 +19,7 @@ from ralph.console import (
     ContextObserved,
     KilledTask,
     Narrated,
+    StageObserved,
     SubagentsObserved,
     ToolActivity,
     ToolObserved,
@@ -140,6 +141,69 @@ class ClaudeObservationExtractionTest(unittest.TestCase):
         )
         counted = [o.name for o in sink.observations if isinstance(o, ToolObserved)]
         self.assertEqual(counted, ["Bash"])
+
+    def test_a_declared_stage_is_reported_as_the_backend_speaks(self) -> None:
+        # The declaration is read from the assistant events as they arrive, not from
+        # the final message alone, so the operator sees the stage while the Iteration
+        # is still running (register G6). Each fresh declaration supersedes the last.
+        sink = self._feed(
+            [
+                _init(),
+                _assistant("s1", [_text("<promise>STAGE: selecting a child</promise>")]),
+                _assistant("s1", [_tool("Bash")]),
+                _assistant("s1", [_text("On it.\n\n<promise>STAGE: implementing</promise>")]),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["selecting a child", "implementing"])
+
+    def test_the_stage_label_is_whatever_wording_the_backend_chose(self) -> None:
+        # Free text, not an enumeration Ralph imposes: the stages belong to the
+        # operator's prompt, which Ralph snapshots but never reads.
+        sink = self._feed(
+            [_init(), _assistant("s1", [_text("<promise>STAGE: chasing the flake</promise>")])]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["chasing the flake"])
+
+    def test_an_over_long_stage_label_is_bounded_and_a_malformed_one_refused(self) -> None:
+        sink = self._feed(
+            [
+                _init(),
+                _assistant("s1", [_text("<promise>STAGE: " + "reticulating " * 8 + "</promise>")]),
+                _assistant("s1", [_text("<promise>STAGE:    </promise>")]),
+                _assistant("s1", [_text("<promise>STAGE: red \x1b[31mtext</promise>")]),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(len(stages), 1)
+        self.assertLessEqual(len(stages[0]), 32)
+        self.assertTrue(stages[0].startswith("reticulating"))
+
+    def test_a_stage_declaration_is_only_the_orchestrators_to_make(self) -> None:
+        # A subagent works inside the Backend's stage and does not speak for the
+        # operator's prompt, so its declaration is not the Iteration's stage.
+        sink = self._feed(
+            [
+                _init(),
+                _assistant("s1", [_text("<promise>STAGE: reviewing</promise>")], parent="toolu_9"),
+            ]
+        )
+        self.assertEqual([o for o in sink.observations if isinstance(o, StageObserved)], [])
+
+    def test_a_stage_marker_inside_code_or_quotation_declares_nothing(self) -> None:
+        # The same visible-Markdown rule the outcome markers use: a stage quoted from
+        # the protocol or shown in a code sample is not a declaration.
+        quoted = "```\n<promise>STAGE: fenced</promise>\n```\n\n> <promise>STAGE: quoted</promise>"
+        sink = self._feed([_init(), _assistant("s1", [_text(quoted)])])
+        self.assertEqual([o for o in sink.observations if isinstance(o, StageObserved)], [])
+
+    def test_tool_use_alone_never_declares_a_stage(self) -> None:
+        # Stage is declared, never inferred from the tool mix (register G6).
+        sink = self._feed(
+            [_init(), _assistant("s1", [_tool("Read"), _tool("Edit"), _tool("Bash")])]
+        )
+        self.assertEqual([o for o in sink.observations if isinstance(o, StageObserved)], [])
 
     def test_orchestrator_context_sums_input_cache_read_and_cache_creation(self) -> None:
         sink = self._feed(

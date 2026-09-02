@@ -133,14 +133,26 @@ having already proven host isolation — the trust boundary is stated as proven
 rather than left silent.
 
 While an iteration runs, a single status line repaints in place on a terminal,
-carrying the iteration and budget, the iteration's elapsed time, the current or
-last tool, a running tool count, the backend orchestrator's live context size in
+carrying the iteration and budget, the iteration's elapsed time, what the backend
+is doing, a running tool count, the backend orchestrator's live context size in
 absolute tokens, and the number of live subagents — the same fields with the same
 meanings whichever backend is running — so a four-hour run and a four-minute run
 occupy the same one line instead of filling your scrollback. A field the backend
 never reports is left absent rather than shown as a zero that reads as a fact: an
 OpenCode run, which has no subagents to report, simply carries no subagent count,
-and its context gauge is the input plus cache-read tokens it reports per step. Its
+and its context gauge is the input plus cache-read tokens it reports per step.
+
+The field saying what the backend is doing prefers the stage it declared over the
+tool it last reached for, because the stage names where it is in *your* prompt —
+selecting a task, loading context, implementing, finishing — rather than which file
+it happened to open. The loop protocol asks for it, in the backend's own wording:
+your prompt's phases are yours, and ralph snapshots the prompt without ever reading
+it, so it suggests example wording rather than handing out a vocabulary to map onto.
+Nothing is guessed from the tool mix — a confidently wrong stage would be believed —
+and a stage the backend declared and then never updated is dropped after a while in
+favour of the last tool, so the line stops short of asserting a phase that may have
+ended. The protocol asks every backend for a stage; today only the Claude adapter
+reads one back, so an OpenCode run still shows its last tool there. Its
 ticking clock is the only motion: there is no spinner, because a spinner that
 keeps spinning over a hang answers the wrong question, while a clock that stops
 tells you the run has stalled. The line is read against the terminal's live width
@@ -264,6 +276,18 @@ Ralph snapshots the prompt once, starts a fresh session per iteration, and
 stops early only when the final turn's last message from the backend itself
 contains the exact standalone line `<promise>COMPLETE</promise>`. Exhausting the
 budget without that marker is an incomplete, non-zero result.
+
+The same protocol also asks for progress, not only for an outcome. The backend
+declares the stage of *your* prompt it has reached as the standalone line
+`<promise>STAGE: label</promise>`, emitted when it enters a stage and again
+whenever that changes, and Ralph reads it out of the stream as the session speaks
+rather than waiting for the final message. The label is a few words in the
+backend's own wording — the protocol offers "selecting", "loading context",
+"implementing" and "finishing" as examples to shape it, not as a set to map onto —
+and it is bounded and sanitized before it reaches the status line. A stage
+declaration is progress and decides nothing: it neither completes the iteration nor
+halts it, and it is kept out of the prose the needs-input heuristics read, so
+declaring one cannot mask a question or invent one.
 
 Some child issues embed an owner decision and must be worked interactively. The
 Loop protocol Ralph appends to every prompt names a configurable label — set with

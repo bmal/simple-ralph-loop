@@ -75,6 +75,13 @@ Invariants:
   suppressed by default and restored only under the opt-in feed (register G2/G11).
   The ``ToolActivity`` a subagent's tool use emits is deliberately not a
   ``ToolObserved``: the status line's tool count stays the orchestrator's alone.
+  The Stage rides the same sink (``console.StageObserved``, register G6, #44), read
+  by ``protocol.extract_stage`` from each of the orchestrator's own text parts as
+  they arrive rather than from the final message alone, so the status line names
+  where the Iteration is while it still runs. It is *declared*, never inferred: the
+  tool mix above is never consulted for it, and a subagent's declaration is ignored
+  because a subagent works inside the Backend's stage rather than speaking for the
+  operator's prompt.
 - The composed prompt carries an adapter-local ``BACKGROUND_TASK_DIRECTIVE`` after
   the shared Loop protocol (H3): the Backend may launch background work but must not
   *park* on it -- end its turn while a task is still unresolved, expecting to be
@@ -164,6 +171,7 @@ from ..console import (
     MarkerWithdrawn,
     Narrated,
     Observation,
+    StageObserved,
     SubagentsObserved,
     ToolActivity,
     ToolObserved,
@@ -183,6 +191,7 @@ from ..protocol import (
     active_protocol,
     explicit_needs_input,
     extract_question,
+    extract_stage,
     has_completion_marker,
     inferred_needs_input,
 )
@@ -798,6 +807,18 @@ class ClaudeEventResult:
                 texts.append(part["text"])
                 if part["text"]:
                     self.emit(Narrated(part["text"], subagent=subagent))
+                if is_backend:
+                    # The Stage the Backend declared through the Loop protocol, read
+                    # here -- as each assistant event arrives -- rather than only from
+                    # the final message, so the status line shows where the Iteration
+                    # is while it runs (register G6). Only the orchestrator's own
+                    # declaration counts: a subagent works inside the Backend's stage
+                    # and does not speak for the operator's prompt. The parser bounds
+                    # and sanitizes the free-text label; nothing is inferred from the
+                    # tool use above or below.
+                    stage = extract_stage(part["text"])
+                    if stage is not None:
+                        self.emit(StageObserved(stage))
                 continue
             if part.get("type") == "tool_use":
                 name = part.get("name")

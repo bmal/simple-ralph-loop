@@ -14,6 +14,22 @@ Invariants:
   always holds the default label's protocol until the loop overrides it -- once the
   trust boundary is proven and the concrete blocked children are resolved, before
   the first session -- so it is never unset.
+- The protocol signals *progress* as well as outcome (register G6). Alongside the
+  completion and needs-input markers it asks the Backend to declare its Stage --
+  which part of the operator's own prompt it has reached -- as the exact standalone
+  line ``<promise>STAGE: label</promise>``, read back by ``extract_stage``. The
+  label is free text in the Backend's own wording, because the stages belong to the
+  prompt, which Ralph snapshots but never reads; no enumeration here could name
+  them, and a fixed vocabulary would force an unusual workflow to distort itself to
+  fit. The protocol offers ``SUGGESTED_STAGES`` as an example to shape the wording,
+  never as a set to map onto (the ratified owner decision on issue #44). Free text
+  is therefore bounded and sanitized where it is parsed, never where it is shown.
+  A Stage decides no outcome: it is progress, and the parser keeps it that way.
+- The widened protocol does not disturb the signalling it was widened from. A Stage
+  line is not the completion marker and is not the needs-input marker, and
+  ``visible_prose_lines`` blanks it, so a Stage declared after a concluding question
+  cannot hide that question from the heuristic and one declared after an explicit
+  needs-input marker is never read back as part of the question.
 - Marker detection reads only *visible* Markdown: fenced code, indented code, and
   block quotes are excluded so a ``<promise>...</promise>`` line quoted inside the
   prompt, a code sample, or tool output is never mistaken for an iteration result.
@@ -41,6 +57,7 @@ payloads to extract_question, and the withdrawn/unmarked fragments through
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 
@@ -48,6 +65,12 @@ from typing import Any
 # session. Repositories already using this convention need no configuration; a
 # repository using a different one names its own through ``ralph run``.
 DEFAULT_INTERACTIVE_LABEL = "may-ask-owner"
+
+# The wording the protocol offers as an example. It is guidance the Backend may
+# deviate from, not an enumeration it must map onto (the ratified owner decision on
+# issue #44); it lives here so the suggestion and the parser that accepts anything
+# stay in the one module.
+SUGGESTED_STAGES = ("selecting", "loading context", "implementing", "finishing")
 
 
 def build_protocol(
@@ -81,6 +104,7 @@ def build_protocol(
             f"\n- Resolved at the start of this run, no open child currently carries "
             f"`{interactive_label}`, so none is blocked on that basis."
         )
+    suggested = ", ".join(SUGGESTED_STAGES[:-1]) + f", or {SUGGESTED_STAGES[-1]}"
     return f"""
 
 Ralph loop protocol:
@@ -101,6 +125,16 @@ Ralph loop protocol:
 - Emit the completion marker when no unfinished child remains or when every
   remaining child has explicit blocker evidence such as a declared dependency,
   blocker label, or clear prerequisite state.
+- As you work, declare which stage of the supplied prompt's own workflow you are
+  in, so the operator can see live what you are doing. Emit the exact standalone
+  line <promise>STAGE: label</promise> when you enter a stage and again whenever
+  it changes, where `label` is a few words in your own wording -- for example
+  {suggested}. Those examples are a
+  suggestion to shape the wording, not a fixed vocabulary to map onto: describe
+  the stages the supplied prompt actually has. Keep a label to a handful of
+  words; a longer one is shortened for display. A stage declaration reports
+  progress and is never an iteration result -- it neither completes the iteration
+  nor halts it.
 - Halt for operator input only when a decision or fact required to make progress
   cannot be established from the issue tracker, this protocol, or the repository
   -- it lives outside them and no future iteration could derive it. To halt,
@@ -153,6 +187,58 @@ def visible_markdown_lines(text: str) -> list[tuple[int, str]]:
             continue
         visible.append((index, line))
     return visible
+
+
+# The Stage marker the widened protocol asks the Backend to declare (register G6).
+# It shares the ``<promise>`` envelope of the outcome markers so the prompt carries one
+# marker vocabulary, and a distinct verb so it can never be confused with them: a Stage
+# line is progress and decides no outcome.
+STAGE_MARKER = re.compile(r"<promise>STAGE:(.*)</promise>")
+
+
+def stage_declaration(line: str) -> str | None:
+    """Return the raw label of the Stage declaration *line* is, or ``None`` when it is
+    not one. One definition of the shape, read by both the parser and the prose filter,
+    so an indented or malformed declaration cannot be a declaration to one of them and
+    prose to the other. Matched against the whole line exactly as the outcome markers
+    are: a stage mentioned inside a sentence is prose, not a declaration."""
+    match = STAGE_MARKER.fullmatch(line)
+    return None if match is None else match.group(1)
+# The most of a declared Stage label that is kept. The label is free text -- the stages
+# belong to the operator's prompt, which Ralph snapshots but never reads, so no fixed
+# vocabulary could name them -- and free text needs a bound: it shares one status-line
+# field with the tool name, and a Backend that answers with a sentence must not push
+# every other field off the line.
+STAGE_LABEL_LIMIT = 32
+def extract_stage(text: str) -> str | None:
+    """Return the Stage label most recently declared in *text*, or ``None`` when it
+    declares none. Read from whatever the Backend has said so far rather than only
+    from its final message, so the console can show a stage while the Iteration runs.
+
+    The label is free text and is therefore bounded and sanitized here rather than
+    trusted: whitespace is collapsed to one line, an empty label is refused, one
+    carrying angle brackets or a control character (an escape sequence bound for a
+    terminal) is refused outright, and one longer than ``STAGE_LABEL_LIMIT`` is
+    shortened. A refused declaration is simply not a declaration -- the previous
+    Stage stands and the status line falls back to the last tool once it goes stale
+    -- so a malformed label can never be rendered raw. Redaction is the Run
+    console's, at its single choke point (register G17)."""
+    for _, line in reversed(visible_markdown_lines(text)):
+        raw = stage_declaration(line)
+        if raw is None:
+            continue
+        label = " ".join(raw.split())
+        if not label or "<" in label or ">" in label:
+            continue
+        if any(unicodedata.category(character) in ("Cc", "Cf") for character in label):
+            # Every control and format codepoint, not only the ASCII ones: the C1
+            # block carries an 8-bit CSI a terminal would act on, and the bidirectional
+            # overrides can make a label read as something other than what it says.
+            continue
+        if len(label) > STAGE_LABEL_LIMIT:
+            label = label[: STAGE_LABEL_LIMIT - 3] + "..."
+        return label
+    return None
 
 
 def has_completion_marker(text: str) -> bool:
@@ -222,6 +308,14 @@ def visible_prose_lines(text: str) -> list[tuple[int, str]]:
             # text even when they contain question marks.
             if not stripped:
                 in_tool_log = False
+            visible.append((index, ""))
+            continue
+        if stage_declaration(line) is not None:
+            # A Stage declaration is progress, not prose. Blanking it keeps the
+            # widened protocol from disturbing the outcome signalling it now shares
+            # a prompt with: a stage line trailing a concluding question must not
+            # hide that question from the heuristic, and one following an explicit
+            # needs-input marker must not be read back as part of the question.
             visible.append((index, ""))
             continue
         if stripped.lower().startswith(TOOL_LOG_PREFIXES):

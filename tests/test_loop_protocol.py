@@ -660,6 +660,98 @@ class LoopProtocolTest(RalphCliTestCase):
         self.assertNotIn("Traceback", claude.stderr)
 
 
+class StageDeclarationTest(RalphCliTestCase):
+    """The Loop protocol widened from signalling an Iteration's outcome to also
+    signalling its progress (register G6): what it asks the Backend for, and that
+    asking has not disturbed the outcome markers it now shares a prompt with."""
+
+    def _composed_prompt(self, backend: str) -> str:
+        if backend == "claude":
+            return json.loads((self.calls / "claude-stdin").read_text())["message"]["content"]
+        return (self.calls / "stdin").read_text()
+
+    def test_the_protocol_asks_for_a_stage_and_suggests_wording_without_fixing_it(
+        self,
+    ) -> None:
+        for backend in ("opencode", "claude"):
+            with self.subTest(backend=backend):
+                result = self.run_ralph(backend=backend)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                composed = self._composed_prompt(backend)
+                flat = " ".join(composed.split())
+                # The marker the Backend is asked to emit, and when.
+                self.assertIn("<promise>STAGE: label</promise>", composed)
+                self.assertIn("when you enter a stage and again whenever it changes", flat)
+                # Free text in the Backend's own wording, with the example vocabulary
+                # offered as a suggestion rather than imposed as an enumeration.
+                self.assertIn("a few words in your own wording", flat)
+                self.assertIn("selecting, loading context, implementing, or finishing", flat)
+                self.assertIn("not a fixed vocabulary to map onto", flat)
+                # Progress is not an outcome: the widened protocol says so in the
+                # prompt as well as enforcing it in the parser.
+                self.assertIn("never an iteration result", flat)
+                # The outcome contract it was widened from is unchanged.
+                self.assertIn("<promise>COMPLETE</promise>", composed)
+                self.assertIn("<promise>NEEDS_INPUT</promise>", composed)
+                for path in self.calls.iterdir():
+                    path.unlink()
+
+    def test_a_stage_declaration_does_not_complete_or_halt_the_iteration(self) -> None:
+        # A run whose only marker is a stage declaration ends the iteration normally:
+        # it neither completes the run early nor is mistaken for a question.
+        staged = "<promise>STAGE: implementing</promise>\n\nFinished the child."
+        result = self.run_ralph(
+            "--iterations",
+            "1",
+            env={"FAKE_EVENTS": self._events(staged), "FAKE_EXPORT": self._export(staged)},
+        )
+        # The budget runs out rather than the marker completing the run, and no
+        # handoff is offered: a stage declaration decides neither outcome.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("iteration budget exhausted", result.stderr)
+        self.assertNotIn("RALPH NEEDS OPERATOR", result.stderr)
+
+    def test_a_stage_declaration_alongside_the_outcome_markers_disturbs_neither(
+        self,
+    ) -> None:
+        completed = "<promise>STAGE: finishing</promise>\n\nAll done.\n\n<promise>COMPLETE</promise>"
+        result = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(completed), "FAKE_EXPORT": self._export(completed)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("complete", result.stderr)
+
+        for path in self.calls.iterdir():
+            path.unlink()
+        asked = (
+            "<promise>NEEDS_INPUT</promise>\n\nWhich database should the cache use?"
+            "\n\n<promise>STAGE: waiting</promise>"
+        )
+        halted = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(asked), "FAKE_EXPORT": self._export(asked)}
+        )
+        self.assertEqual(halted.returncode, 2, halted.stderr)
+        self.assertIn("RALPH NEEDS OPERATOR", halted.stderr)
+        # The stage line trailing the marker is progress, so it is not read back as
+        # part of the question the operator is handed.
+        self.assertIn("Which database should the cache use?", halted.stderr)
+        self.assertNotIn("STAGE: waiting", halted.stderr)
+
+    def test_a_stage_declaration_does_not_hide_an_unmarked_concluding_question(
+        self,
+    ) -> None:
+        # The low-confidence heuristic still sees the question it saw before: a stage
+        # line after it must not end the paragraph on a non-question.
+        asked = "Should I use Postgres or SQLite?\n\n<promise>STAGE: waiting</promise>"
+        result = self.run_ralph(
+            "--iterations",
+            "1",
+            env={"FAKE_EVENTS": self._events(asked), "FAKE_EXPORT": self._export(asked)},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unmarked operator-directed", result.stderr)
+
+
 class InteractiveLabelTest(RalphCliTestCase):
     """The configurable interactive-only label rule the Loop protocol carries into
     the composed prompt for both backends."""

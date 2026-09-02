@@ -24,6 +24,7 @@ from ralph.console import (
     CLAUDE_AGENTS_DEVIATION,
     NO_SANDBOX_DEVIATION,
     OPENCODE_AGENTS_DEVIATION,
+    STAGE_STALE_SECONDS,
     CleanOutcome,
     ContextObserved,
     Deviation,
@@ -35,6 +36,7 @@ from ralph.console import (
     ResumeSettings,
     RunSettings,
     RunSummary,
+    StageObserved,
     StepObserved,
     StreamRunConsole,
     SubagentsObserved,
@@ -895,6 +897,100 @@ class StatusLineRenderTest(unittest.TestCase):
         self.assertIn("context 900 tokens", absent)
         zero = render_status(1, 1, 0.0, "Bash", 2, 900, 0, None)
         self.assertIn("0 subagents", zero)
+
+
+class StatusLineStageTest(unittest.TestCase):
+    """The declared Stage occupies the status line's one "what is it doing" field,
+    and gives it back to the tool once it has gone stale (register G6)."""
+
+    def test_a_declared_stage_is_shown_instead_of_the_tool(self) -> None:
+        line = render_status(2, 4, 63.0, "Bash", 5, 12483, 3, 200, stage="implementing")
+        self.assertIn("implementing", line)
+        self.assertNotIn("Bash", line)
+        # It takes the tool's slot rather than adding one, so the rest of the line
+        # is unchanged and nothing is pushed off a narrow window by the addition.
+        self.assertEqual(
+            line,
+            "ralph: iteration 2/4 · 1m03s · implementing · 5 tools · "
+            "context 12483 tokens · 3 subagents",
+        )
+
+    def test_a_stale_stage_falls_back_to_the_last_tool(self) -> None:
+        fresh = render_status(
+            1, 2, 5.0, "Bash", 3, None, None, None, stage="loading context",
+            stage_age_seconds=STAGE_STALE_SECONDS,
+        )
+        self.assertIn("loading context", fresh)
+        stale = render_status(
+            1, 2, 5.0, "Bash", 3, None, None, None, stage="loading context",
+            stage_age_seconds=STAGE_STALE_SECONDS + 1,
+        )
+        self.assertNotIn("loading context", stale)
+        self.assertIn("Bash", stale)
+
+    def test_a_stale_stage_with_no_tool_yet_asserts_nothing(self) -> None:
+        # Falling back to a tool that does not exist would be worse than saying
+        # nothing: the field is simply absent rather than stating a stale phase.
+        line = render_status(
+            1, 2, 5.0, None, 0, None, None, None, stage="selecting",
+            stage_age_seconds=STAGE_STALE_SECONDS + 1,
+        )
+        self.assertEqual(line, "ralph: iteration 1/2 · 5s · 0 tools")
+
+    def test_a_stage_still_drops_before_the_iteration_and_elapsed(self) -> None:
+        for width in range(8, 100):
+            line = render_status(
+                1, 4, 5.0, "Read", 2, 900, 1, width, stage="loading context"
+            )
+            self.assertLessEqual(len(line), width, f"width {width}: {line!r}")
+
+
+class TerminalStatusStageTest(unittest.TestCase):
+    """The Stage reaches a real status line the same way every other progress fact
+    does -- as an Observation, with no adapter wording anything."""
+
+    def test_a_secret_in_a_stage_label_never_reaches_the_terminal(self) -> None:
+        # The Stage is the first Backend-authored free text to reach the status line,
+        # and the line is painted rather than written -- so it has to pass the same
+        # redaction choke point every other operator-facing string does (register G17).
+        from ralph.redaction import set_active_redactor
+
+        secret = "s3cr3t-subscription-token-value"
+        set_active_redactor([secret])
+        self.addCleanup(set_active_redactor, [])
+        stream = _FakeTerminal()
+        size = os.terminal_size((100, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            console = StreamRunConsole(stream)
+            console.iteration_started(1, 2)
+            console.observe(StageObserved(f"pushing {secret}"))
+            console.iteration_finished(
+                IterationOutcome(1, 2, 5.0, "complete", "ses_1", "Done.")
+            )
+        out = stream.getvalue()
+        self.assertNotIn(secret, out)
+        self.assertIn("[redacted]", out)
+
+    def test_the_status_line_carries_the_stage_the_backend_declared(self) -> None:
+        stream = _FakeTerminal()
+        size = os.terminal_size((100, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            console = StreamRunConsole(stream)
+            console.iteration_started(1, 2)
+            console.observe(ToolObserved("Bash"))
+            console.observe(StageObserved("implementing"))
+            console.iteration_finished(
+                IterationOutcome(1, 2, 5.0, "complete", "ses_1", "Done.")
+            )
+        out = stream.getvalue()
+        self.assertIn("implementing", out)
+        # The final painted status states the stage, not the tool it superseded.
+        painted = [row for row in re.split(r"[\r\n]", out) if "iteration 1/2" in row]
+        self.assertTrue(painted, out)
+        self.assertIn("implementing", painted[-1])
+        self.assertNotIn("Bash", painted[-1])
 
 
 class _FakeTerminal(io.StringIO):

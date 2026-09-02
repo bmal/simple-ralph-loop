@@ -32,11 +32,31 @@ _Avoid_: allowed backend, secondary backend, extra backend
 
 **Loop protocol**:
 The contract ralph appends to every prompt telling the backend how to signal
-an iteration's outcome (complete, or needs operator input) via markers ralph
-can detect. Built once per run from the configured interactive-only label and
-the concrete children ralph resolves as carrying it, so the same contract, its
-resolved facts, and its marker parser stay in one module.
+an iteration's outcome (complete, or needs operator input) and its progress (the
+Stage it has reached) via markers ralph can detect. Built once per run from the
+configured interactive-only label and the concrete children ralph resolves as
+carrying it, so the same contract, its resolved facts, and its marker parser stay
+in one module. Progress and outcome share the marker envelope but never each
+other's meaning: a Stage declaration completes nothing and halts nothing, and is
+excluded from the prose the needs-input heuristics read.
 _Avoid_: prompt suffix, prompt template, system prompt
+
+**Stage**:
+Which part of the operator's own prompt the backend has reached — selecting a
+task, loading context, implementing, finishing — declared by the backend through
+the Loop protocol and shown on the status line as the answer to "what is it
+doing", in place of the tool name rather than beside it. Never inferred from tool
+use: the stages live in
+the prompt, which ralph snapshots but never reads, so a guess would confidently
+report the wrong one and be believed. The label is free text in the backend's own
+wording, because no fixed vocabulary here could name another prompt's phases; the
+protocol suggests wording rather than enumerating it, and the parser bounds and
+sanitizes what comes back. A stage that has gone stale — declared long ago with no
+transition announced since — is dropped in favour of the last tool rather than
+going on asserting a phase that may have ended. The protocol asks every backend
+for it; only the Claude adapter reports it so far.
+_Avoid_: step and phase (both collide with OpenCode's own step-start/step-finish
+stream events), status, state, progress bar
 
 **Parked turn**:
 A backend turn ended while a background task it launched is still unresolved, on the
@@ -109,7 +129,8 @@ _Avoid_: log, output, UI, stderr (the stream it happens to write to)
 A single fact a Backend adapter emits about a running Iteration through the
 narrow one-method sink the Loop injects into `execute_iteration`, over a closed
 set of frozen value types — the orchestrator's tool use and live context gauge,
-the live subagent roster, the mid-run warnings the adapter used to print itself, and
+the live subagent roster, the Stage the backend declared, the mid-run warnings the
+adapter used to print itself, and
 the Backend's own running commentary, each passage attributed to the Backend or to
 the specific subagent that produced it. The adapter emits facts and the Run console
 decides wording and rendering — including whether a fact is shown at all, which is
