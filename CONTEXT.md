@@ -53,8 +53,8 @@ wording, because no fixed vocabulary here could name another prompt's phases; th
 protocol suggests wording rather than enumerating it, and the parser bounds and
 sanitizes what comes back. A stage that has gone stale — declared long ago with no
 transition announced since — is dropped in favour of the last tool rather than
-going on asserting a phase that may have ended. The protocol asks every backend
-for it; only the Claude adapter reports it so far.
+going on asserting a phase that may have ended. Both adapters declare one, each
+reading the marker out of its own stream shape.
 _Avoid_: step and phase (both collide with OpenCode's own step-start/step-finish
 stream events), status, state, progress bar
 

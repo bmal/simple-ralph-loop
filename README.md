@@ -151,14 +151,14 @@ it, so it suggests example wording rather than handing out a vocabulary to map o
 Nothing is guessed from the tool mix — a confidently wrong stage would be believed —
 and a stage the backend declared and then never updated is dropped after a while in
 favour of the last tool, so the line stops short of asserting a phase that may have
-ended. The protocol asks every backend for a stage; today only the Claude adapter
-reads one back, so an OpenCode run still shows its last tool there. Its
-ticking clock is the only motion: there is no spinner, because a spinner that
-keeps spinning over a hang answers the wrong question, while a clock that stops
-tells you the run has stalled. The line is read against the terminal's live width
-and never wraps — it drops fields from the right as the window narrows. When
-stderr is not a terminal the line degrades to slow append-only heartbeats carrying
-the same facts and no escape sequences, so a piped log stays clean.
+ended. Both backends declare one, each adapter reading the marker out of its own
+stream shape. The line's ticking clock is the only motion: there is no spinner,
+because a spinner that keeps spinning over a hang answers the wrong question, while
+a clock that stops tells you the run has stalled. The line is read against the
+terminal's live width and never wraps — it drops fields from the right as the
+window narrows. When stderr is not a terminal the line degrades to slow
+append-only heartbeats carrying the same facts and no escape sequences, so a piped
+log stays clean.
 
 The backend's own running commentary — its message text and bare tool markers — does
 not print at all by default, which is what leaves room for the dashboard. Each

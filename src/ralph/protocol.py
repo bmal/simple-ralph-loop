@@ -49,9 +49,10 @@ Depends on / must not know: nothing but the standard library. It parses backend
 text and must not know how any Backend produced it.
 
 See also: ``backends.opencode`` / ``backends.claude`` (feed final text to
-has_completion_marker plus explicit_needs_input / inferred_needs_input, tool
-payloads to extract_question, and the withdrawn/unmarked fragments through
-``bounded_quote`` before warning on them).
+has_completion_marker plus explicit_needs_input / inferred_needs_input, streaming
+text to extract_stage as the session speaks, tool payloads to extract_question,
+and the withdrawn/unmarked fragments through ``bounded_quote`` before warning on
+them).
 """
 
 from __future__ import annotations

@@ -5,6 +5,7 @@ fail-closed stream parsing."""
 from __future__ import annotations
 
 import json
+import re
 import shlex
 
 from harness import RalphCliTestCase
@@ -662,8 +663,9 @@ class LoopProtocolTest(RalphCliTestCase):
 
 class StageDeclarationTest(RalphCliTestCase):
     """The Loop protocol widened from signalling an Iteration's outcome to also
-    signalling its progress (register G6): what it asks the Backend for, and that
-    asking has not disturbed the outcome markers it now shares a prompt with."""
+    signalling its progress (register G6): what it asks the Backend for, where a
+    declaration ends up, and that asking has not disturbed the outcome markers it now
+    shares a prompt with."""
 
     def _composed_prompt(self, backend: str) -> str:
         if backend == "claude":
@@ -736,6 +738,19 @@ class StageDeclarationTest(RalphCliTestCase):
         # part of the question the operator is handed.
         self.assertIn("Which database should the cache use?", halted.stderr)
         self.assertNotIn("STAGE: waiting", halted.stderr)
+
+    def test_a_declared_stage_reaches_the_status_line_of_a_terminal_run(self) -> None:
+        # The whole chain on a real terminal: declared in the stream, read by the
+        # adapter, reported as an Observation, and painted into the one field that says
+        # what the run is doing, which is what a stage is declared for.
+        staged = "<promise>STAGE: loading context</promise>\n\nDone.\n<promise>COMPLETE</promise>"
+        result = self.run_ralph_pty(
+            env={"FAKE_EVENTS": self._events(staged), "FAKE_EXPORT": self._export(staged)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        painted = [row for row in re.split(r"[\r\n]", result.stderr) if "iteration 1/1" in row]
+        self.assertTrue(painted, result.stderr)
+        self.assertIn("loading context", painted[-1])
 
     def test_a_stage_declaration_does_not_hide_an_unmarked_concluding_question(
         self,

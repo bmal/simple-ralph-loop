@@ -2,11 +2,12 @@
 recording sink without a terminal (the program's testing decisions, register G4/G5).
 
 These drive the adapter's event accumulator directly and assert the facts it emits --
-the orchestrator's tool use and context gauge -- rather than how any of them is later
-rendered, and that a field OpenCode cannot supply (the subagent roster) is emitted as
-nothing rather than a fabricated zero. The Run console's rendering of the same value
-types is proven separately in ``test_run_console``; parity with the Claude adapter's
-extraction is proven in ``test_claude_observations``."""
+the orchestrator's tool use, context gauge, and the Stage it declared -- rather than
+how any of them is later rendered, and that a field OpenCode cannot supply (the
+subagent roster) is emitted as nothing rather than a fabricated zero. The Run
+console's rendering of the same value types is proven separately in
+``test_run_console``; parity with the Claude adapter's extraction is proven in
+``test_claude_observations``."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from ralph.backends.opencode import EventResult, orchestrator_context
 from ralph.console import (
     ContextObserved,
     Narrated,
+    StageObserved,
     StepObserved,
     SubagentsObserved,
     ToolActivity,
@@ -91,6 +93,15 @@ def _text(text: str, part_id: str = "part_1", session: str = "ses_1") -> dict:
             "type": "text",
             "text": text,
         },
+    }
+
+
+def _delta(delta: str, part_id: str = "part_1", session: str = "ses_1") -> dict:
+    # The other shape streamed text arrives in: an extension of a part already seen,
+    # carrying only what is new rather than restating the whole part.
+    return {
+        "type": "message.part.delta",
+        "properties": {"sessionID": session, "partID": part_id, "delta": delta},
     }
 
 
@@ -213,6 +224,123 @@ class OpenCodeObservationExtractionTest(unittest.TestCase):
         sink = self._feed([_step_start(), _step_finish({"input": 1})])
         steps = [o.started for o in sink.observations if isinstance(o, StepObserved)]
         self.assertEqual(steps, [True, False])
+
+    def test_a_declared_stage_is_reported_as_the_backend_speaks(self) -> None:
+        # Read out of the stream while the Iteration runs rather than from the final
+        # message alone, so the operator sees the stage as the session reaches it.
+        sink = self._feed(
+            [
+                _text("<promise>STAGE: selecting a child</promise>"),
+                _tool_use("bash", "prt_1"),
+                _text(
+                    "<promise>STAGE: selecting a child</promise>\n\nOn it.\n\n"
+                    "<promise>STAGE: implementing</promise>",
+                ),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["selecting a child", "implementing"])
+
+    def test_a_growing_part_does_not_re_announce_the_stage_it_already_declared(
+        self,
+    ) -> None:
+        # OpenCode restates the whole part on every update. Re-announcing an unchanged
+        # declaration would keep restarting the staleness clock, so a stage the Backend
+        # declared once and then abandoned would never give the field back to the last
+        # tool (register G6).
+        sink = self._feed(
+            [
+                _text("<promise>STAGE: implementing</promise>"),
+                _text("<promise>STAGE: implementing</promise>\n\nEditing the loop."),
+                _text("<promise>STAGE: implementing</promise>\n\nEditing the loop. Done."),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["implementing"])
+
+    def test_a_stage_declared_by_a_streamed_delta_is_read_too(self) -> None:
+        # A delta extends a part without restating it, so the declaration it completes
+        # is only visible on that shape.
+        sink = self._feed(
+            [
+                _text("Working.\n\n"),
+                _delta("<promise>STAGE: "),
+                _delta("finishing</promise>"),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["finishing"])
+
+    def test_a_later_part_re_announces_the_stage_the_backend_re_entered(self) -> None:
+        # The counterpart of the once-per-part rule: a declaration in a *new* part is a
+        # fresh announcement even when it names the stage already showing, so a Backend
+        # saying it is still there is heard and the staleness clock starts over.
+        sink = self._feed(
+            [
+                _text("<promise>STAGE: implementing</promise>", part_id="p1"),
+                _text("<promise>STAGE: implementing</promise>", part_id="p2"),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["implementing", "implementing"])
+
+    def test_a_delta_on_text_never_attributed_to_the_backend_declares_nothing(self) -> None:
+        # Text whose message was never established as the Backend's own is not narrated,
+        # and it does not declare a stage either: an unattributed part must not put words
+        # in the Backend's mouth on the status line.
+        sink = self._feed(
+            [
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "part": {
+                            "id": "p9",
+                            "sessionID": "ses_1",
+                            "messageID": "msg_unknown",
+                            "type": "text",
+                            "text": "",
+                        }
+                    },
+                },
+                _delta("<promise>STAGE: impersonating</promise>", part_id="p9"),
+            ]
+        )
+        self.assertEqual([o for o in sink.observations if isinstance(o, StageObserved)], [])
+
+    def test_the_stage_label_is_whatever_wording_the_backend_chose(self) -> None:
+        # Free text, not an enumeration Ralph imposes: the stages belong to the
+        # operator's prompt, which Ralph snapshots but never reads.
+        sink = self._feed([_text("<promise>STAGE: chasing the flake</promise>")])
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        self.assertEqual(stages, ["chasing the flake"])
+
+    def test_an_over_long_stage_label_is_bounded_and_a_malformed_one_refused(self) -> None:
+        sink = self._feed(
+            [
+                _text("<promise>STAGE: " + "reticulating " * 8 + "</promise>", part_id="p1"),
+                _text("<promise>STAGE:    </promise>", part_id="p2"),
+                _text("<promise>STAGE: red \x1b[31mtext</promise>", part_id="p3"),
+            ]
+        )
+        stages = [o.label for o in sink.observations if isinstance(o, StageObserved)]
+        # Only the bounded one survives; neither malformed label is ever reported, so
+        # nothing raw can reach the status line.
+        self.assertEqual(len(stages), 1)
+        self.assertLessEqual(len(stages[0]), 32)
+        self.assertTrue(stages[0].startswith("reticulating"))
+        self.assertTrue(stages[0].endswith("..."))
+
+    def test_a_stage_marker_inside_code_or_quotation_declares_nothing(self) -> None:
+        # The same visible-Markdown rule the outcome markers use: a stage quoted from
+        # the prompt or shown in a code sample is not a declaration.
+        quoted = "```\n<promise>STAGE: fenced</promise>\n```\n\n> <promise>STAGE: quoted</promise>"
+        sink = self._feed([_text(quoted)])
+        self.assertEqual([o for o in sink.observations if isinstance(o, StageObserved)], [])
+
+    def test_tool_use_alone_never_declares_a_stage(self) -> None:
+        # Stage is declared, never inferred from the tool mix (register G6).
+        sink = self._feed([_tool_use("edit", "prt_1"), _step_finish({"input": 3})])
+        self.assertEqual([o for o in sink.observations if isinstance(o, StageObserved)], [])
 
     def test_no_sink_is_a_no_op(self) -> None:
         # An accumulator with no sink still runs: the emits are silently dropped.

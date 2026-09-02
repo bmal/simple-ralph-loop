@@ -29,7 +29,14 @@ Invariants:
   G2/G11). The text is reported as *partial* because OpenCode streams deltas rather
   than whole messages, so the console holds the speaker's line open until the text
   completes it; the incremental redaction below still happens here, because only this
-  side knows what was already reported.
+  side knows what was already reported. The Stage rides the same sink
+  (``console.StageObserved``, register G6, #45), read by ``protocol.extract_stage``
+  from that same streaming text -- every update of a growing text part, and every
+  delta that could close a marker, so whichever shape carries a declaration reports
+  it -- rather than only from the final message, and never inferred from the tool
+  use around it. A declaration is announced once per part: a growing part restates it on
+  every update, and re-announcing would keep restarting the staleness clock the
+  console falls back to the last tool on.
 - The unmarked-question warning is emitted as an ``UnmarkedQuestion`` Observation (the
   raw fragment), and the Run console redacts, bounds, and words it into a bounded
   interruption, never the Backend's whole final message (#39/#41). This adapter
@@ -91,6 +98,7 @@ from ..console import (
     Deviation,
     Narrated,
     Observation,
+    StageObserved,
     StepObserved,
     ToolActivity,
     ToolObserved,
@@ -111,6 +119,7 @@ from ..protocol import (
     active_protocol,
     explicit_needs_input,
     extract_question,
+    extract_stage,
     has_completion_marker,
     inferred_needs_input,
 )
@@ -295,6 +304,8 @@ class EventResult:
         # state updates (pending -> running -> completed) under one id is reported to
         # the status line once, not once per update (register G4).
         self.tool_calls_seen: set[str] = set()
+        # The Stage label last announced for each text part id (register G6).
+        self.stage_by_part: dict[str, str] = {}
         # The narrow Observation sink the Loop injects (the Run console). Progress
         # facts and the migrated warning are emitted through it so this adapter
         # constructs no operator-facing text of its own (register G14). ``None`` is a
@@ -373,6 +384,13 @@ class EventResult:
             if isinstance(part_id, str) and isinstance(delta, str) and part_id in self.parts:
                 message_id, text = self.parts[part_id]
                 self.parts[part_id] = (message_id, text + delta)
+                if ">" in delta and message_id in self.assistant_messages:
+                    # A delta extends the Backend's text without restating it, so a
+                    # declaration it completes is visible on this shape alone. Only a
+                    # delta carrying a ``>`` is scanned: a declaration ends on one, so
+                    # every completed marker lands in such a delta, and the ordinary
+                    # prose delta no longer re-parses the whole accumulated part.
+                    self._report_stage(part_id, text + delta)
 
     def _accept_text_part(self, part: dict[str, Any], *, trusted: bool) -> None:
         message_id = part.get("messageID")
@@ -407,6 +425,19 @@ class EventResult:
                 # it and words the prefix (register G2/G14).
                 self.emit(Narrated(addition, partial=True))
             self.reported[part_id] = redacted
+            self._report_stage(part_id, text)
+
+    def _report_stage(self, part_id: str, text: str) -> None:
+        # The raw label is what is parsed: ``extract_stage`` bounds and sanitizes it,
+        # and the Run console redacts it at its single choke point (register G17).
+        # A declaration in a later part is a fresh announcement even when it names the
+        # stage already showing -- the Backend re-entering one, as the protocol invites
+        # -- so the clock is kept per part rather than globally.
+        stage = extract_stage(text)
+        if stage is None or self.stage_by_part.get(part_id) == stage:
+            return
+        self.stage_by_part[part_id] = stage
+        self.emit(StageObserved(stage))
 
     def _report_progress(self, event_type: str, part: dict[str, Any]) -> None:
         # The feed's progress markers, reported as facts the Run console words: a
