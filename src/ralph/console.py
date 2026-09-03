@@ -182,10 +182,21 @@ Invariants:
   unattended run is quiet without the operator losing their help. With no status line
   there is no clock to keep moving, so the ticker never starts and no heartbeat
   appends either. *quiet* and *feed* are orthogonal: they govern different streams.
+- What this module knows of the Backend is its *name*, and only where the operator is
+  being told one: the header states it, the feed prefixes every line with it so
+  concurrent monologues stay attributable, and ``IN_SCOPE_BACKEND_DEVIATIONS`` selects
+  the deviation wording for a declared In-scope backend -- a warning about which
+  subscription credential a run may read cannot avoid naming the Backend it belongs
+  to. That is a string this module renders, not a Backend it dispatches on: nothing
+  here branches on how a Backend behaves, reads a Backend's stream shape, or asks what
+  an adapter did, so a third Backend adds a deviation entry to that table and nothing
+  else. The name arrives from the run header (``UNNAMED_BACKEND`` until it does), which
+  is the same one-way flow every other fact it renders takes.
 
 Depends on / must not know: ``redaction`` (functions only, never the active-redactor
-global). It must not know how a run is driven, which Backend it holds, or what any
-value object it renders was computed from.
+global). It must not know how a run is driven, how any Backend behaves, or what any
+value object it renders was computed from -- it holds a Backend's *name*, as the
+invariant above records, and nothing else about it.
 
 See also: ``cli`` (the composition root; constructs the concrete console, passes it
 in, and drives it directly for ``clean`` and ``resume``), ``loop`` (emits the run's
@@ -887,13 +898,19 @@ def neutralise_feed(text: str) -> str:
 
 
 def summarize_message(text: str) -> str:
-    """Collapse a Backend concluding message to one line and cap its length for the
-    outcome block. Display only: the caller never writes this back to disk, so the
-    retained artifacts keep the whole message byte-identical (register G18).
+    """Collapse a passage of Backend prose to one line and cap its length for the row
+    it is shown on: the concluding message in an outcome block, and the withdrawn and
+    unmarked fragments the two mid-run warnings quote, which is the whole of the
+    bounding those warnings get (issue #40 moved it here, where a message already had
+    to be bounded, and issue #61 removed the second copy it left behind in
+    ``protocol``). Display only: the caller never writes this back to disk, so the
+    retained artifacts keep the whole passage byte-identical (register G18).
 
-    What arrives is prose. The Loop protocol's own marker declarations are dropped
-    upstream, where the protocol is known, because collapsing the message here
-    destroys the line anchoring a declaration is matched on."""
+    What arrives is prose, and it is already neutralised and redacted -- so the cap
+    measures a ``[redacted]`` placeholder rather than the secret it replaced, and can
+    never clip one back into a secret (register J2). The Loop protocol's own marker
+    declarations are dropped upstream, where the protocol is known, because collapsing
+    the message here destroys the line anchoring a declaration is matched on."""
     collapsed = " ".join(text.split())
     if len(collapsed) <= CONCLUDING_MESSAGE_LIMIT:
         return collapsed

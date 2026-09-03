@@ -61,10 +61,16 @@ text and must not know how any Backend produced it.
 
 See also: ``backends.opencode`` / ``backends.claude`` (feed final text to
 has_completion_marker plus explicit_needs_input / inferred_needs_input, streaming
-text to extract_stage as the session speaks, tool payloads to extract_question,
-and the withdrawn/unmarked fragments through ``bounded_quote`` before warning on
-them), ``loop`` (passes a concluding message through ``without_marker_lines`` on
-its way to the Run console, which owns no marker knowledge of its own).
+text to extract_stage as the session speaks, tool payloads to extract_question, and
+emit the unmarked concluding question as the bare fact ``console.UnmarkedQuestion``
+-- both adapters -- alongside, in ``backends.claude`` alone, the withdrawn one as
+``console.MarkerWithdrawn``, which is the only adapter that judges a message against
+an earlier one and so the only one with a marker to see withdrawn. Each fragment goes
+whole, unworded and unbounded, because the Run console is where one is neutralised,
+redacted and then bounded for the row it is shown on, and an adapter constructs no
+operator-facing text (register G14)), ``loop`` (passes a concluding message through
+``without_marker_lines`` on its way to the Run console, which owns no marker
+knowledge of its own).
 """
 
 from __future__ import annotations
@@ -418,25 +424,6 @@ def explicit_needs_input(text: str) -> str | None:
     marker_index = marker_indexes[-1]
     following = [line for index, line in visible if index > marker_index and line]
     return "\n".join(following) or "The assistant requested operator input."
-
-
-# The most of a quoted marker fragment a mid-run warning prints. A withdrawn or
-# unmarked question is surfaced as a bounded interruption, not as an outlet for the
-# backend's whole final message: the operator needs enough to recognise the question,
-# not the narration around it (issue #39).
-MARKER_QUOTE_LIMIT = 200
-
-
-def bounded_quote(text: str) -> str:
-    """Collapse a quoted marker fragment to one line and cap its length, so the
-    withdrawn-marker and unmarked-question warnings stay bounded interruptions rather
-    than printing unbounded backend prose mid-stream (issue #39). Callers redact
-    *before* bounding, so a secret is replaced whole and the placeholder is what gets
-    measured; the retained stream keeps the fragment in full (register G18)."""
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= MARKER_QUOTE_LIMIT:
-        return collapsed
-    return collapsed[: MARKER_QUOTE_LIMIT - 3] + "..."
 
 
 def inferred_needs_input(text: str) -> str | None:

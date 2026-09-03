@@ -65,9 +65,12 @@ the prompt, which ralph snapshots but never reads, so a guess would confidently
 report the wrong one and be believed. The label is free text in the backend's own
 wording, because no fixed vocabulary here could name another prompt's phases; the
 protocol suggests wording rather than enumerating it, and the parser bounds and
-sanitizes what comes back. A stage that has gone stale — declared long ago with no
-transition announced since — is dropped in favour of the last tool rather than
-going on asserting a phase that may have ended. Both adapters declare one, each
+sanitizes what comes back -- and the Run console neutralises it again where it
+renders it, because a module that must not know what a value it is handed was
+computed from cannot rely on an upstream parser having stayed careful. A stage
+that has gone stale — declared long ago with no transition announced since — is
+dropped in favour of the last tool rather than going on asserting a phase that
+may have ended. Both adapters declare one, each
 reading the marker out of its own stream shape.
 _Avoid_: step and phase (both collide with OpenCode's own step-start/step-finish
 stream events), status, state, progress bar
@@ -142,10 +145,20 @@ its first Observation, so an Iteration a Backend reports nothing about still car
 ticking clock, with its unreported fields -- the tool count among them -- absent
 rather than shown as zeros; and the bell rings on every terminal outcome, the
 one-line failure at invocation included.
-It is the only module permitted to write to a terminal, now without exception —
-every emit site has migrated and the structural test enforces the
-rule with no allowlist — and `cli` is the only module that constructs one, choosing
-between its four renderings there and nowhere else. It owns two streams: the
+It is the only module permitted to write to a terminal, now without exception,
+and the two structural rules that make that true ask nothing about which module
+it is. One is that no module holds a terminal of its own: outside the console
+nothing reaches for a standard stream — under any alias, through a from-import of
+the stream's own name, through the `.buffer` beneath it, or by writing straight at
+descriptor 1 or 2 — and then does anything with it but hand it straight on. Handing
+one on is what `cli` does when it passes both to the console it builds, so that
+stays clean; keeping one, in a local name or stashed on an object, does not. The
+rule asks what a module does with a stream rather than which of its names a stream
+touched, so it needs no allowlist, grants the console no exemption, and calls no
+unrelated `stream` parameter an offender. The other rule is that `cli` is the only
+module that constructs a console, choosing between its four renderings there and
+nowhere else. Together they put the entry of a real terminal in one place and the
+writing to it in one object. It owns two streams: the
 dashboard on standard error, and the opt-in Backend feed on standard output, so
 redirecting a transcript to a file leaves the dashboard on the terminal. The feed is
 off by default, which is what makes the default view a dashboard rather than a feed;

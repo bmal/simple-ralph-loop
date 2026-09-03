@@ -1,14 +1,18 @@
 """Loop protocol marker detection and handoff: completion/needs-input
 markers, concluding-question heuristics, native questions, and
-fail-closed stream parsing."""
+fail-closed stream parsing -- plus the structural rule that every helper the
+protocol publishes still has a caller, which is what stops a docstring here from
+going on describing a function nothing calls."""
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shlex
+import unittest
 
-from harness import RalphCliTestCase
+from harness import ROOT, RalphCliTestCase
 
 
 class LoopProtocolTest(RalphCliTestCase):
@@ -966,3 +970,77 @@ class InteractiveLabelTest(RalphCliTestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("--interactive-label", result.stderr)
         self.assertIn("unrecognized arguments", result.stderr)
+
+
+class ProtocolSurfaceTest(unittest.TestCase):
+    """Finding 10 of the Run console review: ``bounded_quote`` outlived its callers.
+    Issue #40 moved the bounding of a mid-run warning to the Run console, which
+    already had to bound a concluding message, so the two constants that had described
+    one job became one live and one unreachable -- and the module docstring went on
+    telling a reader that the withdrawn and unmarked fragments travel through a
+    function nothing calls.
+
+    The rule is read back out of the source rather than restated here, so the next
+    helper to lose its last caller is named by a failing test rather than left to rot
+    behind a docstring that still describes it -- the same structural approach
+    register G13's terminal-ownership rule uses. What keeps a helper alive is being
+    named from somewhere that is itself alive: another module, ``protocol``'s own
+    module level, or a helper already reached that way. A helper that only calls
+    itself, or that only two dead helpers call each other from, is dead, and the
+    reachability below is worked to a fixpoint so it says so. A mention in prose keeps
+    nothing alive -- a docstring pointing at dead code is the defect, not the
+    evidence."""
+
+    def test_every_helper_the_protocol_publishes_still_has_a_caller(self) -> None:
+        package = ROOT / "src" / "ralph"
+        protocol = package / "protocol.py"
+        tree = ast.parse(protocol.read_text(encoding="utf-8"))
+        published = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not node.name.startswith("_")
+        }
+        # The scan is worthless if it learned no names to look for.
+        self.assertIn("extract_stage", published)
+
+        # Who names whom. Every definition outside ``protocol.py``'s own helpers is a
+        # live root: another module, and ``protocol``'s module level, which runs.
+        named_by: dict[str, set[str]] = {}
+        live = {"<module level>"}
+
+        def record(owner: str, node: ast.AST) -> None:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name):
+                    named_by.setdefault(inner.id, set()).add(owner)
+                elif (
+                    isinstance(inner, ast.Attribute)
+                    and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "protocol"
+                ):
+                    named_by.setdefault(inner.attr, set()).add(owner)
+
+        for node in tree.body:
+            owner = getattr(node, "name", None)
+            record(owner if owner in published else "<module level>", node)
+        for path in sorted(package.rglob("*.py")):
+            if path == protocol:
+                continue
+            record(str(path.relative_to(package)), ast.parse(path.read_text("utf-8")))
+            live.add(str(path.relative_to(package)))
+
+        reached = True
+        while reached:
+            reached = False
+            for helper in published:
+                if helper not in live and named_by.get(helper, set()) & live:
+                    live.add(helper)
+                    reached = True
+
+        self.assertEqual(
+            sorted(helper for helper in published if helper not in live),
+            [],
+            "a helper the Loop protocol publishes has no caller left in the package: "
+            "delete it along with whatever constants it alone reached, and correct "
+            "the docstring that still points at it",
+        )

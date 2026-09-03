@@ -108,7 +108,9 @@ Invariants:
   finish, necessarily after the first Iteration's rule (register G8). The loop holds
   no ``print`` of its own: every operator-facing line — header, iteration blocks,
   summary, deviations, and the full help block — goes through the injected console
-  (register G13), so this module no longer appears in the terminal-write allowlist.
+  (register G13). It reaches for no standard stream of its own under any spelling,
+  which is the whole of what the structural rule asks and why that rule needs no
+  allowlist of stragglers.
 
 Depends on / must not know: ``console`` (the ``RunConsole`` abstraction and its
 value objects -- never a concrete renderer), ``redaction`` (functions only),

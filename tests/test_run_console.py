@@ -22,6 +22,8 @@ import unicodedata
 import unittest
 from unittest import mock
 
+from typing import NamedTuple
+
 from harness import ROOT, PtyCapture, RalphCliTestCase
 from ralph.console import (
     CLAUDE_AGENTS_DEVIATION,
@@ -2082,29 +2084,161 @@ class BackendFeedNeutralisationTest(unittest.TestCase):
         self.assertEqual(out, "claude/toolu_7 claude: done\n")
 
 
+class TerminalVocabulary(NamedTuple):
+    """The names one module's own imports bound that can reach a terminal, read off
+    that module alone. A module binding none of them cannot hold a terminal, whatever
+    it happens to call its variables -- which is what lets the rule below decide an
+    unfamiliar file without knowing anything about it."""
+
+    sys_aliases: frozenset[str]
+    stream_names: frozenset[str]
+    os_aliases: frozenset[str]
+    write_names: frozenset[str]
+
+
 class TerminalOwnershipTest(unittest.TestCase):
     """Register G13: the Run console is the only module permitted to write to a
-    terminal. Every emit site has now migrated -- the Loop's, the failure help,
+    terminal. Every emit site has migrated -- the Loop's, the failure help,
     ``resume``'s full-auto caveat, and last the two Backend feeds -- so the rule is
-    asserted unconditionally, with no allowlist of stragglers left to keep."""
+    asserted unconditionally, with no allowlist of stragglers and no exemption for
+    ``console.py`` itself.
+
+    What the scan below enforces is narrower than its name and stronger than a grep:
+    *no module holds a terminal of its own*. It knows nothing about which module the
+    Run console is, and needs to know nothing. A module holds a terminal when it
+    reaches for a standard stream -- ``sys.stdout``/``sys.stderr`` under any alias,
+    their ``__stdout__``/``__stderr__`` originals, or the name a ``from sys import
+    stderr`` bound -- and then does anything with it except hand it straight on to
+    somebody else. ``print``, and an ``os.write`` to descriptor 1 or 2, are the two
+    ways to reach a terminal without naming a stream at all, and are matched directly.
+
+    Testing what a module *does* with a stream, rather than propagating a taint
+    through the names it was copied into, is what keeps the rule honest in both
+    directions. An alias, a from-import, a local capture, an attribute stash and a
+    reach through ``.buffer`` are all offences, because none of them is a hand-off --
+    and a scan that instead tainted the names would have had to decide what
+    ``stream`` means in an unrelated ``def dump(stream)`` further down the same file,
+    which it cannot. Here it never asks: no standard stream was named, so there is
+    nothing to answer.
+
+    Handing one on is passing it as a call argument, through however many conditionals
+    and tuples, which is why ``cli``'s ``StreamRunConsole(sys.stderr, feed=sys.stdout
+    if args.verbose else None)`` is clean and an ``_out = sys.stderr`` kept for later
+    is not. ``console.py`` passes for the same reason: it writes to the stream it was
+    handed as a parameter, never to one it went and found.
+
+    That distinction is the point, and it is what makes the rule G13 rather than an
+    approximation of it. So the two rules compose: no module goes and finds a terminal
+    (this test), and only ``cli`` constructs a console over the streams it hands on
+    (register G16, the test below). A terminal therefore enters Ralph at exactly one
+    place, and the only object that writes to it is the Run console -- which is G13."""
+
+    # ``sys``'s standard streams, under the names a program may rebind and the
+    # originals it may not. A reach through ``.buffer`` needs no entry of its own:
+    # ``sys.stdout.buffer`` names ``sys.stdout`` on the way, which is already the
+    # offence.
+    STD_STREAMS = frozenset({"stdout", "stderr", "__stdout__", "__stderr__"})
+    # The descriptors a terminal is on. Any other is somebody else's pipe.
+    TERMINAL_DESCRIPTORS = frozenset({1, 2})
+    # Expression shapes that only carry a value onward to an enclosing call rather
+    # than doing anything with it, so a stream inside one is still being handed on.
+    FORWARDING = (ast.IfExp, ast.Tuple, ast.List, ast.BoolOp, ast.Starred, ast.keyword)
 
     def _writes_to_a_terminal(self, source: str) -> bool:
-        for node in ast.walk(ast.parse(source)):
-            if not isinstance(node, ast.Call):
-                continue
-            target = node.func
-            if isinstance(target, ast.Name) and target.id == "print":
-                return True
-            if (
-                isinstance(target, ast.Attribute)
-                and target.attr in {"write", "writelines"}
-                and isinstance(target.value, ast.Attribute)
-                and target.value.attr in {"stdout", "stderr"}
-                and isinstance(target.value.value, ast.Name)
-                and target.value.value.id == "sys"
+        tree = ast.parse(source)
+        vocabulary = self._terminal_vocabulary(tree)
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id == "print":
+                    return True
+                if self._writes_to_a_descriptor(node, vocabulary):
+                    return True
+            if self._is_std_stream(node, vocabulary) and not self._handed_on(
+                node, parents
             ):
                 return True
         return False
+
+    def _terminal_vocabulary(self, tree: ast.AST) -> TerminalVocabulary:
+        """Every name *tree*'s own imports bound that can reach a terminal. A module
+        that imports none of them cannot hold one, whatever it calls its variables."""
+        sys_aliases: set[str] = set()
+        os_aliases: set[str] = set()
+        stream_names: set[str] = set()
+        write_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "sys":
+                        sys_aliases.add(alias.asname or alias.name)
+                    elif alias.name == "os":
+                        os_aliases.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.module == "sys":
+                for alias in node.names:
+                    if alias.name in self.STD_STREAMS:
+                        stream_names.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.module == "os":
+                for alias in node.names:
+                    if alias.name == "write":
+                        write_names.add(alias.asname or alias.name)
+        return TerminalVocabulary(
+            frozenset(sys_aliases),
+            frozenset(stream_names),
+            frozenset(os_aliases),
+            frozenset(write_names),
+        )
+
+    def _is_std_stream(self, node: ast.AST, vocabulary: TerminalVocabulary) -> bool:
+        """Whether *node* names a standard stream: a name a ``from sys`` import bound
+        to one, or an attribute of a name bound to ``sys``."""
+        if isinstance(node, ast.Name):
+            return node.id in vocabulary.stream_names
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr in self.STD_STREAMS
+            and isinstance(node.value, ast.Name)
+            and node.value.id in vocabulary.sys_aliases
+        )
+
+    def _handed_on(self, node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+        """Whether the stream at *node* is on its way into somebody else's hands: an
+        argument of a call, through however many conditionals, tuples and keywords.
+        Anything else -- an attribute access on it, an assignment of it, a return of
+        it -- is this module keeping a terminal, which is what the rule forbids."""
+        parent = parents.get(node)
+        while isinstance(parent, self.FORWARDING):
+            node, parent = parent, parents.get(parent)
+        return isinstance(parent, ast.Call) and node is not parent.func
+
+    def _writes_to_a_descriptor(
+        self, call: ast.Call, vocabulary: TerminalVocabulary
+    ) -> bool:
+        """Whether *call* is an ``os.write`` -- however ``os`` or ``write`` itself was
+        imported -- onto a descriptor a terminal is on. A descriptor held in a
+        variable is not decided here: it is undecidable from the source, and guessing
+        would report a module writing down a pipe of its own."""
+        callee = call.func
+        if isinstance(callee, ast.Attribute):
+            reaches_os = (
+                callee.attr == "write"
+                and isinstance(callee.value, ast.Name)
+                and callee.value.id in vocabulary.os_aliases
+            )
+        elif isinstance(callee, ast.Name):
+            reaches_os = callee.id in vocabulary.write_names
+        else:
+            reaches_os = False
+        return (
+            reaches_os
+            and bool(call.args)
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value in self.TERMINAL_DESCRIPTORS
+        )
 
     def test_no_module_outside_the_run_console_writes_to_a_terminal(self) -> None:
         offenders = {
@@ -2134,6 +2268,91 @@ class TerminalOwnershipTest(unittest.TestCase):
             )
         }
         self.assertEqual(constructors, {"cli.py"})
+
+    # The three real terminal writes the review appended to ``preflight.py`` and
+    # watched this rule miss, the two it already caught, and the four more the same
+    # thinking reaches for once the first three are closed. Sources rather than a
+    # fixture module on disk: a fixture that reached a terminal would itself be an
+    # offender under the very rule it is here to exercise.
+    EVASIONS = {
+        "an aliased from-import of a standard stream": (
+            "from sys import stderr as _err\n"
+            '_err.write("aliased import write\\n")\n'
+        ),
+        "a raw write to the standard error descriptor": (
+            "import os as _os\n" '_os.write(2, b"raw fd write\\n")\n'
+        ),
+        "a standard stream captured under another name": (
+            "import sys as _sys\n"
+            "stream = _sys.stderr\n"
+            'stream.write("captured stream write\\n")\n'
+        ),
+        "a bare print": 'def report() -> None:\n    print("the realistic regression")\n',
+        "writelines onto a standard stream": (
+            "import sys\n" 'sys.stdout.writelines(["a\\n", "b\\n"])\n'
+        ),
+        "a reach through the buffer underneath a standard stream": (
+            "import sys\n" 'sys.stdout.buffer.write(b"bytes straight at it\\n")\n'
+        ),
+        "the original stream a program cannot rebind away": (
+            "import sys\n" 'sys.__stderr__.write("under the replacement\\n")\n'
+        ),
+        "the descriptor writer imported on its own": (
+            "from os import write as _write\n" '_write(2, b"no os in sight\\n")\n'
+        ),
+        "a standard stream stashed on an object for later": (
+            "import sys\n"
+            "class Reporter:\n"
+            "    def __init__(self) -> None:\n"
+            "        self._out = sys.stderr\n"
+            "    def say(self, line: str) -> None:\n"
+            "        self._out.write(line)\n"
+        ),
+    }
+
+    # What the rule must keep leaving alone. Naming a standard stream is not holding
+    # one: ``cli`` hands both to the console it constructs (register G16), which is
+    # the composition root doing its job, not a module writing -- and it hands one of
+    # them on through a conditional, which is still a hand-off. A write to somebody
+    # else's descriptor is not a write to a terminal. And a module that bound no
+    # standard stream at all holds none, whatever it calls its parameters: the last
+    # case is the false positive a taint-propagating rule would raise, and the reason
+    # this one asks what a module does with a stream rather than which names touched
+    # it.
+    REFERENCES = {
+        "handing the standard streams to the console constructor": (
+            "import sys\n"
+            "from .console import StreamRunConsole\n"
+            "console = StreamRunConsole(\n"
+            "    sys.stderr, feed=sys.stdout if args.verbose else None, quiet=args.quiet\n"
+            ")\n"
+        ),
+        "a write to a descriptor that is not a terminal": (
+            "import os\n" 'os.write(7, b"down a pipe of our own\\n")\n'
+        ),
+        "a stream parameter that was never a standard stream": (
+            "from pathlib import Path\n"
+            "def dump(stream, records: list[str]) -> None:\n"
+            "    for record in records:\n"
+            "        stream.write(record)\n"
+        ),
+    }
+
+    def test_the_rule_catches_every_way_a_module_can_reach_a_terminal(self) -> None:
+        for description, source in self.EVASIONS.items():
+            with self.subTest(evasion=description):
+                self.assertTrue(
+                    self._writes_to_a_terminal(source),
+                    f"{description} reaches a terminal and the rule must say so",
+                )
+
+    def test_the_rule_leaves_a_reference_and_a_foreign_descriptor_alone(self) -> None:
+        for description, source in self.REFERENCES.items():
+            with self.subTest(reference=description):
+                self.assertFalse(
+                    self._writes_to_a_terminal(source),
+                    f"{description} holds no terminal of its own and is no offence",
+                )
 
     @staticmethod
     def _package() -> Path:
