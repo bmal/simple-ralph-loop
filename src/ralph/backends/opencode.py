@@ -63,7 +63,9 @@ Invariants:
 - ``execute_iteration`` returns the verified final message alongside the outcome and
   session id, so the Run console can show it in the Iteration's outcome block; it is
   the same text the completion/needs-input markers were read from, returned raw, and
-  the console truncates it for display only (register G14). It receives the injected
+  the console truncates it for display only (register G14). The outcome names what
+  happened to *this Iteration* -- ``complete`` or ``incomplete`` -- and never the
+  run-level word for a spent budget (register J3). It receives the injected
   ``ObservationSink`` and drives it through the accumulator (the progress facts above).
 
 Depends on / must not know: ``environment`` (the sanitized base and the timeout
@@ -890,7 +892,11 @@ def _consume_opencode_iteration(
     # The concluding message rides back with the outcome so the Run console can show
     # it in the Iteration's outcome block; it is the same final message the marker was
     # read from. The Loop truncates it for display only (register G14).
-    return ("complete" if complete else "budget_exhausted"), result.session_id, final_text
+    # The outcome names what happened to *this Iteration*, never to the run: an
+    # Iteration that ended without a completion marker is ``incomplete``, which is a
+    # normal end of iteration under the Loop protocol, and only the Loop can say
+    # whether the budget then ran out (register J3).
+    return ("complete" if complete else "incomplete"), result.session_id, final_text
 
 
 def write_opencode_session(run_dir: Path, result: EventResult) -> None:

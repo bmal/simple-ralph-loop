@@ -26,6 +26,8 @@ Invariants:
   message. ``execute_iteration`` returns that final message alongside the outcome
   and session id, so the Run console can show it in the Iteration's outcome block;
   it is returned raw, and the console truncates it for display only (register G14).
+  The outcome names what happened to *this Iteration* -- ``complete`` or
+  ``incomplete`` -- and never the run-level word for a spent budget (register J3).
 - What may follow the results is a matter of *shape*, not a census of subtypes,
   applied uniformly at every stream position (H4/H5). Once results have begun,
   between them and after them alike, the violations are the events that actually
@@ -1221,7 +1223,11 @@ def _consume_claude_iteration(
     # The concluding message rides back with the outcome so the Run console can show
     # it in the Iteration's outcome block; it is the same final message the marker was
     # read from. The Loop truncates it for display only (register G14).
-    return ("complete" if complete else "budget_exhausted"), result.session_id, final
+    # The outcome names what happened to *this Iteration*, never to the run: an
+    # Iteration that ended without a completion marker is ``incomplete``, which is a
+    # normal end of iteration under the Loop protocol, and only the Loop can say
+    # whether the budget then ran out (register J3).
+    return ("complete" if complete else "incomplete"), result.session_id, final
 
 
 def write_claude_session(run_dir: Path, result: ClaudeEventResult) -> None:

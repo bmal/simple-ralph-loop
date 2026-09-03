@@ -1,9 +1,11 @@
 """Run loop and iteration budget: fresh-session cadence, budget bounds,
-backend/model announcement, per-iteration trust re-proof, branch reporting."""
+backend/model announcement, per-iteration trust re-proof, branch reporting, and
+how an Iteration's outcome is named and closed on every terminal path."""
 
 from __future__ import annotations
 
 import json
+import signal
 
 from harness import RalphCliTestCase
 
@@ -292,3 +294,198 @@ class RunLoopTest(RalphCliTestCase):
             result.stderr.index(f"ralph: evidence {run_dir}"),
             result.stderr.index("RALPH NEEDS OPERATOR"),
         )
+
+
+class IterationOutcomeNamingTest(RalphCliTestCase):
+    """Findings 3, 6, 7 and 9 of the #36 review, at the black-box seam: an
+    Iteration is named for what happened to *the Iteration*, every terminal path
+    closes with an outcome block, an interrupted run is summarised in words, and
+    the block shows the Backend's prose rather than Ralph's own protocol markers."""
+
+    def _recorded(self) -> dict:
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        return json.loads((run_dir / "outcome.json").read_text())
+
+    def test_an_ordinary_iteration_is_not_reported_as_budget_exhausted(self) -> None:
+        # Finding 3: iterations 1 and 2 ended exactly as the Loop protocol says a
+        # normal non-completing Iteration should -- "finishing that one child while
+        # unblocked children still remain is a normal end of iteration" -- with the
+        # budget intact, so neither may borrow the run-level word for running out
+        # of it.
+        sequence = self._sequence(
+            [
+                "Implemented child one.",
+                "Implemented child two.",
+                "No work remains.\n<promise>COMPLETE</promise>",
+            ]
+        )
+        result = self.run_ralph(
+            "--iterations", "3", env={"FAKE_SEQUENCE_DIR": str(sequence)}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ralph: iteration 1 of 3 incomplete in", result.stderr)
+        self.assertIn("ralph: iteration 2 of 3 incomplete in", result.stderr)
+        self.assertIn("ralph: iteration 3 of 3 complete in", result.stderr)
+        # The grep habit register G19 protects: a run whose budget was never
+        # exhausted says nothing about a budget at all.
+        self.assertNotIn("budget", result.stderr)
+        recorded = self._recorded()
+        self.assertEqual(
+            [entry["outcome"] for entry in recorded["iterations"]],
+            ["incomplete", "incomplete", "complete"],
+        )
+        self.assertEqual(recorded["outcome"], "complete")
+
+    def test_budget_exhaustion_is_the_loops_own_word_and_greps_once(self) -> None:
+        # The run-level word is the Loop's decision, taken when the budget actually
+        # runs out, and no longer inherited from the last Iteration's return.
+        sequence = self._sequence(["Implemented child one.", "Implemented child two."])
+        result = self.run_ralph(
+            "--iterations", "2", env={"FAKE_SEQUENCE_DIR": str(sequence)}
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # J5: the phrase an operator greps for stays byte-identical, and now
+        # matches exactly once -- at the summary, where the budget ran out.
+        self.assertIn("iteration budget exhausted", result.stderr)
+        self.assertEqual(result.stderr.count("budget"), 1)
+        self.assertIn("ralph: iteration 1 of 2 incomplete in", result.stderr)
+        self.assertIn("ralph: iteration 2 of 2 incomplete in", result.stderr)
+        recorded = self._recorded()
+        self.assertEqual(
+            [entry["outcome"] for entry in recorded["iterations"]],
+            ["incomplete", "incomplete"],
+        )
+        self.assertEqual(recorded["outcome"], "budget_exhausted")
+
+    def test_an_iteration_that_hands_off_still_closes_with_its_outcome_block(self) -> None:
+        # Finding 6: the one Iteration an operator most wants attributed is the one
+        # that stopped the loop, and a handoff used to jump straight from the rule
+        # to the run summary with no block, no duration and no session id at all.
+        final = "<promise>NEEDS_INPUT</promise>\nShould I preserve the legacy file?"
+        result = self.run_ralph(
+            "--iterations",
+            "2",
+            env={"FAKE_EVENTS": self._events(final), "FAKE_EXPORT": self._export(final)},
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ralph: iteration 1 of 2 needs_input in", result.stderr)
+        self.assertIn("session ses_1", result.stderr)
+        # The block closes the Iteration, so it prints before the summary and the
+        # banner keep the last, most visible lines.
+        self.assertLess(
+            result.stderr.index("iteration 1 of 2 needs_input"),
+            result.stderr.index("ralph: outcome "),
+        )
+        self.assertEqual(
+            [entry["outcome"] for entry in self._recorded()["iterations"]], ["needs_input"]
+        )
+
+    def test_an_interrupted_run_is_summarised_in_words(self) -> None:
+        # Finding 7: Ctrl-C is the commonest way an operator ends a multi-hour run,
+        # and its outcome fell through to the bare `run ended: interrupted`.
+        process = self.start_ralph(
+            "--timeout",
+            "0",
+            env={"FAKE_EVENTS": self._events("Partial work"), "FAKE_SLEEP": "30"},
+        )
+        self._await_ready(self.calls / "env", process)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=20)
+
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertNotIn("run ended: interrupted", stderr)
+        self.assertIn("ralph: outcome run stopped: interrupted by the operator", stderr)
+        # Finding 6 on the interrupted path too: the Iteration is attributed.
+        self.assertIn("ralph: iteration 1 of 1 interrupted in", stderr)
+
+    def test_the_outcome_block_shows_prose_not_the_protocols_own_markers(self) -> None:
+        # Finding 9: #44 put a `<promise>STAGE: ...</promise>` line into essentially
+        # every concluding message and the block printed it verbatim. The markers
+        # are Ralph's own contract echoed back, not the Backend's prose; the outcome
+        # word on the line above already reports what they signalled.
+        final = (
+            "<promise>STAGE: loading context</promise>\n"
+            "Looked at the tracker and picked #7.\n"
+            "<promise>COMPLETE</promise>"
+        )
+        result = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(final), "FAKE_EXPORT": self._export(final)}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Looked at the tracker and picked #7.", result.stderr)
+        self.assertNotIn("<promise>", result.stderr)
+        self.assertNotIn("STAGE:", result.stderr)
+        # The retained stream keeps the whole message, markers included: this is a
+        # display change and never an artifact change (register G18).
+        run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
+        self.assertIn("<promise>COMPLETE</promise>", (run_dir / "stdout.ndjson").read_text())
+
+    def test_a_marker_the_parsers_read_as_prose_stays_prose_on_screen(self) -> None:
+        # The block drops exactly what the parsers read as a signal and no more. A
+        # marker mentioned inside a sentence, and one quoted inside a fenced block,
+        # are prose to every parser -- neither completes the Iteration, hence
+        # `incomplete` -- so they stay prose on screen and the console can never
+        # disagree with the contract about what a declaration is.
+        final = (
+            "I was asked to emit <promise>COMPLETE</promise> once done.\n"
+            "\n"
+            "```\n"
+            "<promise>COMPLETE</promise>\n"
+            "```"
+        )
+        result = self.run_ralph(
+            env={"FAKE_EVENTS": self._events(final), "FAKE_EXPORT": self._export(final)}
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ralph: iteration 1 of 1 incomplete in", result.stderr)
+        self.assertIn(
+            "I was asked to emit <promise>COMPLETE</promise> once done.", result.stderr
+        )
+
+    def test_a_stop_between_iterations_closes_neither_twice_nor_early(self) -> None:
+        # The Iteration that closes is the one the operator was told had started, and
+        # it closes once. A power assertion lost between iterations stops the run
+        # before the second Iteration's rule, so iteration 1 keeps its single block
+        # and iteration 2 -- never announced -- gets none.
+        result = self._run_guarded(
+            "--iterations",
+            "2",
+            env={
+                "FAKE_KILL_CAFFEINATE": "1",
+                "FAKE_EVENTS": self._events("Partial work"),
+                "FAKE_EXPORT": self._export("Partial work"),
+            },
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.count("iteration 1 of 2 incomplete in"), 1)
+        self.assertNotIn("iteration 2 of 2", result.stderr)
+
+    def test_a_failure_before_a_new_session_never_names_the_previous_one(self) -> None:
+        # The block closing an Iteration that failed before its own session existed
+        # must say so, not inherit the session id the Iteration before it established.
+        sequence = self._sequence(["First child done.", "must not run"])
+        result = self.run_ralph(
+            "--iterations",
+            "2",
+            env={
+                "FAKE_AUTH_MUTATED_FILE": str(self.base / "credentials-mutated"),
+                "FAKE_SEQUENCE_DIR": str(sequence),
+            },
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ralph: iteration 1 of 2 incomplete in", result.stderr)
+        self.assertIn("session ses_1", result.stderr)
+        closing = next(
+            line
+            for line in result.stderr.splitlines()
+            if line.startswith("ralph: iteration 2 of 2 backend_failure")
+        )
+        self.assertIn("no session id", closing)
+        self.assertNotIn("ses_1", closing)

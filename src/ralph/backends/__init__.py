@@ -24,6 +24,11 @@ Invariants:
   same text the completion/needs-input markers were read from — which the Loop hands
   to the Run console for the Iteration's outcome block. The message is a raw fact, not
   formatted text; the console truncates it for display only (register G14).
+  The outcome names what happened to *the Iteration* — ``complete`` when the Backend
+  declared completion, ``incomplete`` when the Iteration ended normally without doing
+  so — never the run-level word for a spent budget, which only the Loop can decide
+  and only once the whole budget is gone (register J3). A stop that ends the
+  Iteration raises instead, carrying its own outcome.
 - ``execute_iteration`` also receives an ``ObservationSink``: the narrow one-method
   seam (``observe``) declared here alongside the Backend Protocol and injected by the
   Loop, over the closed set of frozen ``console.Observation`` value types (register

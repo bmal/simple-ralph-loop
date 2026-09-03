@@ -57,10 +57,20 @@ Invariants:
   block (``iteration_finished``) carrying its duration, outcome, session id, and the
   Backend's concluding message truncated for display; every run ends with a summary
   (``run_finished``) naming the git outcome and the evidence path, on every terminal
-  path including success (register G9). The bell rings in ``run_finished`` on every
-  terminal outcome but only on a terminal, so a piped log carries no bell character
-  (register G12). The concluding message is truncated for display only — nothing is
-  written to disk from it, so the retained copy stays byte-identical (register G18).
+  path including success (register G9). The Iteration's outcome is rendered as the
+  Loop names it, because it already names what happened to that Iteration; only the
+  *run*'s outcome is worded, through ``OUTCOME_HEADLINES``. Every outcome a run can
+  reach is worded there — a structural test reads the vocabulary back out of the
+  source, so a new one cannot silently degrade to the ``run ended: …`` fallback as
+  ``interrupted`` did. The block prints on every terminal path, the ones that raise
+  included; those carry no concluding message because their path produced none. The
+  bell rings in ``run_finished`` on every terminal outcome but only on a terminal, so
+  a piped log carries no bell character (register G12). The concluding message is
+  truncated for display only — nothing is written to disk from it, so the retained
+  copy stays byte-identical (register G18).
+  It arrives as the Backend's prose: this module holds no knowledge of the Loop
+  protocol and never decides what a marker is, so the Loop drops the protocol's own
+  marker declarations before handing it over (the ratified owner decision on #58).
   The Trust boundary line (``trust_boundary_established``) is emitted where its proof
   completes, after the first Iteration's preflight, never in the header (register G8).
 - The two commands that are not ``run`` address the operator here too (register G22).
@@ -229,10 +239,15 @@ CONCLUDING_MESSAGE_LIMIT = 200
 # The run summary's headline per terminal outcome. ``budget_exhausted`` keeps the
 # byte-identical ``iteration budget exhausted`` phrase an operator greps for
 # (register G19); an unknown outcome degrades to naming itself rather than vanishing.
+# Every outcome a Backend adapter or the Loop can reach is worded here -- a
+# structural test reads the vocabulary back out of the source, so the next one
+# cannot fall through to naming itself unnoticed as ``interrupted`` did. An
+# interruption is worded as a stop rather than a failure: the operator asked for it.
 OUTCOME_HEADLINES = {
     "complete": "run complete",
     "budget_exhausted": "run incomplete: iteration budget exhausted without completion",
     "needs_input": "run handed off for operator input",
+    "interrupted": "run stopped: interrupted by the operator",
     "backend_contract_failure": "run failed: backend contract violation",
     "backend_failure": "run failed: backend error",
     "timeout": "run failed: iteration timed out",
@@ -319,10 +334,17 @@ class RunSettings:
 
 @dataclass(frozen=True)
 class IterationOutcome:
-    """How one Iteration closed: its number and the budget it belongs to, how long
-    the session ran, the outcome the Loop recorded, the session id to resume, and the
-    Backend's concluding message. The Loop fills it with facts; the console truncates
-    the message and words the block (register G14)."""
+    """How one Iteration closed: its number and the budget it belongs to, how long the
+    Iteration ran, what happened to it, the session id to resume, and the Backend's
+    concluding prose. The Loop fills it with facts; the console truncates the message
+    and words the block (register G14).
+
+    ``outcome`` names what happened to *this Iteration* and is rendered as it stands:
+    the run-level word is the Loop's own and is worded by ``OUTCOME_HEADLINES``
+    instead (register J3). ``session_id`` is absent when an Iteration stopped before
+    any arrived, and ``concluding_message`` when the path that ended it produced
+    none -- every raising path. It is prose: the Loop has already dropped the
+    protocol's own marker declarations, which this module knows nothing about."""
 
     number: int
     iterations: int
@@ -828,7 +850,11 @@ def neutralise_feed(text: str) -> str:
 def summarize_message(text: str) -> str:
     """Collapse a Backend concluding message to one line and cap its length for the
     outcome block. Display only: the caller never writes this back to disk, so the
-    retained artifacts keep the whole message byte-identical (register G18)."""
+    retained artifacts keep the whole message byte-identical (register G18).
+
+    What arrives is prose. The Loop protocol's own marker declarations are dropped
+    upstream, where the protocol is known, because collapsing the message here
+    destroys the line anchoring a declaration is matched on."""
     collapsed = " ".join(text.split())
     if len(collapsed) <= CONCLUDING_MESSAGE_LIMIT:
         return collapsed

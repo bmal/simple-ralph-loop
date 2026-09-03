@@ -33,6 +33,17 @@ Invariants:
 - Marker detection reads only *visible* Markdown: fenced code, indented code, and
   block quotes are excluded so a ``<promise>...</promise>`` line quoted inside the
   prompt, a code sample, or tool output is never mistaken for an iteration result.
+- The marker vocabulary has one spelling here. ``COMPLETION_MARKER``,
+  ``NEEDS_INPUT_MARKER`` and ``STAGE_MARKER`` are named once and read by every
+  parser, by ``is_marker_declaration`` -- which answers whether a single line is a
+  declaration at all -- and by ``without_marker_lines``, which drops those
+  declarations from a message bound for an operator. A marker is Ralph's own
+  contract echoed back rather than the Backend's prose, and the outcome reported
+  beside a concluding message already states what a marker signalled, so the
+  display shows the prose (the ratified owner decision on issue #58). What counts
+  as a declaration is the same line-anchored match everywhere, so the console can
+  never drop something a parser still reads as prose, or keep something it reads
+  as a signal.
 - Needs-input detection is split by confidence so the loop can treat the two
   sources differently. ``explicit_needs_input`` fires only on a deliberate,
   standalone ``<promise>NEEDS_INPUT</promise>`` marker -- a signal the agent chose
@@ -52,7 +63,8 @@ See also: ``backends.opencode`` / ``backends.claude`` (feed final text to
 has_completion_marker plus explicit_needs_input / inferred_needs_input, streaming
 text to extract_stage as the session speaks, tool payloads to extract_question,
 and the withdrawn/unmarked fragments through ``bounded_quote`` before warning on
-them).
+them), ``loop`` (passes a concluding message through ``without_marker_lines`` on
+its way to the Run console, which owns no marker knowledge of its own).
 """
 
 from __future__ import annotations
@@ -190,6 +202,11 @@ def visible_markdown_lines(text: str) -> list[tuple[int, str]]:
     return visible
 
 
+# The two outcome markers, named once so the parsers that read them and the filter
+# that removes them from displayed prose cannot drift apart.
+COMPLETION_MARKER = "<promise>COMPLETE</promise>"
+NEEDS_INPUT_MARKER = "<promise>NEEDS_INPUT</promise>"
+
 # The Stage marker the widened protocol asks the Backend to declare (register G6).
 # It shares the ``<promise>`` envelope of the outcome markers so the prompt carries one
 # marker vocabulary, and a distinct verb so it can never be confused with them: a Stage
@@ -205,6 +222,44 @@ def stage_declaration(line: str) -> str | None:
     are: a stage mentioned inside a sentence is prose, not a declaration."""
     match = STAGE_MARKER.fullmatch(line)
     return None if match is None else match.group(1)
+
+
+def is_marker_declaration(line: str) -> bool:
+    """Whether *line* is one of the protocol's own marker declarations -- a Stage, a
+    completion, or a needs-input marker. Matched exactly as each parser above matches
+    it, so what the console drops from displayed prose is precisely what the parsers
+    read as a signal: a marker mentioned inside a sentence is prose to all of them.
+
+    A predicate, unlike ``stage_declaration`` beside it, which hands back the label it
+    found: the ``is_`` says so, because which of the three a line is does not matter to
+    the only caller -- what matters is that it is not prose."""
+    return (
+        stage_declaration(line) is not None
+        or line == COMPLETION_MARKER
+        or line == NEEDS_INPUT_MARKER
+    )
+
+
+def without_marker_lines(text: str) -> str:
+    """*text* with the protocol's own marker declarations dropped and every other line
+    byte-identical. The markers are Ralph's contract echoed back rather than the
+    Backend's prose, so an operator-facing rendering of a concluding message shows the
+    prose and lets the outcome beside it report what the markers signalled (the
+    ratified owner decision on issue #58).
+
+    Only declarations among the *visible* Markdown lines go, so a marker quoted inside
+    a fenced block -- prose to every parser here -- stays prose to the display too.
+    Callers strip before the Run console neutralises: whitespace controls become one
+    space there, which would fuse a marker line into the sentence beside it and leave
+    nothing for a line-anchored match to find."""
+    declarations = {
+        index for index, line in visible_markdown_lines(text) if is_marker_declaration(line)
+    }
+    return "\n".join(
+        line for index, line in enumerate(text.splitlines()) if index not in declarations
+    )
+
+
 # The most of a declared Stage label that is kept. The label is free text -- the stages
 # belong to the operator's prompt, which Ralph snapshots but never reads, so no fixed
 # vocabulary could name them -- and free text needs a bound: it shares one status-line
@@ -243,7 +298,7 @@ def extract_stage(text: str) -> str | None:
 
 
 def has_completion_marker(text: str) -> bool:
-    return any(line == "<promise>COMPLETE</promise>" for _, line in visible_markdown_lines(text))
+    return any(line == COMPLETION_MARKER for _, line in visible_markdown_lines(text))
 
 
 def extract_question(value: Any) -> str | None:
@@ -356,7 +411,7 @@ def explicit_needs_input(text: str) -> str | None:
     marker_indexes = [
         index
         for index, line in visible_markdown_lines(text)
-        if line == "<promise>NEEDS_INPUT</promise>"
+        if line == NEEDS_INPUT_MARKER
     ]
     if not marker_indexes:
         return None

@@ -1,6 +1,7 @@
 """The Run console: the run header an operator is shown before budget is spent,
-the terminal and piped rendering paths, and the structural rule that no other
-module addresses a terminal.
+the terminal and piped rendering paths, and the two structural rules — that no
+other module addresses a terminal, and that every run outcome the source can
+reach is worded rather than left to name itself.
 
 Two tiers, as the program's testing decisions require. The black-box CLI seam
 asserts what a real run tells an operator; the unit tests below drive the console
@@ -24,6 +25,7 @@ from ralph.console import (
     CLAUDE_AGENTS_DEVIATION,
     NO_SANDBOX_DEVIATION,
     OPENCODE_AGENTS_DEVIATION,
+    OUTCOME_HEADLINES,
     PALETTE,
     STAGE_STALE_SECONDS,
     CleanOutcome,
@@ -318,6 +320,15 @@ class PipedConsoleTest(unittest.TestCase):
             lambda console: console.run_finished(self._summary(outcome="budget_exhausted"))
         )
         self.assertIn("iteration budget exhausted", "\n".join(lines))
+
+    def test_an_interrupted_run_is_worded_rather_than_merely_named(self) -> None:
+        # Finding 7: ``interrupted`` fell through to the bare ``run ended:
+        # interrupted``, and Ctrl-C is the commonest way an operator ends a run.
+        lines = self._lines(
+            lambda console: console.run_finished(self._summary(outcome="interrupted"))
+        )
+        self.assertIn("ralph: outcome run stopped: interrupted by the operator", lines)
+        self.assertNotIn("run ended:", "\n".join(lines))
 
     def test_a_piped_terminal_outcome_emits_no_bell(self) -> None:
         stream = io.StringIO()
@@ -1897,3 +1908,115 @@ class TerminalOwnershipTest(unittest.TestCase):
     @staticmethod
     def _package() -> Path:
         return ROOT / "src" / "ralph"
+
+
+class OutcomeVocabularyTest(unittest.TestCase):
+    """Finding 7: ``OUTCOME_HEADLINES`` covered six of the seven reachable outcome
+    strings, so ``interrupted`` fell through to the bare ``run ended: interrupted``.
+    The vocabulary is read back out of the source rather than restated here, so the
+    next outcome a Backend adapter or the Loop invents cannot silently fall through
+    either -- the same structural approach register G13's rule uses."""
+
+    # The one value object whose ``outcome`` is an Iteration's rather than a run's.
+    ITERATION_LEVEL = "IterationOutcome"
+
+    def _outcome_positions(self) -> dict[str, int]:
+        """Where ``outcome`` sits in the argument list of each error that carries one,
+        read from ``errors.py`` rather than restated, so a positional call is scanned
+        as surely as a keyword one -- ``StartedIterationError(str(error),
+        "backend_contract_failure")`` names no keyword and must not slip past."""
+        source = (ROOT / "src" / "ralph" / "errors.py").read_text(encoding="utf-8")
+        positions: dict[str, int] = {}
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for member in node.body:
+                if not isinstance(member, ast.FunctionDef) or member.name != "__init__":
+                    continue
+                names = [
+                    argument.arg
+                    for argument in member.args.posonlyargs + member.args.args
+                    if argument.arg != "self"
+                ]
+                if "outcome" in names:
+                    positions[node.name] = names.index("outcome")
+        return positions
+
+    def _run_outcomes(self, source: str, positions: dict[str, int]) -> set[str]:
+        """Every run-level outcome *source* spells, read from the five places the
+        package spells one: as an ``outcome=`` keyword argument, in the positional slot
+        ``outcome`` occupies for one of the errors that carry one, as the default of an
+        ``outcome`` parameter, as an assignment to a name called ``outcome``, or as
+        the value ``outcome.json`` records under that key. Each collects the string
+        constants anywhere in the expression, so a conditional spelling two of them
+        yields both."""
+        found: set[str] = set()
+
+        def literals(node: ast.AST) -> set[str]:
+            return {
+                inner.value
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Constant) and isinstance(inner.value, str)
+            }
+
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                # An Iteration's own outcome is named at the Iteration's level and
+                # rendered as it stands, never through the run summary's headlines, so
+                # its vocabulary is deliberately not collected here. No call trips this
+                # today -- every one passes the Loop's variable -- so it guards the rule
+                # rather than a present case: a literal Iteration-level word must not
+                # come to demand a run headline it can never use.
+                callee = node.func
+                if isinstance(callee, ast.Name) and callee.id == self.ITERATION_LEVEL:
+                    continue
+                for keyword in node.keywords:
+                    if keyword.arg == "outcome":
+                        found |= literals(keyword.value)
+                # ...and the positional slot, for the errors that carry an outcome
+                # there. Both spellings occur in the adapters today.
+                if isinstance(callee, ast.Name) and callee.id in positions:
+                    index = positions[callee.id]
+                    if index < len(node.args):
+                        found |= literals(node.args[index])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arguments = node.args
+                positional = arguments.posonlyargs + arguments.args
+                defaults = arguments.defaults
+                paired = list(zip(positional[len(positional) - len(defaults) :], defaults))
+                paired += [
+                    (argument, default)
+                    for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
+                    if default is not None
+                ]
+                for argument, default in paired:
+                    if argument.arg == "outcome":
+                        found |= literals(default)
+            elif isinstance(node, ast.Assign):
+                if any(
+                    isinstance(target, ast.Name) and target.id == "outcome"
+                    for target in node.targets
+                ):
+                    found |= literals(node.value)
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and key.value == "outcome":
+                        found |= literals(value)
+        return found
+
+    def test_every_reachable_run_outcome_has_a_worded_headline(self) -> None:
+        positions = self._outcome_positions()
+        # The scan is worthless if it learned no positional slot to look in.
+        self.assertIn("StartedIterationError", positions)
+        reachable: set[str] = set()
+        for path in sorted((ROOT / "src" / "ralph").rglob("*.py")):
+            reachable |= self._run_outcomes(path.read_text(encoding="utf-8"), positions)
+        # The scan is only worth anything if it finds the outcomes it is meant to,
+        # so pin the ones the review named rather than trusting an empty result.
+        self.assertLessEqual({"interrupted", "timeout", "needs_input"}, reachable)
+        self.assertEqual(
+            reachable - set(OUTCOME_HEADLINES),
+            set(),
+            "a run outcome has no worded headline and would degrade to naming "
+            "itself: word it in OUTCOME_HEADLINES (register G19)",
+        )

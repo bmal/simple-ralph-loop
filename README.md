@@ -134,10 +134,30 @@ row. Truncation is display-only: no retained artifact loses content.
 
 Each iteration opens with a rule naming its number and the budget, and closes
 with an outcome block giving its duration, outcome, session id, and the backend's
-concluding message truncated for display. Once the first iteration's preflight
-has proven authentication and customization isolation — the sandbox self-test
-having already proven host isolation — the trust boundary is stated as proven
-rather than left silent.
+concluding message truncated for display. Every iteration gets that block,
+including one that ended by timing out, handing off, or violating the contract —
+the one you most want attributed. Such a block carries no concluding message,
+because that path never produced one, and it names a session only if that
+iteration got as far as establishing one; it never borrows the session id of the
+iteration before it.
+
+The outcome names what happened to *the iteration*. An iteration that finished its
+child while unblocked children still remain has ended normally, not run out of
+anything, and reads `incomplete`; only the run summary says
+`iteration budget exhausted`, and only when the budget actually ran out, so
+`grep budget` over a log still matches once. An interruption — the commonest way a
+long run ends — is summarised in words as a stop rather than a failure.
+
+The block shows the backend's prose. The loop protocol's own markers — the stage
+declaration, the completion marker, the needs-input marker — are Ralph's contract
+echoed back, and the outcome on the line above already reports what they signalled,
+so a standalone marker line is not repeated inside the message. A marker mentioned
+inside a sentence stays, because that is prose to the parsers too. The retained
+artifacts keep the whole message, markers included.
+
+Once the first iteration's preflight has proven authentication and customization
+isolation — the sandbox self-test having already proven host isolation — the trust
+boundary is stated as proven rather than left silent.
 
 While an iteration runs, a single status line repaints in place on a terminal,
 carrying the iteration and budget, the iteration's elapsed time, what the backend

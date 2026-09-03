@@ -12,7 +12,12 @@ _Avoid_: agent (reserved for backend-defined subagents), model, provider
 
 **Iteration**:
 One fresh backend session running the snapshotted prompt; consumes one unit of
-budget, including when handed off for manual recovery.
+budget, including when handed off for manual recovery. Its outcome names what
+happened to *it* -- `complete` when the backend declared completion, `incomplete`
+when it ended normally without doing so, and otherwise the stop that ended it --
+never the run-level word for the budget running out, which only the Loop can
+decide and only once the whole budget is spent. Every terminal path closes it
+with an outcome block, the ones that raise included.
 _Avoid_: run, loop cycle
 
 **Launch chain**:
@@ -41,7 +46,13 @@ configured interactive-only label and the concrete children ralph resolves as
 carrying it, so the same contract, its resolved facts, and its marker parser stay
 in one module. Progress and outcome share the marker envelope but never each
 other's meaning: a Stage declaration completes nothing and halts nothing, and is
-excluded from the prose the needs-input heuristics read.
+excluded from the prose the needs-input heuristics read. The markers are Ralph's
+own contract echoed back rather than the backend's prose, so a standalone
+declaration is dropped from a concluding message on its way to the operator --
+the outcome reported beside it already states what the marker signalled. What
+counts as a declaration is one line-anchored match shared by the parsers and that
+filter, so a marker mentioned inside a sentence is prose to all of them and the
+console can never disagree with the contract about which is which.
 _Avoid_: prompt suffix, prompt template, system prompt
 
 **Stage**:
