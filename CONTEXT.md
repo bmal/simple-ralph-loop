@@ -18,7 +18,10 @@ _Avoid_: run, loop cycle
 **Launch chain**:
 The ordered stack of wrappers every backend session starts under — the
 `caffeinate` power assertion outermost, host isolation inside it, the backend
-innermost — identical for automated iterations and handed-off recovery.
+innermost — identical for automated iterations and handed-off recovery. Every
+session it starts is interruptible: ralph un-ignores the interrupt before it
+launches anything, because an ignored one is inherited through the whole stack and
+the graceful first step of a stop could then never reach the backend.
 _Avoid_: launcher, wrapper, command line
 
 **In-scope backend**:

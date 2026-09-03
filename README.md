@@ -397,7 +397,11 @@ last stated either way, so a resumed session that is running unconfined says so
 rather than leaving you to notice the omission. That header is the last thing Ralph
 prints: the next step replaces its own process with the interactive session. A started
 handed-off session consumes its iteration. The first Ctrl-C requests graceful
-resumable shutdown; a second Ctrl-C force-kills the backend.
+resumable shutdown; a second Ctrl-C force-kills the backend. The same graceful
+step opens the timeout shutdown, so Ralph un-ignores the interrupt at startup:
+a shell that starts Ralph in the background sets it to ignored, and an ignored
+interrupt — unlike a handled one — is inherited straight through into the backend
+session, which could then never be asked to stop politely.
 
 Known subscription credentials, including `CLAUDE_CODE_OAUTH_TOKEN`, are
 redacted from readable progress and every retained diagnostic stream in case

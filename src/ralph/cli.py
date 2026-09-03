@@ -45,6 +45,11 @@ Invariants:
   G8/G22). It is where the proof completes, the same placement register G8 gives a
   run's Trust boundary line, and host isolation is stated whether or not it holds:
   an operator reading three lines cannot tell an omitted guarantee from a kept one.
+- ``main`` calls ``process.keep_interrupt_deliverable`` before any command runs,
+  because an ignored disposition is inherited through exec: it is the one point that
+  covers both a run's automated sessions and the session ``resume`` execs into, and
+  neither could otherwise be asked to stop politely when Ralph was started in the
+  background.
 - ``main`` is the single place a ``RalphError`` becomes ``ralph: <message>`` on
   stderr with exit code 2; the console script and ``python -m ralph.cli`` both run
   it, and the name ``main`` is preserved for the packaging entry point.
@@ -69,11 +74,11 @@ only), ``protocol`` (the default interactive-only label),
 ``gitcontext``, ``launch`` (``session_argv``, ``establish_sandbox``), ``locking``
 (the worktree lock and ``secure_state_directory``), ``loop`` (``run_locked``, and
 ``retained_runs`` so ``clean`` never has to know how runs are laid out inside the
-state root), ``process`` (timeout ceiling), and ``errors``. It resolves the Backend
-once and drives it only through the interface; it must not contain any Backend,
-Launch chain, or Loop mechanism of its own, nor branch on the backend name. It words
-no operator-facing line of its own at all: every one goes through the injected Run
-console.
+state root), ``process`` (timeout ceiling and the inherited-interrupt repair), and
+``errors``. It resolves the Backend once and drives it only through the interface;
+it must not contain any Backend, Launch chain, or Loop mechanism of its own, nor
+branch on the backend name. It words no operator-facing line of its own at all:
+every one goes through the injected Run console.
 
 See also: ``console`` (the Run console it constructs), ``loop`` (the budgeted
 Iteration loop), ``backends`` (the registry and adapters), ``launch`` (wrapped argv
@@ -111,7 +116,7 @@ from .launch import (
 )
 from .locking import WorktreeLock, secure_state_directory
 from .loop import retained_runs, run_locked
-from .process import MAX_ITERATION_TIMEOUT_SECONDS
+from .process import MAX_ITERATION_TIMEOUT_SECONDS, keep_interrupt_deliverable
 from .protocol import DEFAULT_INTERACTIVE_LABEL
 from .redaction import collect_secrets, set_active_redactor
 
@@ -423,6 +428,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    # Before anything is launched, and here rather than per launch because `resume`
+    # execs a session of its own.
+    keep_interrupt_deliverable()
     # The composition root: the one place a concrete Run console is selected and
     # injected (register G16). Every module below here depends on the abstraction.
     # The four concrete renderings -- terminal, plain, quiet, verbose -- are selected

@@ -60,7 +60,12 @@ Invariants:
   re-proves the same relaxed boundary, and ``--session`` is placed last.
 - The loop-wide ``CaffeinateAssertion`` must cover the entire invocation: if it
   exits unexpectedly the sleep guarantee is gone, so ``ensure_alive`` fails closed
-  and the loop stops at the next boundary rather than continuing unprotected.
+  and the loop stops at the next boundary rather than continuing unprotected. Which
+  of its two failures an operator is told about follows from the iteration the run
+  had reached -- named by the caller -- never from how promptly the failure
+  surfaced: a loss found before the first session is the startup failure the probe
+  names, however long the assertion took to die, and only a loss found after one
+  has begun is the mid-run one.
 
 Depends on / must not know: ``errors``. It must not know how the Loop schedules
 Iterations or how a Backend consumes the argv it helps build.
@@ -632,6 +637,12 @@ def restart_command(
     return shell_command(args, worktree)
 
 
+def _startup_failure(code: int) -> RalphError:
+    # The one wording for a power assertion that never got going, shared by the
+    # startup probe and by the first iteration's check so the two can never drift.
+    return RalphError(f"caffeinate exited during startup with status {code}")
+
+
 class CaffeinateAssertion:
     def __init__(self, worktree: Path) -> None:
         self.worktree = worktree
@@ -652,19 +663,24 @@ class CaffeinateAssertion:
             returncode = self.process.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
             return self
-        raise RalphError(f"caffeinate exited during startup with status {returncode}")
+        raise _startup_failure(returncode)
 
-    def ensure_alive(self) -> None:
+    def ensure_alive(self, iteration: int) -> None:
         # The loop-wide assertion must cover the entire invocation. If it exits
         # unexpectedly (killed, crashed) the sleep guarantee is gone, so the loop
         # stops safely at the next boundary rather than continuing unprotected.
         if self.process is None:
             return
         code = self.process.poll()
-        if code is not None:
-            raise RalphError(
-                f"the loop-wide caffeinate power assertion exited unexpectedly with status {code}"
-            )
+        if code is None:
+            return
+        # A caffeinate that failed slower than the startup probe waits is the same
+        # failure the probe names, not a mid-run loss: nothing has been spent yet.
+        if iteration == 1:
+            raise _startup_failure(code)
+        raise RalphError(
+            f"the loop-wide caffeinate power assertion exited unexpectedly with status {code}"
+        )
 
     def __exit__(self, *_: object) -> None:
         if self.process is None or self.process.poll() is not None:

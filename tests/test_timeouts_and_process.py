@@ -4,8 +4,8 @@ caffeinate power assertion."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import signal
-import subprocess
 import time
 
 from harness import RalphCliTestCase
@@ -59,6 +59,27 @@ class TimeoutAndProcessControlTest(RalphCliTestCase):
         outcome = json.loads((run_dir / "outcome.json").read_text())
         self.assertEqual(outcome["outcome"], "timeout")
         self.assertEqual(outcome["iterations"][0]["session_id"], "ses_1")
+
+    def test_a_run_started_with_the_interrupt_ignored_still_escalates_from_sigint(self) -> None:
+        # A shell starting Ralph asynchronously (`ralph run … &`) sets SIGINT to
+        # ignored, and an ignored disposition -- unlike a handler -- survives exec
+        # into every descendant. A backend inheriting it cannot be asked politely
+        # to stop at all, so the escalation would silently lose its gentlest step
+        # and jump straight to terminating a session that was still cleaning up.
+        result = self.run_ralph(
+            "--timeout",
+            "0.5",
+            env={
+                "FAKE_EVENTS": self._events("Partial work"),
+                "FAKE_SLEEP": "30",
+                "FAKE_IGNORE_SIGNALS": "1",
+            },
+            interrupt_ignored=True,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("iteration timed out", result.stderr)
+        self.assertEqual((self.calls / "signals").read_text(), "INTTERM")
 
     def test_claude_timeout_uses_the_same_resumable_handoff(self) -> None:
         result = self.run_ralph(
@@ -148,21 +169,15 @@ class TimeoutAndProcessControlTest(RalphCliTestCase):
         self.assertIn("--session ses_1", result.stderr)
 
     def test_second_interrupt_force_kills_and_hands_off_promptly(self) -> None:
-        process = subprocess.Popen(
-            self._command("run", "--timeout", "0"),
-            cwd=self.base,
-            env=self._environment(
-                {
-                    "FAKE_EVENTS": self._events("Partial work"),
-                    "FAKE_SLEEP": "30",
-                    "FAKE_IGNORE_SIGNALS": "1",
-                }
-            ),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        process = self.start_ralph(
+            "--timeout",
+            "0",
+            env={
+                "FAKE_EVENTS": self._events("Partial work"),
+                "FAKE_SLEEP": "30",
+                "FAKE_IGNORE_SIGNALS": "1",
+            },
         )
-        self.addCleanup(lambda: process.poll() is None and process.kill())
         self._await_ready(self.calls / "env", process)
 
         started = time.monotonic()
@@ -244,6 +259,32 @@ class TimeoutAndProcessControlTest(RalphCliTestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("caffeinate exited during startup", result.stderr)
+        self.assertFalse((self.calls / "opencode").exists())
+
+    def test_a_caffeinate_lost_before_the_first_iteration_still_reports_startup(self) -> None:
+        # The startup probe waits a fixed moment, so on a loaded machine the very
+        # same failing caffeinate is discovered just after that window rather than
+        # inside it. Which of the two power-assertion failures an operator is told
+        # about has to follow from what the run had reached -- no iteration has
+        # begun either way -- and never from how promptly the failure surfaced.
+        # Parking the run inside the sandbox self-test puts the loss squarely in
+        # the gap between the probe and the first iteration, by ordering rather
+        # than by margin.
+        block = self.base / "selftest-block"
+        block.write_text("", encoding="utf-8")
+        process = self.start_ralph(
+            env={
+                "FAKE_SELFTEST_BLOCK": str(block),
+                "FAKE_CAFFEINATE_FAIL_WHEN": f"{block}.ready",
+            }
+        )
+        self._await_ready(Path(f"{block}.ready"), process, what="the sandbox self-test")
+        self._await_ready(self.calls / "caffeinate-failed", process, what="caffeinate")
+        block.unlink()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 2, stdout + stderr)
+        self.assertIn("caffeinate exited during startup", stderr)
         self.assertFalse((self.calls / "opencode").exists())
 
     def test_absolute_caffeinate_is_not_path_shadowed(self) -> None:

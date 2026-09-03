@@ -1,5 +1,5 @@
-"""Process-group control, timeouts, controlled-stop classification, and process
-identity.
+"""Process-group control, timeouts, the interrupt disposition a session inherits,
+controlled-stop classification, and process identity.
 
 Invariants:
 - A backend child is started in its own session (``start_new_session=True``) so it
@@ -11,6 +11,14 @@ Invariants:
 - ``MAX_ITERATION_TIMEOUT_SECONDS`` is the largest iteration timeout Ralph accepts,
   kept far below ``BACKEND_TIMEOUT_MS`` expressed in seconds so the backend's own
   limits always stay subordinate to Ralph's timer.
+- That escalation only has its gentlest step if the backend can receive an
+  interrupt at all. An *ignored* SIGINT -- unlike a handled one, which exec resets
+  to the default -- is inherited straight through exec into every descendant, and a
+  shell starting Ralph asynchronously (``ralph run ... &``) sets exactly that, as
+  do several unattended parents. ``keep_interrupt_deliverable`` replaces an
+  inherited ignored disposition with a handler that swallows the signal, so Ralph
+  itself behaves as it did while every session it launches starts interruptible;
+  ``cli`` calls it once, before anything is launched.
 - ``raise_if_controlled_stop`` is the single classifier turning a timed-out or
   interrupted controller into the right exception: a resumable ``HandoffError`` once
   a session exists, a consuming ``StartedIterationError`` before any session id
@@ -20,7 +28,8 @@ Invariants:
 Depends on / must not know: ``errors``. It must not know which Backend it is
 controlling beyond the ``backend`` label it echoes into stop reasons.
 
-See also: ``launch`` (CaffeinateAssertion is a separate power assertion),
+See also: ``cli`` (calls ``keep_interrupt_deliverable`` once, before any command
+runs), ``launch`` (CaffeinateAssertion is a separate power assertion),
 ``backends.opencode`` / ``backends.claude`` (drive a controller per Iteration).
 """
 
@@ -153,6 +162,24 @@ class ProcessController:
                 pass
         except (ProcessLookupError, OSError):
             pass
+
+
+def _swallow_interrupt(_signum: int, _frame: Any) -> None:
+    return None
+
+
+def keep_interrupt_deliverable() -> None:
+    # An interrupt Ralph *ignores* is an interrupt no backend it launches can ever
+    # receive: unlike a handler, which exec resets to the default, an ignored
+    # disposition is inherited straight through exec into the whole session. A
+    # shell that starts Ralph asynchronously (`ralph run ... &`) sets exactly that
+    # -- POSIX requires it -- as do several unattended parents, so the first and
+    # gentlest step of the shutdown escalation would be silently swallowed and a
+    # backend still cleaning up would be terminated instead of asked to stop.
+    # Replacing it with a handler that ignores the signal leaves Ralph itself
+    # behaving exactly as it did while restoring the default in every child.
+    if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+        signal.signal(signal.SIGINT, _swallow_interrupt)
 
 
 def process_identity(pid: int) -> str | None:

@@ -3,6 +3,17 @@ command builder, the sanitized-environment allowlist, the run/clean/
 resume helpers, and the narrow pseudo-terminal capability. Every behavior-area
 test case subclasses RalphCliTestCase so this harness lives in exactly one home.
 
+The fake backends install their signal traps as the first thing a session does,
+before anything that can block or fork. A session that has been started but is not
+yet trapping dies of the first SIGINT instead of recording it, so every readiness
+marker below would otherwise announce a backend that is not yet signal-ready and
+the escalation tests would race the launch chain's cold start.
+
+The knobs that decide *when* something fails take a file to watch rather than a
+number of seconds wherever the ordering is what a test is asserting
+(``FAKE_CAFFEINATE_FAIL_WHEN``, ``FAKE_SELFTEST_BLOCK``, ``FAKE_BLOCK_FILE``), so a
+stage of the run is named rather than a margin hoped for.
+
 ``PtyCapture`` and ``run_ralph_pty`` exist because the suite otherwise drives
 Ralph exclusively through pipes, which would leave the terminal path — colour and
 width — as the one path nothing exercises, and the degraded piped path free to rot
@@ -79,6 +90,18 @@ class PtyCapture:
             if not data:
                 return
             self._chunks.append(data)
+
+
+def _with_the_interrupt_ignored(command: list[str]) -> list[str]:
+    """The same command, started the way a shell starts an asynchronous job.
+
+    POSIX requires a shell to set SIGINT (and SIGQUIT) to *ignored* for a command
+    run with ``&``, and an ignored disposition -- unlike a handler -- survives
+    ``exec`` into every descendant. ``trap "" INT`` reproduces exactly that state,
+    then hands the argv on untouched, so a test can drive the boundary a
+    background ``ralph run … &``, a cron entry, or an agent harness puts Ralph
+    behind."""
+    return ["/bin/sh", "-c", 'trap "" INT; exec "$@"', "sh", *command]
 
 
 class RalphCliTestCase(unittest.TestCase):
@@ -173,6 +196,13 @@ class RalphCliTestCase(unittest.TestCase):
               *Library/Keychains*) probe=read ;;
             esac
             if test -n "$probe"; then
+              # A test can park the run inside the self-test, which is the one
+              # stretch of a run that sits after the caffeinate startup probe and
+              # before the first iteration begins.
+              if test -n "${FAKE_SELFTEST_BLOCK:-}"; then
+                : > "$FAKE_SELFTEST_BLOCK.ready"
+                while test -e "$FAKE_SELFTEST_BLOCK"; do sleep 0.05; done
+              fi
               case " ${FAKE_SELFTEST_ALLOW:-} " in
                 *" $probe "*) exit 0 ;;
               esac
@@ -194,7 +224,18 @@ class RalphCliTestCase(unittest.TestCase):
               # the backend). Dying on command rather than on a wall-clock timer
               # keeps that scenario deterministic under CI scheduling latency.
               printf '%s\\n' "$$" > "$FAKE_CALLS/caffeinate-pid"
-              while kill -0 "$2" 2>/dev/null; do sleep 0.02; done
+              while kill -0 "$2" 2>/dev/null; do
+                # Failing on a file rather than on a timer keeps *when* the
+                # assertion is lost an ordering a test states, not a margin it
+                # hopes for: the marker is written by the stage of the run the
+                # test wants the loss to land after.
+                if test -n "${FAKE_CAFFEINATE_FAIL_WHEN:-}" \\
+                    && test -e "$FAKE_CAFFEINATE_FAIL_WHEN"; then
+                  : > "$FAKE_CALLS/caffeinate-failed"
+                  exit 9
+                fi
+                sleep 0.02
+              done
               exit 0
             fi
             exec "$@"
@@ -246,6 +287,15 @@ class RalphCliTestCase(unittest.TestCase):
                 emit_export "${3}"
                 ;;
               *" run "*)
+                # Before anything that can block or fork: a session that has been
+                # started but has not yet installed its traps dies of the first
+                # SIGINT instead of recording it, so every readiness marker below
+                # would announce a backend that is not yet signal-ready and the
+                # escalation under test would race the launch chain's cold start.
+                if test "${FAKE_IGNORE_SIGNALS:-0}" = "1"; then
+                  trap 'printf INT >> "$FAKE_CALLS/signals"' INT
+                  trap 'printf TERM >> "$FAKE_CALLS/signals"' TERM
+                fi
                 if test -n "${FAKE_SEQUENCE_DIR:-}"; then
                   count_file="$FAKE_CALLS/run-count"
                   count=0
@@ -282,10 +332,6 @@ class RalphCliTestCase(unittest.TestCase):
                   # group leader exits, modelling a departed leader.
                   (sleep "$FAKE_ORPHAN_SLEEP") &
                   exit 0
-                fi
-                if test "${FAKE_IGNORE_SIGNALS:-0}" = "1"; then
-                  trap 'printf INT >> "$FAKE_CALLS/signals"' INT
-                  trap 'printf TERM >> "$FAKE_CALLS/signals"' TERM
                 fi
                 if test -n "${FAKE_SLEEP:-}"; then
                   if test "${FAKE_IGNORE_SIGNALS:-0}" = "1"; then
@@ -337,6 +383,12 @@ class RalphCliTestCase(unittest.TestCase):
                 printf '%s\n' "${FAKE_CLAUDE_AUTH}"
                 ;;
               "-p "*)
+                # Installed before anything that can block or fork, for the reason
+                # the OpenCode fake's `run` branch gives.
+                if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
+                  trap 'printf INT >> "$FAKE_CALLS/claude-signals"' INT
+                  trap 'printf TERM >> "$FAKE_CALLS/claude-signals"' TERM
+                fi
                 if test -n "${FAKE_CLAUDE_SEQUENCE_DIR:-}"; then
                   count_file="$FAKE_CALLS/claude-run-count"
                   count=0
@@ -361,10 +413,6 @@ class RalphCliTestCase(unittest.TestCase):
                 if test -n "${FAKE_CLAUDE_ERROR_RESULT_ON_INT:-}"; then
                   trap 'printf "%s\n" "$FAKE_CLAUDE_ERROR_RESULT_ON_INT"; exit 0' INT
                   while :; do sleep 1 || true; done
-                fi
-                if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
-                  trap 'printf INT >> "$FAKE_CALLS/claude-signals"' INT
-                  trap 'printf TERM >> "$FAKE_CALLS/claude-signals"' TERM
                 fi
                 if test -n "${FAKE_CLAUDE_SLEEP:-}"; then
                   if test "${FAKE_CLAUDE_IGNORE_SIGNALS:-0}" = "1"; then
@@ -792,14 +840,38 @@ class RalphCliTestCase(unittest.TestCase):
         *extra: str,
         env: dict[str, str] | None = None,
         backend: str = "opencode",
+        interrupt_ignored: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        command = self._command("run", *extra, backend=backend)
+        if interrupt_ignored:
+            command = _with_the_interrupt_ignored(command)
         return subprocess.run(
-            self._command("run", *extra, backend=backend),
+            command,
             cwd=self.base,
             env=self._environment(env),
             text=True,
             capture_output=True,
         )
+
+    def start_ralph(
+        self,
+        *extra: str,
+        env: dict[str, str] | None = None,
+        backend: str = "opencode",
+    ) -> subprocess.Popen[str]:
+        """A run left in flight, for the tests that have to act on it *while* it is
+        running -- signalling it, or releasing a stage it is parked in. The caller
+        reaps it; the cleanup only covers the paths that leave it alive."""
+        process = subprocess.Popen(
+            self._command("run", *extra, backend=backend),
+            cwd=self.base,
+            env=self._environment(env),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        return process
 
     def run_ralph_pty(
         self,

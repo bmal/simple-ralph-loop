@@ -4,7 +4,9 @@ and outcome recording under the loop-wide power assertion.
 Invariants:
 - The loop-wide ``CaffeinateAssertion`` wraps the whole run and is re-checked with
   ``ensure_alive`` before every fresh session, so a lost power assertion stops the
-  loop with retained evidence rather than continuing unprotected.
+  loop with retained evidence rather than continuing unprotected. The check is told
+  which session it guards, because an assertion already gone before the first one is
+  a startup failure and one lost later is not, and only the loop knows which.
 - Every terminal path writes ``outcome.json``, records the final git state, and ends
   with a Run console summary (register G9): a clean finish, a ``HandoffError``
   (resumable, records the session and the ``RALPH NEEDS OPERATOR`` help block with a
@@ -401,7 +403,7 @@ def run_protected(
         for number in range(1, args.iterations + 1):
             # The loop-wide sleep assertion must still be held before each fresh
             # session; a lost assertion stops the loop with retained evidence.
-            assertion.ensure_alive()
+            assertion.ensure_alive(number)
             iteration_dir = (
                 run_dir
                 if number == 1
