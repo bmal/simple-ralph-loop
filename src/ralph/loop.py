@@ -44,7 +44,9 @@ Invariants:
   upstream — from those facts (register G14).
 - This module names where a run's evidence sits *inside* the state root
   (``RUNS_DIRECTORY``) because it is the module that creates those directories.
-  ``retained_runs`` counts them for ``clean``'s report (register G22), so the command
+  ``retained_runs`` counts them for the confirmation ``clean`` puts to an operator and
+  the report it prints afterwards (register G22, decision J4) -- one count for both, so
+  the number agreed to is the number destroyed -- so the command
   that destroys them never has to know that layout — it knows only the state root it
   was already resolving. The count descends into nothing and follows no symlink, and a
   state root that never held a run counts zero rather than failing.
@@ -179,9 +181,11 @@ RUNS_DIRECTORY = "runs"
 
 
 def retained_runs(state_root: Path) -> int:
-    """How many runs' evidence *state_root* holds, for the report ``clean`` prints
-    before it removes the tree (register G22). A state root that has never held a run
-    counts zero rather than failing.
+    """How many runs' evidence *state_root* holds, for the confirmation ``clean`` puts
+    to an operator before it removes the tree and the report it prints afterwards
+    (register G22, decision J4) -- counted once and worded from that one value, so the
+    number agreed to cannot differ from the number destroyed. A state root that has
+    never held a run counts zero rather than failing.
 
     A ``runs`` entry that is a symlink or not a directory counts zero and is never
     descended into. ``lstat`` decides that, because ``scandir`` would happily walk a

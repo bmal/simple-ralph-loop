@@ -17,9 +17,11 @@ stage of the run is named rather than a margin hoped for.
 ``PtyCapture`` and ``run_ralph_pty`` exist because the suite otherwise drives
 Ralph exclusively through pipes, which would leave the terminal path — colour and
 width — as the one path nothing exercises, and the degraded piped path free to rot
-unnoticed (register G20). The capability is deliberately narrow: a handful of
-tests, asserting what an operator on a terminal is shown, never how it is
-painted."""
+unnoticed (register G20). ``clean_ralph_at_a_terminal`` extends it to the one place
+Ralph asks the operator something rather than telling them: the terminal carries both
+ends, so what was asked and what was typed back sit in one capture. The capability is
+deliberately narrow: a handful of tests, asserting what an operator on a terminal is
+shown and what their answer does, never how it is painted."""
 
 from __future__ import annotations
 
@@ -74,6 +76,13 @@ class PtyCapture:
         """A text stream onto the terminal that owns its own descriptor, so closing
         it cannot pull the slave out from under the capture."""
         return os.fdopen(os.dup(self.fd), "w", encoding="utf-8")
+
+    def send(self, text: str) -> None:
+        """Type *text* at the terminal. Written to the master end, so it reaches the
+        slave's input queue exactly as an operator's keystrokes would -- and may be
+        queued before the process under test starts, since the line discipline holds
+        it until something reads."""
+        os.write(self._master, text.encode("utf-8"))
 
     @property
     def text(self) -> str:
@@ -905,13 +914,51 @@ class RalphCliTestCase(unittest.TestCase):
             terminal.text,
         )
 
-    def clean_ralph(self) -> subprocess.CompletedProcess[str]:
+    def clean_ralph(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        """``ralph clean`` as an unattended invocation: stdin is not a terminal, so
+        there is nobody to confirm to and none is asked for. Explicit rather than
+        inherited, because a suite started from a shell would otherwise hand the
+        command the operator's own terminal and hang waiting for an answer nobody is
+        there to type."""
         return subprocess.run(
-            self._command("clean"),
+            self._command("clean", *extra),
             cwd=self.base,
             env=self._environment(),
             text=True,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
+        )
+
+    def clean_ralph_at_a_terminal(
+        self,
+        *extra: str,
+        answer: str = "",
+        columns: int = 100,
+        timeout: float = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        """``ralph clean`` with stdin *and* stderr on one pseudo-terminal, the way an
+        operator runs it, with *answer* already typed.
+
+        Both ends of the conversation are the same terminal, so what the command
+        asked and what it was told sit in one capture. A command that asks and is
+        never answered blocks until *timeout* and fails the test rather than wedging
+        the suite."""
+        with PtyCapture(columns) as terminal:
+            terminal.send(answer)
+            process = subprocess.run(
+                self._command("clean", *extra),
+                cwd=self.base,
+                env=self._environment(),
+                stdin=terminal.fd,
+                stdout=subprocess.PIPE,
+                stderr=terminal.fd,
+                timeout=timeout,
+            )
+        return subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            process.stdout.decode("utf-8", "replace"),
+            terminal.text,
         )
 
     def resume_ralph(

@@ -91,7 +91,8 @@ Every flag, and when you reach for it. The prose below and under
 
 `ralph clean --worktree PATH` removes Ralph's state for a worktree and reports how
 many runs' evidence went with it, so a worktree that had nothing to clean reads
-differently from one whose fifty-five runs just went. The three
+differently from one whose fifty-five runs just went. Run from a terminal it names
+what is about to go and waits for a `y`; `--yes` skips that. The three
 flags marked *relaxes a guarantee* are the only ones that weaken what Ralph
 proves; each is default-off, independent of the others, announced loudly at
 launch, and reproduced into the recovery commands Ralph prints.
@@ -477,9 +478,17 @@ that repository-local state when no loop is active with:
 ralph clean --worktree PATH
 ```
 
-That deletes every run's retained evidence and cannot be undone, so it tells you
-what it took: the number of runs removed and the state directory they were in, or
-that there was no Ralph state there at all.
+That deletes every run's retained evidence and cannot be undone, so it asks first
+and tells you afterwards. Run from a terminal it states the number of runs and the
+state directory it is about to destroy — the same facts it reports — and removes
+nothing unless you answer `y`; declining is an ordinary exit, not a failure. Pass
+`--yes` to skip the question. Whether it asks is decided by standard input alone: with
+stdin not a terminal there is nobody to ask, so it never prompts and never blocks and
+an unattended `ralph clean` behaves exactly as it always has. The question itself is
+printed with the rest of Ralph's lines on standard error, so if you send that to a file
+while answering from the keyboard, look for the question in the file — or pass `--yes`.
+Afterwards it tells you what it took: the number of runs removed and the state
+directory they were in, or that there was no Ralph state there at all.
 
 ## Safety
 

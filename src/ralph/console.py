@@ -93,7 +93,13 @@ Invariants:
 - The two commands that are not ``run`` address the operator here too (register G22).
   ``state_removed`` reports what ``clean`` destroyed and, on its own line ahead of the
   fitted path, whether there was anything there at all, so a command that irreversibly
-  deletes every run's evidence can never be mistaken for a no-op. ``resume_started``
+  deletes every run's evidence can never be mistaken for a no-op. ``confirm_removal``
+  puts the same two facts to the operator *before* any of it goes, worded from the same
+  ``CleanOutcome`` so the number agreed to is the number destroyed, and
+  ``removal_declined`` reports the refusal in the same ``removed``-first shape rather
+  than borrowing the wording of a worktree that held nothing. Asking is all the console
+  does: reading the answer is ``cli``'s, because this module writes to an operator and
+  does not interview them (decision J4). ``resume_started``
   is recovery's header: the session being entered, the trust boundary re-proven, and
   the host-isolation status stated either way — never reported by omission. Only the
   standing full-auto caveat follows it, and then ``resume`` replaces its own process,
@@ -718,6 +724,10 @@ class RunConsole(Protocol):
 
     def resume_started(self, settings: ResumeSettings) -> None: ...
 
+    def confirm_removal(self, outcome: CleanOutcome) -> None: ...
+
+    def removal_declined(self, outcome: CleanOutcome) -> None: ...
+
     def state_removed(self, outcome: CleanOutcome) -> None: ...
 
     def relaunching_full_auto(self) -> None: ...
@@ -1172,6 +1182,39 @@ class StreamRunConsole:
             else "not enforced; the resumed session runs unconfined",
         )
 
+    @staticmethod
+    def _retained(runs: int) -> str:
+        """How much evidence is at stake, worded in one place so the confirmation and
+        the report that follows it can never name different numbers: both are handed
+        the same ``CleanOutcome`` and reach the same phrase from it."""
+        return f"{runs} run(s) of retained evidence"
+
+    def confirm_removal(self, outcome: CleanOutcome) -> None:
+        """What ``clean`` is about to destroy, put to the operator before any of it
+        goes (register G22, decision J4).
+
+        It states the same two facts the report states afterwards, off the same
+        ``CleanOutcome``, so the number an operator agrees to is the number that is
+        destroyed. The console asks; reading the answer belongs to ``cli`` -- this
+        module writes to the operator, it does not interview them."""
+        self._fact(
+            "about to remove",
+            self._retained(outcome.runs) if outcome.runs else "Ralph state; it holds no runs",
+        )
+        self._fact("state directory", str(outcome.state_root), keep_tail=True)
+        # Unfitted and in the warning role: the question an irreversible destruction
+        # turns on may be wrapped by a narrow window, never clipped short of the
+        # answers it names (register G3/G19).
+        self._message("warning", "this cannot be undone; remove it? [y/N]")
+
+    def removal_declined(self, outcome: CleanOutcome) -> None:
+        """The operator was asked and said no. It opens on ``removed`` like every
+        other outcome of ``clean``, so one habit reads them all, and leads with
+        ``nothing`` -- then names the answer that produced it, which is what tells it
+        apart from having found nothing there to begin with."""
+        self._fact("removed", "nothing; you declined the removal")
+        self._fact("state directory", str(outcome.state_root), keep_tail=True)
+
     def state_removed(self, outcome: CleanOutcome) -> None:
         # ``clean`` destroys every run's evidence, so it says what it destroyed
         # (register G22). All three wordings open on ``removed`` so one habit reads
@@ -1182,7 +1225,7 @@ class StreamRunConsole:
         if outcome.runs is None:
             self._fact("removed", "nothing; there was no Ralph state for this worktree")
         elif outcome.runs:
-            self._fact("removed", f"{outcome.runs} run(s) of retained evidence")
+            self._fact("removed", self._retained(outcome.runs))
         else:
             self._fact("removed", "Ralph state; it held no runs")
         self._fact("state directory", str(outcome.state_root), keep_tail=True)

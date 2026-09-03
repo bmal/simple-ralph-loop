@@ -6,9 +6,9 @@ Module map — start here, then open only the module you need:
 - ``cli``          — argument parsing and the run/clean/resume commands; ``main``,
                      the composition root that selects the concrete Run console.
 - ``console``      — the Run console: the operator-facing seam for all three
-                     commands, the run header, the ``clean`` report and the
-                     ``resume`` header, the palette, terminal detection and width,
-                     no-wrap truncation, and the redaction choke point.
+                     commands, the run header, the ``clean`` confirmation and
+                     report, the ``resume`` header, the palette, terminal detection
+                     and width, no-wrap truncation, and the redaction choke point.
 - ``loop``         — the budgeted Iteration loop, handoff printing, outcome
                      recording, the run-directory layout (and the run count
                      ``clean`` reports against it), and the once-per-run resolution

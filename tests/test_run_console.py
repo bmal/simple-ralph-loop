@@ -692,6 +692,65 @@ class CleanAndResumeConsoleTest(unittest.TestCase):
         self.assertNotEqual(emptied, nothing)
         self.assertNotIn("nothing", emptied)
 
+    def test_the_confirmation_names_what_goes_and_asks_before_it_goes(self) -> None:
+        state_root = Path("/Users/operator/code/project/.git/ralph")
+        joined = "\n".join(
+            self._lines(lambda console: console.confirm_removal(CleanOutcome(state_root, runs=55)))
+        )
+        # The two facts the report gives afterwards, given before, plus the question.
+        self.assertIn("55 run(s)", joined)
+        self.assertIn(str(state_root), joined)
+        self.assertIn("cannot be undone", joined)
+        self.assertIn("[y/N]", joined)
+
+    def test_the_confirmation_and_the_report_name_the_same_count(self) -> None:
+        # An operator agrees to a number; the number destroyed must be that one, so
+        # the phrase comes from the one outcome both are handed.
+        outcome = CleanOutcome(Path("/w/.git/ralph"), runs=7)
+        asked = "\n".join(self._lines(lambda console: console.confirm_removal(outcome)))
+        reported = "\n".join(self._lines(lambda console: console.state_removed(outcome)))
+        phrase = "7 run(s) of retained evidence"
+        self.assertIn(phrase, asked)
+        self.assertIn(phrase, reported)
+
+    def test_declining_reports_that_nothing_went_and_why(self) -> None:
+        state_root = Path("/w/.git/ralph")
+        declined = "\n".join(
+            self._lines(
+                lambda console: console.removal_declined(CleanOutcome(state_root, runs=3))
+            )
+        )
+        nothing = "\n".join(
+            self._lines(
+                lambda console: console.state_removed(CleanOutcome(state_root, runs=None))
+            )
+        )
+        # Both removed nothing, and the operator needs to know which happened: a
+        # refused destruction is not an empty worktree.
+        self.assertIn("nothing", declined)
+        self.assertIn("declined", declined)
+        self.assertNotEqual(declined, nothing)
+        self.assertNotIn("3 run(s)", declined)
+
+    def test_the_confirmation_is_redacted_at_the_console(self) -> None:
+        from ralph.redaction import set_active_redactor
+
+        secret = "s3cr3t-subscription-token-value"
+        set_active_redactor([secret])
+        self.addCleanup(set_active_redactor, [])
+        # The prompt prints a resolved worktree path exactly as the report does, so it
+        # passes the same choke point (register G17).
+        joined = "\n".join(
+            self._lines(
+                lambda console: (
+                    console.confirm_removal(CleanOutcome(Path(f"/w/{secret}/.git/ralph"), runs=1)),
+                    console.removal_declined(CleanOutcome(Path(f"/w/{secret}/.git/ralph"), runs=1)),
+                )
+            )
+        )
+        self.assertNotIn(secret, joined)
+        self.assertIn("[redacted]", joined)
+
     def test_the_resume_header_names_the_session_and_what_was_reproven(self) -> None:
         joined = "\n".join(self._lines(lambda console: console.resume_started(self._resume())))
         self.assertIn("claude", joined)

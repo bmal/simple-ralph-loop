@@ -70,6 +70,78 @@ class WorktreeLockingTest(RalphCliTestCase):
         self.assertIn("1 run(s)", removed.stderr)
         self.assertNotIn("nothing", removed.stderr)
 
+    def test_clean_at_a_terminal_asks_before_it_destroys_and_declining_keeps_it_all(
+        self,
+    ) -> None:
+        # The destruction is irreversible, so an operator sitting at a terminal is
+        # told what is about to go and gets to say no. Declining is an ordinary exit,
+        # not a failure -- nothing happened.
+        self.assertEqual(self.run_ralph().returncode, 0)
+        state_root = self.repo / ".git" / "ralph"
+        before = sorted(path.name for path in (state_root / "runs").iterdir())
+
+        # Wide enough that the temporary worktree's own path is not what the window
+        # spends; this asserts the prompt names it, not how a narrow one fits it.
+        declined = self.clean_ralph_at_a_terminal(answer="n\n", columns=240)
+
+        self.assertEqual(declined.returncode, 0, declined.stderr)
+        self.assertTrue(state_root.is_dir())
+        self.assertEqual(sorted(path.name for path in (state_root / "runs").iterdir()), before)
+        # The prompt names the same facts the report does: the count and the path.
+        self.assertIn("about to remove", declined.stderr)
+        self.assertIn("1 run(s)", declined.stderr)
+        self.assertIn(str(state_root.resolve()), declined.stderr)
+        self.assertIn("declined", declined.stderr)
+
+    def test_clean_at_a_terminal_destroys_once_the_operator_agrees(self) -> None:
+        self.assertEqual(self.run_ralph().returncode, 0)
+        state_root = self.repo / ".git" / "ralph"
+
+        confirmed = self.clean_ralph_at_a_terminal(answer="y\n")
+
+        self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+        self.assertIn("removed", confirmed.stderr)
+        self.assertIn("1 run(s)", confirmed.stderr)
+        self.assertFalse(state_root.exists())
+
+    def test_yes_removes_at_a_terminal_without_asking_anything(self) -> None:
+        # Nothing is typed at this terminal: a command that asked anyway would block
+        # until the helper's timeout, which is the failure this asserts against.
+        self.assertEqual(self.run_ralph().returncode, 0)
+        state_root = self.repo / ".git" / "ralph"
+
+        confirmed = self.clean_ralph_at_a_terminal("--yes")
+
+        self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+        self.assertNotIn("about to remove", confirmed.stderr)
+        self.assertIn("1 run(s)", confirmed.stderr)
+        self.assertFalse(state_root.exists())
+
+    def test_clean_never_asks_when_stdin_is_not_a_terminal(self) -> None:
+        # An unattended invocation has nobody to answer, so it is never asked and can
+        # never block: it proceeds and reports, exactly as it did before there was a
+        # prompt at all.
+        self.assertEqual(self.run_ralph().returncode, 0)
+        state_root = self.repo / ".git" / "ralph"
+
+        cleaned = self.clean_ralph()
+
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+        self.assertNotIn("about to remove", cleaned.stderr)
+        self.assertIn("1 run(s)", cleaned.stderr)
+        self.assertFalse(state_root.exists())
+
+    def test_clean_at_a_terminal_asks_nothing_when_there_is_nothing_to_destroy(
+        self,
+    ) -> None:
+        # There is no decision to put to an operator when the answer destroys
+        # nothing; asking would be a question with one meaningful answer.
+        nothing = self.clean_ralph_at_a_terminal()
+
+        self.assertEqual(nothing.returncode, 0, nothing.stderr)
+        self.assertNotIn("about to remove", nothing.stderr)
+        self.assertIn("nothing", nothing.stderr)
+
     def test_clean_does_not_count_runs_through_a_symlinked_runs_directory(self) -> None:
         # A run refuses a symlinked `runs` outright, and rmtree removes such a link
         # without touching what it points at. Counting through one would report

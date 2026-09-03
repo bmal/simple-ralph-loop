@@ -164,9 +164,16 @@ redirecting a transcript to a file leaves the dashboard on the terminal. The fee
 off by default, which is what makes the default view a dashboard rather than a feed;
 quiet drops the status line and the Iteration blocks and nothing else, so an
 unattended run never loses its header, its summary, or its help. It speaks for the
-two commands that are not `run` as well: `clean` reports the runs it destroyed and
-distinguishes that from having found nothing, so a command that irreversibly deletes
-every run's evidence is never silent about it, and `resume` gets a compact header
+two commands that are not `run` as well: `clean` states the runs and the state
+directory it is about to destroy and then reports what went, distinguishing that from
+having found nothing and from an operator who declined, so a command that irreversibly
+deletes every run's evidence neither does it unasked nor is silent about having done
+it. It asks and never reads the answer: `cli` takes that off standard input, which is
+the one stream the console has no part in, and puts the question only when standard
+input is a terminal, so an unattended invocation is neither asked nor left waiting.
+The structural rules above pin where a terminal is *written* to; the side an answer
+arrives on is not theirs to govern and stays with the module that reads it. And
+`resume` gets a compact header
 naming the session being entered, the trust boundary re-proven, and the
 host-isolation status — stated either way, never reported by omission — printed
 before the process is replaced and there is nothing left to render.

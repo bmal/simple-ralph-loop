@@ -24,6 +24,24 @@ Invariants:
   redactor knows about, so a command that prints a resolved path has to arm one
   (register G17). The refusals reach the operator the same way every other failure
   does, as a ``RalphError`` the console words.
+- ``clean`` also asks before it destroys (decision J4). The count and the path are
+  put to the operator off the same ``CleanOutcome`` the report is worded from, so the
+  number agreed to is the number that goes; the question is asked while the lock is
+  still held, so no run can add evidence between the two. Declining removes nothing
+  and exits 0 — refusing to destroy is not a failure. ``--yes`` skips the question,
+  and it is only asked where somebody can answer: with stdin not a terminal ``clean``
+  proceeds as it did before there was a prompt, rather than refusing and naming
+  ``--yes``, because a refusal would break every script that cleans state today in
+  exchange for protecting nobody — there is no operator behind a pipe to protect.
+  Either way nothing waits on an answer that cannot arrive, which is the case J4
+  names, and stdin is the whole of the test J4 words: an operator who sends the
+  dashboard to a file is still there to answer and reads the question out of the file.
+  There is nothing to ask when there is no state directory: a question with
+  one meaningful answer is not put. The console words the question (register
+  G13/G14); reading the answer is this module's, since the console writes to an
+  operator and does not interview them — and standard input is the one stream the
+  structural rule on terminals has nothing to say about, because that rule is about
+  writing.
 - ``resume`` re-establishes the full Trust boundary (sanitized environment,
   per-session OAuth/routing proof, isolated configuration, full-auto permissions,
   caffeinate, and host isolation) before ``exec``-ing the interactive backend, so
@@ -184,6 +202,7 @@ def clean(args: argparse.Namespace, console: RunConsole) -> int:
     # cannot disappear underneath the process.
     lock = WorktreeLock(git_dir)
     lock.acquire()
+    declined = False
     try:
         try:
             info = os.lstat(state_root)
@@ -198,17 +217,63 @@ def clean(args: argparse.Namespace, console: RunConsole) -> int:
                 raise RalphError("refusing to remove a symlinked Ralph state path")
             if not stat.S_ISDIR(info.st_mode):
                 raise RalphError("Ralph state path is not a directory")
-            # Count what is about to be destroyed while it still exists; the report
-            # names the evidence that went, not the empty space it left.
+            # Count what is about to be destroyed while it still exists; the same
+            # count is put to the operator and then reported, so the number they
+            # agreed to is the number that went and the report names the evidence
+            # that went, not the empty space it left.
             outcome = CleanOutcome(state_root, runs=retained_runs(state_root))
-            shutil.rmtree(state_root)
+            # Asked while the lock is still held, so nothing can start a run and add
+            # evidence between the count an operator agreed to and the removal.
+            declined = not _removal_confirmed(console, outcome, assume_yes=args.yes)
+            if not declined:
+                shutil.rmtree(state_root)
     finally:
         lock.release()
     # Reported after the lock is released and only once the removal actually
     # succeeded, so a failed rmtree raises instead of claiming a delete that did
     # not happen.
-    console.state_removed(outcome)
+    if declined:
+        console.removal_declined(outcome)
+    else:
+        console.state_removed(outcome)
     return 0
+
+
+def _removal_confirmed(
+    console: RunConsole, outcome: CleanOutcome, *, assume_yes: bool
+) -> bool:
+    """Whether ``clean`` may destroy *outcome*'s state directory.
+
+    *assume_yes* is ``--yes``: the operator saying so up front. Otherwise the
+    question is only worth asking where somebody is there to answer it, and decision
+    J4 makes stdin the test of that. A stdin that is not a terminal -- a pipe, a
+    closed stream, or no stdin at all -- is nobody to ask, and ``clean`` then
+    proceeds exactly as it did before there was a prompt, rather than refusing and
+    naming ``--yes``. Refusing would read as the safer default and is not: it would
+    break every script and cron entry that cleans state today, in exchange for no
+    protection an operator asked for -- the confirmation exists to catch the person
+    who has just typed ``clean`` at a prompt, and there is no such person behind a
+    pipe. Either way nothing waits on input that can never arrive, which is the case
+    J4 names.
+
+    The gate is stdin alone, as J4 words it, not the stream the question is printed
+    to. An operator who redirects stderr away is still there to answer, and reads
+    their prompt out of the log they redirected it into -- the same bargain every
+    tool that prompts on stderr strikes.
+
+    The console words the question (register G13/G14); reading the answer is this
+    module's, and only ``y``/``yes`` is a yes, so an empty line or anything else
+    keeps the evidence."""
+    if assume_yes:
+        return True
+    stdin = sys.stdin
+    try:
+        if stdin is None or not stdin.isatty():
+            return True
+    except ValueError:  # a closed stdin answers nothing either
+        return True
+    console.confirm_removal(outcome)
+    return stdin.readline().strip().lower() in {"y", "yes"}
 
 
 def resume(args: argparse.Namespace, console: RunConsole) -> int:
@@ -378,6 +443,15 @@ def parser() -> argparse.ArgumentParser:
     )
     clean_parser = subcommands.add_parser("clean", help="remove Ralph state for a worktree")
     clean_parser.add_argument("--worktree")
+    clean_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "remove without the confirmation prompt. The prompt appears only when "
+            "stdin is a terminal; an unattended invocation is never asked and never "
+            "blocks, so this flag states intent rather than unblocking a script"
+        ),
+    )
     resume_parser = subcommands.add_parser(
         "resume", help="relaunch a handed-off session under Ralph's trust boundary"
     )
