@@ -41,6 +41,20 @@ Invariants:
   head-first for prose, tail-first for paths, where the run id and the file name
   are the informative end — so it degrades by dropping characters and never by
   folding onto a second row.
+- Every measurement of what fits the window is in display columns, never in
+  codepoints, and goes through the one ``display_width`` they share -- the header's
+  ``fit_line``, the Iteration rule's fill, the status line's ``render_status``, and
+  the run of spaces that erases the status line. ``summarize_message``'s cap on a
+  concluding message is not one of them and stays a character budget: it bounds how
+  much of a message the outcome block quotes, which ``fit_line`` then fits.
+  A path of CJK directory names counts 34 codepoints and occupies about 50 columns,
+  which is how a header fact register G3 pins as fitted-never-folded came to wrap and
+  how the erase came to leave the tail of a wide status line on the screen. The
+  measurement is ``unicodedata`` and nothing else -- the package has no runtime
+  dependency and keeps none -- so it is per-codepoint and not grapheme-correct: East
+  Asian ``W`` and ``F`` count two, combining marks count none, and an emoji ZWJ
+  sequence over-measures. Over-measuring shortens a line sooner than it had to be;
+  under-measuring wraps the header, which is the failure that matters.
 - Only header facts are fitted. A warning or a failure is emitted whole, wrapping
   if it must: its wording is what an operator greps for and what register G19 pins
   byte-identical, so clipping words out of one would break the contract the header
@@ -64,9 +78,12 @@ Invariants:
   source, so a new one cannot silently degrade to the ``run ended: …`` fallback as
   ``interrupted`` did. The block prints on every terminal path, the ones that raise
   included; those carry no concluding message because their path produced none. The
-  bell rings in ``run_finished`` on every terminal outcome but only on a terminal, so
-  a piped log carries no bell character (register G12). The concluding message is
-  truncated for display only — nothing is written to disk from it, so the retained
+  bell rings on every terminal outcome but only on a terminal, so a piped log
+  carries no bell character (register G12): in ``run_finished`` for every path that
+  reached a run directory, and in ``failed`` for the one-line argument and
+  precondition path, which carries a ``RalphError`` from the git context, the prompt,
+  the worktree lock, and a failed ``resume`` handover as well as a bad flag. The
+  concluding message is truncated for display only — nothing is written to disk from it, so the retained
   copy stays byte-identical (register G18).
   It arrives as the Backend's prose: this module holds no knowledge of the Loop
   protocol and never decides what a marker is, so the Loop drops the protocol's own
@@ -120,11 +137,22 @@ Invariants:
   (register G6). Its ticking elapsed clock is the only motion -- a background ticker
   repaints it on a cadence so a long silent tool call still advances the clock, and a
   frozen clock therefore means stalled rather than a spinner spinning over a hang.
+  One Iteration's ticker cannot survive into the next: ``_finalize``'s wait for it is
+  bounded (``TICKER_JOIN_SECONDS``) so a stuck repaint never holds up the outcome
+  block, and a ticker still in flight when that wait expires reads the console's
+  cleared stop event as its own supersession and retires instead of repainting
+  alongside its successor.
   The line is read against the terminal's live width and never wraps: it drops fields
-  right-to-left (``render_status``) and clips rather than folding. It is painted only
-  once the Iteration has produced at least one Observation, so an Iteration that emits
-  none never paints one. The status line is erased before any other operator line
-  prints and redrawn after, so a warning or a header fact never corrupts it. Off a
+  right-to-left (``render_status``) and clips rather than folding, in columns rather
+  than codepoints. It is established when the Iteration opens, not by its first
+  Observation, so the clock ticks from zero for the whole of an Iteration a Backend
+  reports nothing about: no clock at all is a third state beside running and stalled
+  that US7 does not account for, and liveness is the one thing the line owes an
+  operator unconditionally. Only the fields wait for facts, the running tool count
+  among them -- absent until a Backend names a tool, like the context gauge and the
+  roster, so the first paint of an Iteration is a bare Iteration and clock rather than
+  a ``0 tools`` nothing reported (register G4/G5). The status line is erased before
+  any other operator line prints and redrawn after, so a warning or a header fact never corrupts it. Off a
   terminal there is no in-place line: the ticker degrades to slow append-only
   heartbeat lines carrying the same facts and no ANSI, so a piped log stays clean
   (register G3/G11). The status apparatus uses only ``\\r`` and spaces to repaint, never
@@ -591,6 +619,12 @@ STATUS_TICK_SECONDS = 1.0
 # misleading well inside a long Iteration. Falling back loses information but never
 # states an untruth, which is the trade register G6 makes.
 STAGE_STALE_SECONDS = 900.0
+# How long ``_finalize`` waits for the Iteration's ticker to retire before moving on.
+# Bounded on purpose -- a stuck repaint must not hold up the outcome block an operator
+# is waiting for -- which is exactly why giving up has to be safe: a ticker still in
+# flight when the wait expires checks that it is still the live one before it paints,
+# and retires when a successor has taken over (finding 16 of the #36 review).
+TICKER_JOIN_SECONDS = 2.0
 # Off a terminal there is no in-place line to keep smooth, so the ticker degrades to
 # *slow* append-only heartbeats at this far coarser cadence (register G3): a live sign
 # for a piped log without one line a second flooding it. A run shorter than one
@@ -603,7 +637,7 @@ def render_status(
     iterations: int,
     elapsed_seconds: float,
     tool: str | None,
-    tool_count: int,
+    tool_count: int | None,
     context_tokens: int | None,
     subagents: int | None,
     width: int | None,
@@ -616,12 +650,15 @@ def render_status(
     a terminal) keeps every field. The Iteration and elapsed are never dropped; when
     even they do not fit the line is clipped rather than folded onto a second row.
 
-    A field the Backend never supplied is absent, not zero: ``context_tokens`` or
-    ``subagents`` of ``None`` drops that field entirely rather than asserting a zero
-    that reads as a fact (register G4/G5). A genuine count of zero -- a Backend that
-    reported an empty subagent roster -- still renders, so the two are not conflated.
-    OpenCode emits no subagent roster, so its status line simply carries no subagent
-    field, while a Claude run shows the count once its roster event supplies one.
+    A field the Backend never supplied is absent, not zero: ``tool_count``,
+    ``context_tokens`` or ``subagents`` of ``None`` drops that field entirely rather
+    than asserting a zero that reads as a fact (register G4/G5). A genuine count of
+    zero -- a Backend that reported an empty subagent roster -- still renders, so the
+    two are not conflated. OpenCode emits no subagent roster, so its status line
+    simply carries no subagent field, while a Claude run shows the count once its
+    roster event supplies one. The line is established when the Iteration opens, so
+    its very first paint is a bare Iteration and clock: a tool count of ``None`` is
+    what keeps that paint from opening on a ``0 tools`` no Backend has reported.
 
     One field answers "what is it doing", and the declared Stage is the better answer
     than the tool whenever there is one: it names where the Backend is in the
@@ -636,21 +673,23 @@ def render_status(
     activity = stage if stage and not stale else tool
     if activity:
         fields.append(activity)
-    fields.append(f"{tool_count} tool{'' if tool_count == 1 else 's'}")
+    if tool_count is not None:
+        fields.append(f"{tool_count} tool{'' if tool_count == 1 else 's'}")
     if context_tokens is not None:
         fields.append(f"context {context_tokens} tokens")
     if subagents is not None:
         fields.append(f"{subagents} subagent{'' if subagents == 1 else 's'}")
-    # Drop from the right (subagents first) until the prefixed line fits the window.
+    # Drop from the right (subagents first) until the prefixed line fits the window,
+    # measured in columns so a wide Stage label cannot push the line onto a second row.
     while len(fields) > 2 and width is not None and (
-        len(PREFIX) + len(STATUS_SEPARATOR.join(fields)) > width
+        display_width(PREFIX) + display_width(STATUS_SEPARATOR.join(fields)) > width
     ):
         fields.pop()
     text = PREFIX + STATUS_SEPARATOR.join(fields)
-    if width is not None and len(text) > width:
+    if width is not None and display_width(text) > width:
         # Even the Iteration and elapsed overflow a very narrow window: clip rather
         # than fold, so the line still occupies exactly one row.
-        text = text[:width]
+        text = _clip_columns(text, width)
     return text
 
 
@@ -861,22 +900,98 @@ def summarize_message(text: str) -> str:
     return collapsed[: CONCLUDING_MESSAGE_LIMIT - len(ELLIPSIS)] + ELLIPSIS
 
 
+def _char_columns(char: str) -> int:
+    """How many terminal columns one codepoint occupies.
+
+    Deliberately not grapheme-correct, and it does not pretend to be: it answers for
+    codepoints, so a base character followed by two combining marks measures right
+    while an emoji ZWJ sequence -- several wide codepoints a terminal may draw as one
+    glyph -- measures wide. Both are the standard-library answer, which is the whole
+    of what is available without a runtime dependency, and the failure it leaves is
+    over-measuring (a line shortened sooner than it had to be) rather than the
+    under-measuring that wraps a header or leaves erase residue on the screen."""
+    if unicodedata.category(char) in ("Mn", "Me", "Cc", "Cf"):
+        # A combining mark composes onto the character before it and takes no column
+        # of its own; a control or format codepoint is not a column at all. Backend
+        # text has already lost the latter at ``neutralise``, and Ralph writes none.
+        return 0
+    # ``W`` and ``F`` are the two East Asian classes that are unambiguously double
+    # width. ``A`` (ambiguous) covers the box-drawing characters the Iteration rule
+    # is built from and the middle dot the status line separates fields with, and is
+    # single width in a terminal at its default settings, which is the only guess
+    # available here and the one that leaves Ralph's own chrome measured as it is.
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def display_width(text: str) -> int:
+    """How many terminal columns *text* occupies -- the one measurement of what fits
+    the window, shared by ``fit_line``, ``render_status`` and the status line's erase,
+    so a header fact, a status line, and the spaces that erase it can never disagree
+    about how wide the same string is. (``summarize_message`` measures characters, not
+    columns, on purpose: it caps how much of a message is quoted, and what it returns
+    is fitted here afterwards.)
+
+    Codepoint count is not column count: a path of CJK directory names counts 34
+    codepoints and occupies about 50 columns, which is how a header fact register G3
+    pins as fitted-never-folded came to wrap. See ``_char_columns`` for what this
+    measures and what it does not."""
+    return sum(_char_columns(char) for char in text)
+
+
+def _fitting_length(text: str, columns: int, *, from_end: bool) -> int:
+    """How many characters taken from one end of *text* fit *columns*. A double-width
+    character that would straddle the last column is not taken rather than half-drawn,
+    so the answer may be one column short of the budget."""
+    if columns <= 0:
+        return 0
+    total = 0
+    for taken, char in enumerate(reversed(text) if from_end else text):
+        total += _char_columns(char)
+        if total > columns:
+            return taken
+    return len(text)
+
+
+def _clip_columns(text: str, columns: int) -> str:
+    """The longest prefix of *text* that fits *columns*, never a codepoint's worth
+    over."""
+    return text[: _fitting_length(text, columns, from_end=False)]
+
+
+def _clip_columns_tail(text: str, columns: int) -> str:
+    """The longest *suffix* of *text* that fits *columns* -- the informative end of a
+    path, where the leading directories are what can be spared.
+
+    A suffix never opens on a zero-width codepoint: a combining mark belongs to the
+    character it composes onto, and one whose base did not survive would compose onto
+    the last dot of the ellipsis in front of it instead."""
+    tail = text[len(text) - _fitting_length(text, columns, from_end=True) :]
+    start = 0
+    while start < len(tail) and _char_columns(tail[start]) == 0:
+        start += 1
+    return tail[start:]
+
+
 def fit_line(prefix: str, value: str, width: int | None, *, keep_tail: bool) -> tuple[str, str]:
     """Shorten *value* so ``prefix + value`` occupies at most *width* columns.
 
     A stream with no width (anything that is not a terminal) is returned
     untouched. ``keep_tail`` preserves the informative end of a path — the run id,
-    the file name — where the leading directories are what can be spared."""
-    if width is None or len(prefix) + len(value) <= width:
+    the file name — where the leading directories are what can be spared.
+
+    Columns, not codepoints (``display_width``): the fields most likely to hold a
+    wide character are the paths, and they are the ones fitted tail-first."""
+    if width is None or display_width(prefix) + display_width(value) <= width:
         return prefix, value
-    budget = width - len(prefix)
-    if budget < len(ELLIPSIS) + 1:
+    budget = width - display_width(prefix)
+    marker = display_width(ELLIPSIS)
+    if budget < marker + 1:
         # Narrower than the prefix can usefully carry: the line degrades to the
         # prefix alone, itself clipped, rather than folding onto a second row.
-        return prefix[:width], ""
+        return _clip_columns(prefix, width), ""
     if keep_tail:
-        return prefix, ELLIPSIS + value[-(budget - len(ELLIPSIS)):]
-    return prefix, value[: budget - len(ELLIPSIS)] + ELLIPSIS
+        return prefix, ELLIPSIS + _clip_columns_tail(value, budget - marker)
+    return prefix, _clip_columns(value, budget - marker) + ELLIPSIS
 
 
 class StreamRunConsole:
@@ -908,9 +1023,9 @@ class StreamRunConsole:
         # go through one re-entrant lock so a repaint never interleaves with a line.
         self._lock = threading.RLock()
         # The status line's live state, reset each Iteration. ``_active`` spans an
-        # Iteration; ``_established`` turns on with the first Observation, gating the
-        # very first paint so an Iteration that emits none never shows one;
-        # ``_painted`` records whether an in-place status currently sits at the cursor.
+        # Iteration; ``_established`` turns on when the Iteration opens, so its clock
+        # runs whether or not the Backend ever reports anything; ``_painted`` records
+        # whether an in-place status currently sits at the cursor.
         self._status_active = False
         self._status_established = False
         self._status_painted = False
@@ -918,7 +1033,10 @@ class StreamRunConsole:
         self._iteration = 0
         self._iterations = 0
         self._tool: str | None = None
-        self._tool_count = 0
+        # ``None`` until the Backend names a tool: the line is established when the
+        # Iteration opens, and a count no Backend has reported yet is absent rather
+        # than a ``0 tools`` that reads as a fact (register G4/G5).
+        self._tool_count: int | None = None
         # The Stage the Backend last declared and when, so the status line can stop
         # asserting it once it goes stale and fall back to the tool (register G6).
         self._stage: str | None = None
@@ -946,7 +1064,7 @@ class StreamRunConsole:
                 self._establish_locked()
             elif isinstance(observation, ToolObserved):
                 self._tool = observation.name
-                self._tool_count += 1
+                self._tool_count = 1 if self._tool_count is None else self._tool_count + 1
                 self._establish_locked()
             elif isinstance(observation, ContextObserved):
                 self._context = observation.tokens
@@ -1066,8 +1184,9 @@ class StreamRunConsole:
 
     def iteration_started(self, number: int, iterations: int) -> None:
         # Open the Iteration's status lifecycle: reset the fields and start the
-        # elapsed clock. The status line itself is not painted until the first
-        # Observation establishes it, so an Iteration that emits none never shows one.
+        # elapsed clock. The line is established here rather than by the first
+        # Observation, so the clock ticks from zero for an Iteration a Backend
+        # reports nothing about (register G3, US7); only its fields wait for facts.
         self._begin_iteration(number, iterations)
         if self._quiet:
             # Quiet drops the Iteration blocks and the status line, and nothing else:
@@ -1080,12 +1199,19 @@ class StreamRunConsole:
         width = self._width()
         if width is None:
             self._message("chrome", f"iteration {number} of {iterations}")
-            return
-        opener = f"{PREFIX}── iteration {number} of {iterations} "
-        # Fill to the window on a terminal, but never past it: a rule wider than the
-        # window is clipped rather than folded onto a second row (register G3).
-        line = opener[:width] if width < len(opener) else opener + "─" * (width - len(opener))
-        self._paint("", "chrome", redact(line), "chrome")
+        else:
+            opener = f"{PREFIX}── iteration {number} of {iterations} "
+            # Fill to the window on a terminal, but never past it: a rule wider than
+            # the window is clipped rather than folded onto a second row (register G3).
+            fill = width - display_width(opener)
+            line = _clip_columns(opener, width) if fill < 0 else opener + "─" * fill
+            self._paint("", "chrome", redact(line), "chrome")
+        # Established after the rule, so the first paint lands under the Iteration it
+        # belongs to rather than being erased and redrawn around it. On both paths,
+        # because off a terminal the same lifecycle drives the append-only heartbeat,
+        # and that log's only liveness signal is no less owed (register G3/G11).
+        with self._lock:
+            self._establish_locked()
 
     def trust_boundary_established(self, properties: list[str]) -> None:
         # Printed where its proof completes — after the first Iteration's preflight —
@@ -1120,12 +1246,7 @@ class StreamRunConsole:
         # session), so stop the ticker and erase any painted status here too before
         # the summary prints.
         self._finalize()
-        # Ring the bell on a terminal only, so an operator who walked away is called
-        # back on every terminal outcome and a piped log carries no control character.
-        if self._is_terminal():
-            with self._lock:
-                self._stream.write(BELL)
-                self._stream.flush()
+        self._ring_bell()
         self._fact(
             "outcome", OUTCOME_HEADLINES.get(summary.outcome, f"run ended: {summary.outcome}")
         )
@@ -1213,8 +1334,28 @@ class StreamRunConsole:
         )
 
     def failed(self, message: str) -> None:
+        """The one-line failure: an argument or precondition that stopped the run
+        before a run directory existed, so there is no evidence path to point at and
+        no help block to print (register G10).
+
+        It rings the bell like any other terminal outcome (register G12). The
+        counter-argument -- nobody walks away from a run that failed at invocation --
+        does not cover the path: the same handler carries a ``RalphError`` raised from
+        the git context, the prompt, the worktree lock, and a failed ``resume``
+        handover, and an operator can be away for any of those."""
         self._finalize()
+        self._ring_bell()
         self._message("failure", message)
+
+    def _ring_bell(self) -> None:
+        # On a terminal only, so an operator who walked away is called back on every
+        # terminal outcome and a piped log carries no control character (register
+        # G12). It occupies no column, so no width measurement counts it.
+        if not self._is_terminal():
+            return
+        with self._lock:
+            self._stream.write(BELL)
+            self._stream.flush()
 
     def _fact(self, label: str, value: str, *, keep_tail: bool = False) -> None:
         """One header fact, fitted to the window. The label rides in the chrome, so
@@ -1374,7 +1515,7 @@ class StreamRunConsole:
             self._iteration = number
             self._iterations = iterations
             self._tool = None
-            self._tool_count = 0
+            self._tool_count = None
             self._stage = None
             self._stage_at = None
             self._context = None
@@ -1382,8 +1523,13 @@ class StreamRunConsole:
             self._iteration_start = time.monotonic()
 
     def _establish_locked(self) -> None:
-        # The first Observation of an Iteration turns the status line on and starts
-        # the ticker that keeps its clock moving; later Observations only repaint it.
+        # Opening the Iteration turns the status line on and starts the ticker that
+        # keeps its clock moving; every Observation after that only repaints it. The
+        # line is established before any Observation on purpose: an Iteration a
+        # Backend reports nothing about otherwise had no clock and no heartbeat for
+        # its whole duration -- no liveness signal at all, which is a third state
+        # beside running and stalled that US7 does not account for. What waits for
+        # facts is the fields, not the clock (register G4/G5).
         # Quiet establishes nothing: with no status line there is no clock to keep
         # moving and no heartbeat to append, so the ticker never starts (register G11).
         if self._quiet:
@@ -1411,7 +1557,11 @@ class StreamRunConsole:
         if stop is not None:
             stop.set()
         if thread is not None:
-            thread.join(timeout=2)
+            # Bounded, and safe to give up on: clearing ``_ticker_stop`` above is what
+            # a ticker still in flight reads as "you have been superseded", so one
+            # that outlives this wait retires instead of repainting alongside the next
+            # Iteration's own ticker.
+            thread.join(timeout=TICKER_JOIN_SECONDS)
 
     def _start_ticker_locked(self) -> None:
         if self._ticker_thread is not None:
@@ -1425,16 +1575,26 @@ class StreamRunConsole:
     def _run_ticker(self, stop: threading.Event) -> None:
         while not stop.wait(STATUS_TICK_SECONDS):
             try:
-                self._tick()
+                if not self._tick(stop):
+                    return
             except (ValueError, OSError):
                 # The stream was closed under us; stop rather than raising on a
                 # daemon thread the run no longer depends on.
                 return
 
-    def _tick(self) -> None:
+    def _tick(self, stop: threading.Event) -> bool:
+        """One repaint or heartbeat, and whether this ticker should keep going.
+
+        *stop* is the ticker's own identity: ``_finalize``'s bounded wait may give up
+        on a ticker that is still in flight, and the next Iteration then starts one of
+        its own. A ticker whose event the console no longer holds is that abandoned
+        one, so it paints nothing -- and is told to retire rather than left to notice
+        at its next wake, so the two never overlap even for one tick."""
         with self._lock:
+            if self._ticker_stop is not stop:
+                return False
             if not (self._status_active and self._status_established):
-                return
+                return True
             if self._is_terminal():
                 self._erase_status_locked()
                 self._paint_status_locked()
@@ -1448,6 +1608,7 @@ class StreamRunConsole:
                     self._last_heartbeat = now
                     self._stream.write(self._status_text() + "\n")
                     self._stream.flush()
+        return True
 
     def _status_text(self) -> str:
         """The status line, already through the redaction choke point (register G17).
@@ -1484,7 +1645,10 @@ class StreamRunConsole:
         if not (self._status_active and self._status_established and self._is_terminal()):
             return
         text = self._status_text()
-        self._painted_width = len(text)
+        # Columns, not codepoints: the erase overwrites this many spaces, so a wide
+        # character measured as one column would leave the tail of the line on the
+        # operator's screen under whatever printed next.
+        self._painted_width = display_width(text)
         painted = f"{PALETTE['chrome']}{text}{RESET}" if self._colour() else text
         self._stream.write("\r" + painted)
         self._status_painted = True

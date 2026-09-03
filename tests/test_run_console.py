@@ -16,7 +16,9 @@ import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -27,6 +29,7 @@ from ralph.console import (
     OPENCODE_AGENTS_DEVIATION,
     OUTCOME_HEADLINES,
     PALETTE,
+    PREFIX,
     STAGE_STALE_SECONDS,
     CleanOutcome,
     ContextObserved,
@@ -59,6 +62,33 @@ def without_ansi(text: str) -> str:
         start = text.index("\033[")
         text = text[:start] + text[text.index("m", start) + 1 :]
     return text.replace("\a", "")
+
+
+def columns_of(text: str) -> int:
+    """How many terminal columns *text* would occupy, measured here rather than with
+    the console's own width function so a test cannot agree with a bug in it. A wide
+    or fullwidth East Asian character takes two columns, a combining mark takes none,
+    and the bell and the palette take none because they are not columns at all."""
+    total = 0
+    for char in without_ansi(text):
+        if unicodedata.category(char) in ("Mn", "Me", "Cc", "Cf"):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return total
+
+
+def _painted_status_lines(out: str) -> list[str]:
+    """The in-place status paints in *out*, in the order they reached the terminal.
+
+    The status line is painted rather than written -- a carriage return, the line,
+    no newline -- so a row of the stream holds the paints, the runs of spaces that
+    erase them, and whatever printed in between. Each paint is one such segment."""
+    return [
+        segment
+        for segment in re.split(r"[\r\n]", out)
+        if without_ansi(segment).startswith(PREFIX + "iteration ")
+        and "·" in segment
+    ]
 
 
 def _settings(**overrides: object) -> RunSettings:
@@ -135,6 +165,27 @@ class TerminalConsoleTest(unittest.TestCase):
         # every header fact is still present as its own line.
         self.assertEqual(len(lines), len(self._render(columns=200)))
 
+    def test_a_wide_character_header_fact_is_shortened_rather_than_wrapped(self) -> None:
+        # Finding 11: width was measured in codepoints, so a path of CJK directory
+        # names counted 34 against a 40-column window while occupying about 50 --
+        # left unfitted and folded onto a second row, which register G3 pins the
+        # header against. Paths are exactly where non-ASCII turns up.
+        columns = 40
+        worktree = Path("/日本語のディレクトリ/プロジェクト")
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            lines = self._render(
+                columns=columns, worktree=worktree, prompt_path=worktree / "prompt.md"
+            )
+        for line in lines:
+            self.assertLessEqual(
+                columns_of(line), columns, f"{line!r} would wrap at {columns} columns"
+            )
+        # It was shortened, not dropped: the fact is still there, keeping the
+        # informative end of the path (register J6).
+        worktree = next(line for line in lines if line.startswith("ralph: worktree"))
+        self.assertIn("...", worktree)
+        self.assertIn("プロジェクト", worktree)
+
     def test_a_dirty_worktree_is_warned_about_in_the_header(self) -> None:
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             clean = self._render()
@@ -185,6 +236,18 @@ class TerminalConsoleTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             shown = self._shown(80, lambda console: console.run_finished(summary))
         self.assertIn("\a", "".join(shown))
+
+    def test_a_failure_at_invocation_rings_the_bell(self) -> None:
+        # Finding 13: the one-line argument and precondition path was silent, while
+        # register G12 rings on every terminal outcome. The same path carries a
+        # RalphError raised from the git context, the prompt, the worktree lock, and
+        # a failed ``resume`` handover -- an operator can be away for any of those.
+        message = "iterations must be between 1 and 100"
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            shown = self._shown(80, lambda console: console.failed(message))
+        self.assertIn("\a", "".join(shown))
+        # The bell occupies no column and costs the failure none of its wording.
+        self.assertIn(f"ralph: {message}", [without_ansi(line) for line in shown])
 
     def test_the_status_line_repaints_in_place_carrying_the_progress_fields(self) -> None:
         # The whole point of the program on a real terminal: progress Observations
@@ -242,9 +305,9 @@ class TerminalConsoleTest(unittest.TestCase):
                     console.run_finished(summary),
                 ),
             )
-        for line in shown:
+        for row in re.split(r"[\r\n]", "\n".join(shown)):
             self.assertLessEqual(
-                len(without_ansi(line)), columns, f"{line!r} would wrap at {columns} columns"
+                columns_of(row), columns, f"{row!r} would wrap at {columns} columns"
             )
 
 
@@ -335,6 +398,15 @@ class PipedConsoleTest(unittest.TestCase):
         StreamRunConsole(stream).run_finished(self._summary())
         self.assertNotIn("\a", stream.getvalue())
         self.assertNotIn("\033", stream.getvalue())
+
+    def test_a_piped_failure_at_invocation_emits_no_bell(self) -> None:
+        # The other half of finding 13: the bell is a terminal signal, so the failure
+        # that gained one on a terminal gains none in a redirected log (register G12).
+        stream = io.StringIO()
+        StreamRunConsole(stream).failed("iterations must be between 1 and 100")
+        self.assertNotIn("\a", stream.getvalue())
+        self.assertNotIn("\033", stream.getvalue())
+        self.assertIn("ralph: iterations must be between 1 and 100", stream.getvalue())
 
     def test_a_branch_change_is_reported_in_the_summary(self) -> None:
         unchanged = self._lines(lambda console: console.run_finished(self._summary()))
@@ -749,9 +821,11 @@ class RunHeaderTest(RalphCliTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("\033[", result.stderr)
-        for line in result.stderr.split("\n"):
+        # A row ends at a carriage return as well as a newline: the status line
+        # repaints in place inside a row the surrounding block shares.
+        for row in re.split(r"[\r\n]", result.stderr):
             self.assertLessEqual(
-                len(without_ansi(line)), columns, f"{line!r} would wrap at {columns} columns"
+                columns_of(row), columns, f"{row!r} would wrap at {columns} columns"
             )
 
     def test_no_color_on_a_terminal_still_prints_the_header(self) -> None:
@@ -909,6 +983,35 @@ class StatusLineRenderTest(unittest.TestCase):
         self.assertIn("context 900 tokens", absent)
         zero = render_status(1, 1, 0.0, "Bash", 2, 900, 0, None)
         self.assertIn("0 subagents", zero)
+
+    def test_a_tool_count_no_backend_has_reported_is_dropped_not_shown_as_zero(
+        self,
+    ) -> None:
+        # The line is established when the Iteration opens, before any Observation,
+        # so its first paint must not open on a count nothing has reported. A tool
+        # count of ``None`` is absent for the same reason the roster's is (G4/G5),
+        # and the first tool the Backend names brings the field with it.
+        absent = render_status(3, 4, 12.0, None, None, None, None, 80)
+        self.assertEqual(absent, "ralph: iteration 3/4 · 12s")
+        self.assertIn("1 tool", render_status(3, 4, 12.0, "Bash", 1, None, None, 80))
+
+    def test_a_wide_field_is_measured_in_columns_not_codepoints(self) -> None:
+        # Finding 11 on the status line: a Stage declared in Japanese counts far
+        # fewer codepoints than the columns it draws, so measuring the former let the
+        # line run past the window it may never wrap out of (register G3).
+        stage = "実装しています"
+        for width in range(8, 60):
+            line = render_status(1, 4, 5.0, "Read", 2, 900, 1, width, stage=stage)
+            self.assertLessEqual(columns_of(line), width, f"width {width}: {line!r}")
+        # It is the columns that decide, not the characters: the stage survives only
+        # a window wide enough for the fourteen columns it draws, not the seven
+        # characters it is written in.
+        self.assertNotIn(
+            stage, render_status(1, 4, 5.0, "Read", 2, None, None, 34, stage=stage)
+        )
+        self.assertIn(
+            stage, render_status(1, 4, 5.0, "Read", 2, None, None, 42, stage=stage)
+        )
 
 
 class StatusLineStageTest(unittest.TestCase):
@@ -1162,6 +1265,119 @@ class TerminalStatusLineTest(unittest.TestCase):
             self.assertLessEqual(len(without_ansi(row)), 32, f"{row!r} would wrap")
         self.assertIn("iteration 1/4", out)
 
+    def test_the_erase_covers_exactly_the_columns_a_wide_line_painted(self) -> None:
+        # The other half of finding 11: the erase overwrites the painted characters
+        # with spaces, so counting codepoints instead of columns left the tail of a
+        # wide-character status line on the operator's screen under whatever printed
+        # next. Measured on a Stage the Backend declared in Japanese.
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 2)
+            console.observe(StageObserved("実装しています"))
+            console.observe(MarkerWithdrawn("Should I pick option A?"))
+            console.iteration_finished(
+                IterationOutcome(1, 2, 1.0, "incomplete", "ses_1", "Continuing.")
+            )
+
+        out = self._drive(say)
+        self.assertIn("実装しています", out)
+        # The stream is a sequence of "\r"-anchored segments: a paint, then the run of
+        # spaces that erases it. Every erase has to cover the columns of the paint it
+        # follows -- no fewer, or residue survives, and no more, or it eats the row.
+        segments = out.split("\r")
+        erases = [
+            (segments[index - 1], segment)
+            for index, segment in enumerate(segments)
+            if index and segment and not segment.strip()
+        ]
+        self.assertTrue(erases, f"expected the status line to be erased: {out!r}")
+        # Both halves of the criterion are present to be checked: the line the
+        # Iteration opens on is ASCII, and the one carrying the Stage is not.
+        measured = {(columns_of(painted), len(painted)) for painted, _ in erases}
+        self.assertTrue(
+            any(cols == chars for cols, chars in measured), f"no ASCII erase: {out!r}"
+        )
+        self.assertTrue(
+            any(cols > chars for cols, chars in measured), f"no wide erase: {out!r}"
+        )
+        for painted, blanks in erases:
+            self.assertEqual(
+                len(blanks),
+                columns_of(painted),
+                f"erasing {len(blanks)} columns of a {columns_of(painted)}-column "
+                f"line: {painted!r}",
+            )
+
+    def test_an_iteration_that_observes_nothing_still_shows_a_ticking_clock(self) -> None:
+        # Finding 15: the line was established by the first Observation, so an
+        # Iteration a Backend reported nothing for had no clock and no heartbeat for
+        # its whole duration -- a third state beside running and stalled that US7
+        # does not account for. The clock now ticks from zero and only the fields
+        # wait for facts.
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(3, 4)
+            time.sleep(1.2)
+            console.iteration_finished(
+                IterationOutcome(3, 4, 1.2, "incomplete", "ses_3", None)
+            )
+
+        with mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.05):
+            out = self._drive(say)
+        self.assertIn("iteration 3/4", out)
+        # It ticks: the same line was repainted with a later elapsed time.
+        self.assertIn("· 0s", out)
+        self.assertIn("· 1s", out)
+        # The fields a Backend never supplied stay absent rather than becoming zeros
+        # that read as facts (register G4/G5).
+        self.assertNotIn("tool", out)
+        self.assertNotIn("context", out)
+        self.assertNotIn("subagent", out)
+
+    def test_a_ticker_that_outlives_its_join_cannot_paint_beside_its_successor(
+        self,
+    ) -> None:
+        # Finding 16: ``_finalize`` forgot the ticker before its bounded join, so one
+        # that missed the window went on repainting alongside the next Iteration's
+        # own -- staged here the way that arrives, as a ticker still running with a
+        # stop event the console no longer owns. Staged rather than raced on purpose:
+        # a join can only miss its window when the ticker is stalled at a moment no
+        # test can pin down, and the successor's ticker is held asleep for the whole
+        # window below so anything reaching the stream came from the abandoned one.
+        # What is asserted is still only what lands on the terminal.
+        stream = _FakeTerminal()
+        size = os.terminal_size((80, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False), \
+                mock.patch("ralph.console.STATUS_TICK_SECONDS", 30.0):
+            console = StreamRunConsole(stream)
+            console.iteration_started(1, 2)
+            console.observe(ToolObserved("Bash"))
+            console.iteration_finished(
+                IterationOutcome(1, 2, 1.0, "incomplete", "ses_1", None)
+            )
+            # The successor: its own ticker is asleep for the whole window below, so
+            # anything that reaches the stream came from the abandoned one.
+            console.iteration_started(2, 2)
+            console.observe(ToolObserved("Read"))
+            settled = stream.getvalue()
+            orphan_stop = threading.Event()
+            with mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.01):
+                orphan = threading.Thread(
+                    target=console._run_ticker, args=(orphan_stop,), daemon=True
+                )
+                orphan.start()
+                try:
+                    orphan.join(timeout=2)
+                    retired = not orphan.is_alive()
+                    residue = stream.getvalue()[len(settled) :]
+                finally:
+                    orphan_stop.set()
+                    orphan.join(timeout=2)
+            console.iteration_finished(
+                IterationOutcome(2, 2, 1.0, "incomplete", "ses_2", None)
+            )
+        self.assertEqual(residue, "", "a superseded ticker repainted the status line")
+        self.assertTrue(retired, "a superseded ticker outlived the successor's start")
+
 
 class PipedProgressTest(unittest.TestCase):
     """Off a terminal there is no in-place line: the ticker degrades to slow
@@ -1195,19 +1411,31 @@ class PipedProgressTest(unittest.TestCase):
             out,
         )
 
-    def test_an_iteration_that_emits_no_observations_prints_no_status_line(self) -> None:
-        # An Iteration that emits nothing never paints a status line or a heartbeat,
-        # so a Backend that reports no progress leaves the piped log exactly as before.
+    def test_an_iteration_that_observes_nothing_still_appends_a_heartbeat(self) -> None:
+        # Finding 15 off a terminal: there is no line to repaint here, so the
+        # heartbeat *is* the liveness signal -- and an Iteration a Backend reported
+        # nothing about used to get none of those either, for its whole duration.
         stream = io.StringIO()
         console = StreamRunConsole(stream)
-        with mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.02):
+        with mock.patch("ralph.console.STATUS_TICK_SECONDS", 0.02), \
+                mock.patch("ralph.console.HEARTBEAT_SECONDS", 0.02):
             console.iteration_started(1, 1)
-            time.sleep(0.1)
+            time.sleep(0.2)
             console.iteration_finished(
-                IterationOutcome(1, 1, 1.0, "complete", "ses_1", "Done.")
+                IterationOutcome(1, 1, 1.0, "incomplete", "ses_1", None)
             )
         out = stream.getvalue()
-        self.assertNotIn("iteration 1/1 ·", out)
+        # Still append-only and still clean: no in-place repaint, no escape.
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\033", out)
+        heartbeats = [line for line in out.split("\n") if "iteration 1/1 ·" in line]
+        self.assertTrue(heartbeats, out)
+        for line in heartbeats:
+            # The clock, and none of the fields a Backend never supplied turned into
+            # zeros that read as facts (register G4/G5).
+            self.assertNotIn("tool", line)
+            self.assertNotIn("context", line)
+            self.assertNotIn("subagent", line)
 
 
 class BackendFeedTest(unittest.TestCase):
@@ -1616,13 +1844,12 @@ class BackendTextNeutralisationTest(unittest.TestCase):
             console.iteration_finished(
                 IterationOutcome(1, 4, 1.0, "complete", "ses_1", "Done.")
             )
-        out = stream.getvalue()
-        # The first painted status begins after the first carriage return and must
-        # occupy exactly one row of the window.
-        painted = out.split("\r")[1]
-        self.assertNotIn("\n", painted)
-        self.assertIn("Bash rm -rf /", painted)
-        self.assertLessEqual(len(painted), 60, f"{painted!r} would wrap")
+        painted = _painted_status_lines(stream.getvalue())
+        self.assertTrue(painted, "expected the status line to be painted")
+        for segment in painted:
+            self.assertNotIn("\n", segment)
+            self.assertLessEqual(columns_of(segment), 60, f"{segment!r} would wrap")
+        self.assertIn("Bash rm -rf /", painted[-1])
 
     def test_a_stage_label_with_a_newline_still_paints_one_row(self) -> None:
         stream = _FakeTerminal()
@@ -1635,9 +1862,12 @@ class BackendTextNeutralisationTest(unittest.TestCase):
             console.iteration_finished(
                 IterationOutcome(1, 4, 1.0, "complete", "ses_1", "Done.")
             )
-        painted = stream.getvalue().split("\r")[1]
-        self.assertNotIn("\033", painted)
-        self.assertIn("implementingthe fix", painted)
+        painted = _painted_status_lines(stream.getvalue())
+        self.assertTrue(painted, "expected the status line to be painted")
+        for segment in painted:
+            self.assertNotIn("\033", segment)
+            self.assertLessEqual(columns_of(segment), 60, f"{segment!r} would wrap")
+        self.assertIn("implementingthe fix", painted[-1])
 
     # (d) -- forging the banner's first-column anchors.
 

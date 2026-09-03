@@ -130,7 +130,12 @@ what it loses is the ability to move your cursor, ring your bell, paint itself i
 Ralph's colour, spill onto a second row, set your window title, or open a line of its
 own inside a block Ralph is speaking in. On a terminal a header line that does not fit the window is
 shortened — paths keep their informative end — rather than folded onto a second
-row. Truncation is display-only: no retained artifact loses content.
+row. Width is counted in the columns a terminal actually draws, not in characters, so
+a path of Japanese or Chinese directory names is shortened at the right point instead
+of quietly running past the edge of the window; the measurement is per-character, so
+an emoji that a terminal draws as one glyph may be counted as wider than it looks and
+shorten a line a little sooner than it had to be. Truncation is display-only: no
+retained artifact loses content.
 
 Each iteration opens with a rule naming its number and the budget, and closes
 with an outcome block giving its duration, outcome, session id, and the backend's
@@ -167,7 +172,11 @@ meanings whichever backend is running — so a four-hour run and a four-minute r
 occupy the same one line instead of filling your scrollback. A field the backend
 never reports is left absent rather than shown as a zero that reads as a fact: an
 OpenCode run, which has no subagents to report, simply carries no subagent count,
-and its context gauge is the input plus cache-read tokens it reports per step.
+and its context gauge is the input plus cache-read tokens it reports per step. The
+line appears as soon as the iteration opens, carrying just the iteration and the
+clock, and fills in as facts arrive — including the tool count, which is absent until
+the backend reaches for a tool. An iteration a backend says nothing about for twenty
+minutes is the one you most need a clock for, and it gets one.
 
 The field saying what the backend is doing prefers the stage it declared over the
 tool it last reached for, because the stage names where it is in *your* prompt —
@@ -218,8 +227,9 @@ Every run ends with a summary, on every terminal path
 including a successful one that used to exit in silence: it names the final
 branch, whether the worktree is clean, whether the branch's commits reached their
 upstream, and the run directory where the evidence lives. A terminal bell rings
-on every terminal outcome — completion, budget exhaustion, handoff, or error — so
-an unattended run calls you back; a piped log carries no bell.
+on every terminal outcome — completion, budget exhaustion, handoff, or error, and
+the one-line failures that stop a run before it starts among them — so an unattended
+run calls you back; a piped log carries no bell.
 
 Once a run directory exists, every way a run can stop gets the full help block, not
 one sentence. A question or a consuming stop prints the `RALPH NEEDS OPERATOR`

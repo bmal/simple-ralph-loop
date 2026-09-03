@@ -121,8 +121,13 @@ guarantee, the full help block every failure gets once a run directory exists (t
 `RALPH NEEDS OPERATOR` handoff, the backend-failure next step, and the budget-
 exhaustion continuation command), and the bell — and the rendering apparatus behind
 that small interface: the four-role palette, terminal and `NO_COLOR` detection,
-dynamic width, no-wrap truncation, and the single choke point every operator-facing
-string is redacted at. Text a Backend wrote is not text it renders unexamined: every
+dynamic width measured in display columns rather than codepoints, no-wrap truncation,
+and the single choke point every operator-facing string is redacted at. One width
+function serves the header, the status line and the run of spaces that erases it, so
+a wide-character path is shortened rather than folded and an erase covers exactly the
+columns it painted; it is `unicodedata` and nothing else, so it answers for
+codepoints and never claims grapheme correctness.
+Text a Backend wrote is not text it renders unexamined: every
 Backend-authored field is neutralised first — whitespace controls to a space, whole
 CSI and OSC sequences removed, remaining control and format codepoints dropped — and
 only then redacted, so a piped log carries no escape and no bell, no Backend text can
@@ -131,8 +136,14 @@ forges a first-column anchor inside the handoff banner, and a secret with a cont
 character spliced into it is rejoined before it is matched. The opt-in feed is held
 to a narrower form of the same rule: it keeps the Backend's own colour and
 indentation, which are what make a raw transcript worth asking for, and loses what
-would let it leave its row. It is the only module permitted to write to a terminal, now
-without exception — every emit site has migrated and the structural test enforces the
+would let it leave its row. Liveness is what the console owes an operator
+unconditionally: the status line is established when an Iteration opens rather than by
+its first Observation, so an Iteration a Backend reports nothing about still carries a
+ticking clock, with its unreported fields -- the tool count among them -- absent
+rather than shown as zeros; and the bell rings on every terminal outcome, the
+one-line failure at invocation included.
+It is the only module permitted to write to a terminal, now without exception —
+every emit site has migrated and the structural test enforces the
 rule with no allowlist — and `cli` is the only module that constructs one, choosing
 between its four renderings there and nowhere else. It owns two streams: the
 dashboard on standard error, and the opt-in Backend feed on standard output, so
