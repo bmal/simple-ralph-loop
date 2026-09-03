@@ -226,6 +226,17 @@ one sentence. A question or a consuming stop prints the `RALPH NEEDS OPERATOR`
 banner with the reason, the run id, the session to resume, the remaining budget, and
 the exact recovery commands. Budget exhaustion adds the command that continues the
 work — the same invocation with the budget restored — so you do not reconstruct it.
+Every recovery command is the run's own invocation again: every flag that changed
+what the run did comes back in every command that accepts it, so the continuation
+keeps the model, the timeout, the interactive-only label, the declared in-scope
+backends, and any relaxed guarantee you asked for, and the manual resume keeps the
+model, the in-scope backends and the relaxed guarantees. `ralph resume` enters one
+interactive session rather than looping, so it has no budget, no timer and no Loop
+protocol to label, and takes none of those three flags. `--verbose` and `--quiet` are
+the deliberate exception everywhere — they choose which stream renders what rather
+than what the run does, so a replayed command renders however you ask it to at the
+time. The budget is the only value not copied verbatim: a handoff offers what is left
+of it, and exhaustion restores all of it.
 A backend failure that leaves evidence behind names what failed and points you at the
 run directory to inspect, rather than dropping a bare line. Only argument and
 precondition failures, which happen before anything is on disk, stay one-liners. A

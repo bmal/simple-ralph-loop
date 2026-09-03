@@ -223,6 +223,19 @@ budget, proving that a denied read and a denied write actually fail — turning
 "we think it's sandboxed" into observed refusal.
 _Avoid_: sandbox check, smoke test
 
+**Recovery command**:
+The `ralph resume` or `ralph run` command Ralph prints for an operator to run
+next -- the handed-off session relaunched, or the work continued. Built from the
+run's own resolved invocation, so every flag that changed what the run did comes
+back in every recovery command whose subcommand accepts it and the operator
+reconstructs nothing. Only the budget differs (what a handoff left, or the whole
+of it restored after exhaustion). The display flags are absent from both by
+decision, because they choose what renders rather than what a run does; the
+budget, the timer and the interactive-only label are absent from the `ralph
+resume` command because one interactive session has nothing to spend, time out,
+or label.
+_Avoid_: resume line, continue line, replay command
+
 **Handed-off session**:
 A backend session that stopped the loop (question, timeout, interruption,
 failure) and is offered for manual `ralph resume` recovery under the same

@@ -59,6 +59,13 @@ Invariants:
   summary precedes it and rings the bell once per run (register G12), so the
   ``RALPH NEEDS OPERATOR`` block stays the last, most visible lines. Budget exhaustion
   gains the continuation command through ``console.budget_continue`` at the clean end.
+- The run's whole invocation is read once, into a ``launch.Invocation``, and every
+  recovery command the run can print is built from that one reading. The loop
+  decides only the budget a continuation is offered — what a handoff left, or the
+  whole of it restored after exhaustion — and never which flags a command carries,
+  so a handoff and budget exhaustion cannot disagree about the run they came from
+  (they did: the exhaustion command dropped ``--in-scope-backend``, and neither
+  carried ``--interactive-label``).
 - The loop holds a resolved ``Backend`` and drives it only through the Backend
   Protocol (here ``environment``, ``preflight``, and ``execute_iteration``); it never
   names a concrete backend, so it cannot tell the two apart (register E2, user story
@@ -69,9 +76,9 @@ Invariants:
   (register D7). That gate is silent; the loop states the relaxed guarantees loudly
   through ``console.deviation`` — the sandbox opt-out from the flag it holds, and an
   admitted agent vector from the ``Deviation`` ``preflight`` hands back (register
-  G7/G14). It threads ``args.unsafe_no_sandbox`` into the gate and the recovery
-  commands so recovery reproduces the opt-out, and governs nothing else about host
-  isolation.
+  G7/G14). It threads ``args.unsafe_no_sandbox`` into the gate, and the run's
+  ``Invocation`` carries it into the recovery commands so recovery reproduces the
+  opt-out; it governs nothing else about host isolation.
 - The concrete interactive-only children are resolved once per run, after the first
   iteration's preflight has proven the shared ``gh`` dependency and before that
   session spends budget: the loop asks ``gitcontext.interactive_only_issues`` for
@@ -151,6 +158,7 @@ from .errors import (
 from .gitcontext import command, interactive_only_issues, write_json
 from .launch import (
     CaffeinateAssertion,
+    Invocation,
     additional_in_scope,
     establish_sandbox,
     prepare_in_scope_state,
@@ -273,9 +281,7 @@ def close_iteration(
 def handoff_help(
     *,
     error: HandoffError | StartedIterationError,
-    args: argparse.Namespace,
-    worktree: Path,
-    prompt_path: Path,
+    invocation: Invocation,
     remaining: int,
     run_id: str,
 ) -> OperatorHelp:
@@ -283,43 +289,26 @@ def handoff_help(
     recovery commands the Launch chain produces (register G14). A ``HandoffError``
     carries a session to resume and an operator-facing detail; a ``StartedIterationError``
     consumed its slot with nothing to resume, so it omits both. The console words the
-    ``RALPH NEEDS OPERATOR`` block; this function never formats operator text."""
+    ``RALPH NEEDS OPERATOR`` block; this function never formats operator text.
+
+    Both commands come from the run's whole ``Invocation``, so a flag the operator
+    declared cannot go missing from one command while reaching the other -- which is
+    how ``--in-scope-backend`` came to be dropped from budget exhaustion alone. The
+    continuation is offered what the handoff left of the budget."""
     session_id = getattr(error, "session_id", None)
     detail = getattr(error, "detail", None)
     return OperatorHelp(
         reason=error.reason,
         run_id=run_id,
         remaining=remaining,
-        backend=args.backend,
+        backend=invocation.backend,
         session_id=session_id,
         detail=detail,
         resume_command=(
-            resume_command(
-                args.backend,
-                args.model,
-                worktree,
-                session_id,
-                args.unsafe_allow_agents,
-                args.unsafe_no_sandbox,
-                tuple(getattr(args, "in_scope_backend", None) or ()),
-            )
-            if session_id
-            else None
+            resume_command(invocation, session_id) if session_id else None
         ),
         continue_command=(
-            restart_command(
-                args.backend,
-                args.model,
-                worktree,
-                prompt_path,
-                remaining,
-                args.timeout,
-                args.unsafe_allow_agents,
-                args.unsafe_no_sandbox,
-                tuple(getattr(args, "in_scope_backend", None) or ()),
-            )
-            if remaining
-            else None
+            restart_command(invocation, remaining) if remaining else None
         ),
     )
 
@@ -366,7 +355,12 @@ def run_protected(
     console: RunConsole,
 ) -> int:
     env = backend.environment(args.model)
-    in_scope = tuple(getattr(args, "in_scope_backend", None) or ())
+    # The run's whole resolved invocation, read once here and handed to every
+    # recovery command the run can print. One reading means a handoff and budget
+    # exhaustion can never disagree about which flags the run had (findings 4 and
+    # 12 of #36's review were exactly that disagreement).
+    invocation = Invocation.of(args, worktree, prompt_path)
+    in_scope = invocation.in_scope
     # Redact subscription credentials from every readable and retained stream in
     # case backend output echoes an environment value. This precedes the header so
     # the Run console's choke point already has a live redactor to scrub through.
@@ -647,9 +641,7 @@ def run_protected(
         console.operator_help(
             handoff_help(
                 error=error,
-                args=args,
-                worktree=worktree,
-                prompt_path=prompt_path,
+                invocation=invocation,
                 remaining=args.iterations - number,
                 run_id=run_dir.name,
             )
@@ -712,16 +704,5 @@ def run_protected(
         # thing they do is run it again, so state the exact continuation command
         # (register G10). The Launch chain builds it from the run's own facts with the
         # full budget restored, so it is a fresh run rather than a zero-iteration one.
-        console.budget_continue(
-            restart_command(
-                args.backend,
-                args.model,
-                worktree,
-                prompt_path,
-                args.iterations,
-                args.timeout,
-                args.unsafe_allow_agents,
-                args.unsafe_no_sandbox,
-            )
-        )
+        console.budget_continue(restart_command(invocation, invocation.iterations))
     return 0 if outcome == "complete" else 1

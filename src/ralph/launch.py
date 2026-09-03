@@ -58,6 +58,14 @@ Invariants:
   recovery re-establishes the full Trust boundary rather than inheriting the
   operator's ambient environment; ``--unsafe-allow-agents`` is reproduced so resume
   re-proves the same relaxed boundary, and ``--session`` is placed last.
+- Both recovery commands are built from one ``Invocation`` -- the run's whole
+  resolved invocation -- and never from a per-flag argument list threaded through
+  each call site. Every ``ralph run`` flag that changes what a run does round-trips
+  into every recovery command whose subcommand accepts it; ``--verbose`` and
+  ``--quiet`` choose which stream renders what rather than what the run does, so
+  they are reproduced nowhere. The budget is the one value a caller passes
+  separately, because a handoff continues with what is left while budget exhaustion
+  restores the whole thing.
 - The loop-wide ``CaffeinateAssertion`` must cover the entire invocation: if it
   exits unexpectedly the sleep guarantee is gone, so ``ensure_alive`` fails closed
   and the loop stops at the next boundary rather than continuing unprotected. Which
@@ -67,8 +75,11 @@ Invariants:
   names, however long the assertion took to die, and only a loss found after one
   has begun is the mid-run one.
 
-Depends on / must not know: ``errors``. It must not know how the Loop schedules
-Iterations or how a Backend consumes the argv it helps build.
+Depends on / must not know: ``errors``, and the parsed command line ``cli`` produces,
+which ``Invocation.of`` reads once so that the mapping from a flag to the field it
+resolves into sits beside the mapping from that field back to the flag a recovery
+command prints. It must not know how the Loop schedules Iterations or how a Backend
+consumes the argv it helps build.
 
 See also: ``process`` (per-Iteration process control), ``loop`` (holds the
 CaffeinateAssertion and hands the run's facts to the Run console), the Backend
@@ -77,7 +88,9 @@ adapters (wrap their argv).
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Sequence
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shlex
@@ -557,84 +570,135 @@ def shell_command(args: list[str], worktree: Path) -> str:
     return f"cd {shlex.quote(str(worktree))} && {shlex.join(args)}"
 
 
-def resume_command(
-    backend: str,
-    model: str,
-    worktree: Path,
-    session_id: str,
-    allow_agents: bool = False,
-    no_sandbox: bool = False,
-    in_scope: Sequence[str] = (),
-) -> str:
+@dataclass(frozen=True)
+class Invocation:
+    """The whole resolved invocation a recovery command has to reproduce.
+
+    Both recovery commands are built from one of these rather than from a
+    positional argument list per call site, because the two defects this closes
+    (findings 4 and 12 of #36's review) were each one flag added to ``ralph run``
+    and then forgotten at one call site: ``--in-scope-backend`` reached
+    ``handoff_help`` but not budget exhaustion, and ``--interactive-label`` reached
+    neither. A run that continues without the credential lane or the interactive-only
+    label the operator declared is not the run they started, so the next flag has to
+    be impossible to forget rather than merely remembered.
+
+    Fixed schema: one field per ``ralph run`` flag that changes *what a run does*.
+    ``--verbose`` and ``--quiet`` are deliberately absent and are reproduced in no
+    recovery command: they choose which stream renders what, so replaying a command
+    without them replays the same run. Adding a flag to ``ralph run`` that changes
+    behaviour means adding a field here and emitting it below; the suite drives the
+    parser itself, so forgetting either half fails.
+
+    ``iterations`` is the budget the run was *given*, which is what budget exhaustion
+    restores. Which budget a continuation gets is the caller's decision and is passed
+    to ``restart_command`` explicitly, because a handoff continues with what is left
+    of that budget rather than with all of it."""
+
+    backend: str
+    model: str
+    worktree: Path
+    prompt_path: Path
+    iterations: int
+    timeout: float
+    interactive_label: str
+    allow_agents: bool = False
+    no_sandbox: bool = False
+    in_scope: tuple[str, ...] = ()
+
+    @classmethod
+    def of(
+        cls, args: argparse.Namespace, worktree: Path, prompt_path: Path
+    ) -> Invocation:
+        """The run's own settings, read once from the parsed command line. The
+        worktree and prompt path are passed resolved because ``cli`` resolves them
+        (a relative ``--worktree`` and a bare prompt name must both replay from
+        anywhere), and every other field is the value the run actually used --
+        ``model`` after the per-backend default is filled in, ``interactive_label``
+        after it is stripped."""
+        return cls(
+            backend=args.backend,
+            model=args.model,
+            worktree=worktree,
+            prompt_path=prompt_path,
+            iterations=args.iterations,
+            timeout=args.timeout,
+            interactive_label=args.interactive_label,
+            allow_agents=args.unsafe_allow_agents,
+            no_sandbox=args.unsafe_no_sandbox,
+            in_scope=tuple(args.in_scope_backend or ()),
+        )
+
+
+def _relaxed_boundary_arguments(invocation: Invocation) -> list[str]:
+    # The flags that relax a guarantee, shared by both recovery commands because
+    # both re-establish the identical boundary the run had. Each reproduces
+    # independently: the two unsafe flags are orthogonal (register D7), and without
+    # a declared in-scope backend the recovered session would be re-confined out of
+    # a lane the run deliberately opened, failing on the half of the work the
+    # operator came back to finish.
+    args: list[str] = []
+    if invocation.allow_agents:
+        args.append("--unsafe-allow-agents")
+    if invocation.no_sandbox:
+        args.append("--unsafe-no-sandbox")
+    for name in additional_in_scope(invocation.backend, invocation.in_scope):
+        args += ["--in-scope-backend", name]
+    return args
+
+
+def resume_command(invocation: Invocation, session_id: str) -> str:
     # A dedicated `ralph resume` re-establishes the full subscription trust
     # boundary (sanitized environment, per-session OAuth/routing proof, isolated
     # configuration, full-auto permissions, and caffeinate) before handing an
     # operator the interactive backend. A raw backend command would inherit the
     # operator's ambient environment and skip that proof, so recovery is routed
     # through Ralph itself. --session is placed last so callers can rely on it.
+    #
+    # `ralph resume` enters one interactive session rather than looping, so the
+    # budget, the timer and the Loop protocol's interactive-only label have nothing
+    # to act on and are not flags it accepts; every other run-affecting flag
+    # reproduces here.
     args = [
         "ralph",
         "resume",
         "--backend",
-        backend,
+        invocation.backend,
         "--model",
-        model,
+        invocation.model,
         "--worktree",
-        str(worktree),
+        str(invocation.worktree),
     ]
-    # Reproduce each relaxed check so the handoff re-establishes the identical
-    # boundary; the two unsafe flags are orthogonal and reproduce independently
-    # (register D7). Without --unsafe-allow-agents resume would refuse the very
-    # agents the run allowed; without --unsafe-no-sandbox it would re-confine a
-    # session the operator deliberately ran unconfined. --session stays last.
-    if allow_agents:
-        args.append("--unsafe-allow-agents")
-    if no_sandbox:
-        args.append("--unsafe-no-sandbox")
-    # Every declared in-scope backend reproduces too: without them the resumed
-    # session would re-confine a lane the run deliberately opened, and the
-    # handoff would fail on the half of its work the operator came back to finish.
-    for name in additional_in_scope(backend, in_scope):
-        args += ["--in-scope-backend", name]
+    args += _relaxed_boundary_arguments(invocation)
     args += ["--session", session_id]
-    return shell_command(args, worktree)
+    return shell_command(args, invocation.worktree)
 
 
-def restart_command(
-    backend: str,
-    model: str,
-    worktree: Path,
-    prompt_path: Path,
-    remaining: int,
-    timeout: float,
-    allow_agents: bool = False,
-    no_sandbox: bool = False,
-    in_scope: Sequence[str] = (),
-) -> str:
+def restart_command(invocation: Invocation, budget: int) -> str:
+    # The whole invocation again, with *budget* as the number of iterations the
+    # continuation is given: what a handoff left, or ``invocation.iterations`` again
+    # once exhaustion has spent it all. Every other flag is the run's own, so the
+    # command an operator is handed is the run they started rather than one
+    # reassembled from the flags anybody remembered.
     args = [
         "ralph",
         "run",
-        str(prompt_path),
+        str(invocation.prompt_path),
         "--backend",
-        backend,
+        invocation.backend,
         "--iterations",
-        str(remaining),
+        str(budget),
         "--model",
-        model,
+        invocation.model,
         "--worktree",
-        str(worktree),
+        str(invocation.worktree),
         "--timeout",
-        str(timeout),
+        str(invocation.timeout),
+        "--interactive-label",
+        invocation.interactive_label,
     ]
-    # Each unsafe flag reproduces independently so the continuation run re-proves
-    # the same relaxed boundary and nothing more (register D7).
-    if allow_agents:
-        args.append("--unsafe-allow-agents")
-    if no_sandbox:
-        args.append("--unsafe-no-sandbox")
-    for name in additional_in_scope(backend, in_scope):
-        args += ["--in-scope-backend", name]
-    return shell_command(args, worktree)
+    args += _relaxed_boundary_arguments(invocation)
+    return shell_command(args, invocation.worktree)
 
 
 def _startup_failure(code: int) -> RalphError:
