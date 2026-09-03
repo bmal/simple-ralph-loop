@@ -121,7 +121,14 @@ guarantee, a dirty worktree — is worth reading when it appears.
 
 Ralph writes its own lines to stderr, prefixed `ralph:` and coloured only when
 stderr is a terminal and `NO_COLOR` is unset, so a redirected log carries no
-escape sequences. On a terminal a header line that does not fit the window is
+escape sequences. Nor does the backend's own text: every string a backend authors —
+its concluding message, its session id, the tool and stage the status line names, the
+quotes in a warning, and the reason and question in the handoff block — has its
+escape sequences and control characters removed before it is shown. Nothing the
+backend said to *you* is dropped — no line goes missing and no message is shortened;
+what it loses is the ability to move your cursor, ring your bell, paint itself in
+Ralph's colour, spill onto a second row, set your window title, or open a line of its
+own inside a block Ralph is speaking in. On a terminal a header line that does not fit the window is
 shortened — paths keep their informative end — rather than folded onto a second
 row. Truncation is display-only: no retained artifact loses content.
 
@@ -170,8 +177,16 @@ are deliberately different streams: `ralph run … --verbose > feed.log` capture
 whole transcript to a file while you keep watching the dashboard on the terminal.
 Ralph paints nothing onto the feed: the speaker prefix is plain text and no colour is
 added, on a terminal or off it, so nothing Ralph put there can be read as its own
-voice. The backend's own text passes through as the backend wrote it, exactly as it
-did when the feed was the default view.
+voice. The backend's own text passes through nearly as the backend wrote it: its
+colour and its indentation survive, so a backend that colours its output or prints an
+indented code block reads on the feed the way it does in its own terminal. What does
+not survive is cursor motion, a carriage return, a window-title sequence — anything
+that would let a line leave its own row. Colour a backend opens and never closes is
+closed at the end of that line for the same reason. An un-redirected `--verbose` puts
+the feed on the same terminal as the dashboard, where any of those would own the
+screen just as well from here. One more thing outranks the backend's colour: if a
+line turns out to be hiding a credential behind its own escape sequences, that line is
+shown without them, so redaction still bites.
 
 `--quiet` is the other direction, for an unattended run: it drops the status line and
 the per-iteration blocks, and nothing else. The run header, the run summary, the

@@ -111,7 +111,16 @@ guarantee, the full help block every failure gets once a run directory exists (t
 exhaustion continuation command), and the bell — and the rendering apparatus behind
 that small interface: the four-role palette, terminal and `NO_COLOR` detection,
 dynamic width, no-wrap truncation, and the single choke point every operator-facing
-string is redacted at. It is the only module permitted to write to a terminal, now
+string is redacted at. Text a Backend wrote is not text it renders unexamined: every
+Backend-authored field is neutralised first — whitespace controls to a space, whole
+CSI and OSC sequences removed, remaining control and format codepoints dropped — and
+only then redacted, so a piped log carries no escape and no bell, no Backend text can
+erase or counterfeit Ralph's own lines, no field paints a second row, no newline
+forges a first-column anchor inside the handoff banner, and a secret with a control
+character spliced into it is rejoined before it is matched. The opt-in feed is held
+to a narrower form of the same rule: it keeps the Backend's own colour and
+indentation, which are what make a raw transcript worth asking for, and loses what
+would let it leave its row. It is the only module permitted to write to a terminal, now
 without exception — every emit site has migrated and the structural test enforces the
 rule with no allowlist — and `cli` is the only module that constructs one, choosing
 between its four renderings there and nowhere else. It owns two streams: the

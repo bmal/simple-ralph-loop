@@ -7,12 +7,26 @@ Invariants:
   is the concrete renderer and ``cli`` is the only module that constructs one
   (register G16). The Loop and the Backend adapters hand over value objects and
   plain facts and never construct operator-facing text (register G14).
+- Every string a *Backend* authored passes through ``neutralise`` before it is
+  redacted and rendered (register J1/J2). Text the Backend wrote is not text this
+  module may render unexamined: whitespace controls become one space, whole CSI and
+  OSC sequences go, and every remaining ``Cc``/``Cf`` codepoint goes -- so a piped log
+  really does carry no ANSI and no bell, a concluding message cannot scroll the
+  terminal up and erase the deviation warning above it, no field can paint a second
+  row, and no ``\\n`` can forge a first-column anchor inside the handoff banner. The
+  covered fields are the concluding message and session id, ``ToolObserved.name``,
+  ``StageObserved.label``, ``MarkerWithdrawn.quote``, ``UnmarkedQuestion.quote``,
+  ``KilledTask.task_id``, ``OperatorHelp.reason``/``.detail``/``.session_id``,
+  ``failure_help``'s reason, and the feed's speaker and text. Neutralisation runs
+  *before* redaction, never after, so a secret a Backend spliced a control character
+  into is rejoined and then matched -- the retained artifacts close the same evasion
+  through the matcher itself, not through this.
 - Every operator-facing string this module emits passes through ``redact`` (register
   G17): operator lines in ``_write``, and the status line in ``_status_text``, which
   redacts its two Backend-authored fields before the width fitting measures them so a
   placeholder can never be clipped back into a secret. The status line has its own
   choke point rather than sharing ``_write`` because it is painted, not written --
-  ``\r`` and spaces, no trailing newline -- but nothing reaches a stream without one
+  ``\\r`` and spaces, no trailing newline -- but nothing reaches a stream without one
   of the two. Retained
   artifacts keep their own redaction; console truncation is display-only and never
   reduces what is written to disk (register G18).
@@ -115,11 +129,15 @@ Invariants:
   prefix only ever lands at the start of a line; ``_finalize`` closes any line still
   open when the Iteration ends. Ralph paints no colour onto the feed at all, on a
   terminal or off it (register G12), so nothing Ralph writes there can be read as its
-  own voice; Backend text passes through as the Backend wrote it, exactly as it did
-  when the feed was the default view, and through the same redaction choke point
-  (register G17). A feed line erases and redraws the status line around itself exactly
-  as an operator line does, because an un-redirected ``--verbose`` puts both streams
-  on one terminal.
+  own voice; Backend text passes through the same redaction choke point as every
+  other operator-facing string (register G17), and through ``neutralise_feed``, which
+  keeps the Backend's own SGR colour and its tabs and removes everything else. That
+  narrows the verbatim pass-through the feed was given when the commentary left the
+  default view: a feed line erases and redraws the status line around itself, and an
+  un-redirected ``--verbose`` puts both streams on one terminal, so cursor motion or a
+  carriage return here owns the operator's screen and escapes the row its speaker
+  prefix names it on. Colour and indentation are what make the raw transcript worth
+  asking for and can do neither, so they are what stays.
 - *quiet* drops exactly the status line and the Iteration blocks (register G11). The
   header, the Trust boundary, the resolved children, the run summary, the deviation
   warnings, the mid-run warnings, and every failure block still print, so an
@@ -144,6 +162,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Protocol, TextIO
+import unicodedata
 
 from .redaction import redact
 
@@ -183,6 +202,25 @@ ELLIPSIS = "..."
 # The terminal bell, rung on every terminal outcome (register G12) — on a terminal
 # only, so a piped or redirected log never carries the control character.
 BELL = "\a"
+
+# The introducers a Backend-authored string is parsed against before it is rendered
+# (register J1). ``ESCAPE`` opens a seven-bit sequence; ``C1_CSI`` and ``C1_OSC`` are
+# the eight-bit single-codepoint equivalents a terminal obeys just as readily, and
+# which a check written against ``\033`` alone does not see at all.
+ESCAPE = "\033"
+C1_CSI = "\x9b"
+C1_OSC = "\x9d"
+STRING_TERMINATOR = "\x9c"
+
+# The whitespace controls, mapped to a single space *before* anything is removed, so
+# deleting a control can never fuse two words into one (register J1): a tool name
+# ``Bash\nrm -rf /`` becomes ``Bash rm -rf /``, never ``Bashrm -rf /``.
+WHITESPACE_CONTROLS = "\n\r\t\v\f"
+
+# Select Graphic Rendition: the one CSI the opt-in Backend feed keeps, identified by
+# its final byte. Colour is what makes a transcript a transcript; cursor motion is
+# what would let the Backend own the operator's screen.
+SGR_FINAL = "m"
 
 # The concluding message is truncated for display so a long final narration does not
 # fill the outcome block; the retained artifacts keep the whole of it (register G18).
@@ -357,7 +395,11 @@ class OperatorHelp:
     session to resume when one exists, the remaining budget, and the recovery commands
     the Launch chain produced. The Loop fills it with facts and pre-built commands; the
     console words the block and keeps its ``RALPH NEEDS OPERATOR`` vocabulary
-    byte-identical (register G14/G19)."""
+    byte-identical (register G14/G19). ``reason``, ``detail`` and ``session_id`` are
+    Backend-authored and are neutralised to one line each before the block is rendered
+    (register J1): the newlines a Backend put in them otherwise opened forged
+    ``manual resume:`` and ``continue Ralph:`` lines *above* the genuine ones, inside
+    the very block whose purpose is to hand the operator a command to run."""
 
     reason: str
     run_id: str
@@ -379,8 +421,12 @@ class StageObserved:
     through the Loop protocol (register G6). Never inferred from tool use: the stages
     live in the prompt, which Ralph snapshots but never reads, so a guess would
     confidently report the wrong one. ``label`` is the free text the protocol accepts,
-    already bounded and sanitized by the parser; the console redacts it like every
-    other operator-facing string and decides when it has gone stale."""
+    already bounded by the parser, which refuses outright a label carrying a control
+    character rather than repairing one. The console neutralises and redacts whatever
+    reaches its sink anyway (register J1/J2), because it must not know what any value
+    object it renders was computed from -- the guarantee is over its own inputs, not
+    over an upstream module staying careful. It decides when the Stage has gone
+    stale."""
 
     label: str
 
@@ -388,7 +434,10 @@ class StageObserved:
 @dataclass(frozen=True)
 class ToolObserved:
     """The orchestrator reached for a tool. ``name`` is the tool the status line
-    shows as the current or last tool, and each one increments the tool count."""
+    shows as the current or last tool, and each one increments the tool count. It is
+    Backend-authored, so the console neutralises it before rendering (register J1): a
+    name carrying a newline would otherwise paint a status line two rows tall, of
+    which the erase clears one."""
 
     name: str
 
@@ -419,7 +468,8 @@ class SubagentsObserved:
 class MarkerWithdrawn:
     """The Backend raised a needs-input marker in a message other than the one the
     Iteration was judged on, then spoke past it: a question it withdrew. ``quote`` is
-    the raw fragment; the console redacts, bounds, and words it (register G17/G19)."""
+    the raw fragment; the console neutralises, redacts, bounds, and words it -- in that
+    order (register J1/J2, G17/G19)."""
 
     quote: str
 
@@ -428,7 +478,8 @@ class MarkerWithdrawn:
 class UnmarkedQuestion:
     """The Backend's final message ended on an operator-directed question with no
     marker: a low-confidence signal the run warns on and continues past. ``quote`` is
-    the raw fragment the console redacts, bounds, and words (register G17/G19)."""
+    the raw fragment the console neutralises, redacts, bounds, and words -- in that
+    order (register J1/J2, G17/G19)."""
 
     quote: str
 
@@ -437,7 +488,8 @@ class UnmarkedQuestion:
 class KilledTask:
     """The Backend's runtime reported it killed a background task the Backend left
     running when it ended its turn. ``task_id`` is the CLI-generated identifier the
-    console names the abandoned task by, or ``None`` when the report carried none."""
+    console names the abandoned task by -- Backend-authored, so neutralised before it
+    is rendered (register J1) -- or ``None`` when the report carried none."""
 
     task_id: str | None
 
@@ -451,7 +503,9 @@ class Narrated:
     stay attributable instead of braiding into one. ``partial`` says the passage is
     a fragment of a message still streaming rather than a whole one, so the console
     holds the line open instead of ending it -- the difference between a Backend
-    that emits complete messages and one that emits deltas."""
+    that emits complete messages and one that emits deltas. ``text`` reaches the feed
+    through ``neutralise_feed``, which keeps the Backend's own colour and indentation
+    and removes what would let it leave its row."""
 
     text: str
     subagent: str | None = None
@@ -637,6 +691,140 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def _csi_end(text: str, start: int) -> tuple[int, str | None]:
+    """Where the CSI sequence whose parameter bytes begin at *start* ends, and the
+    final byte that named it.
+
+    A sequence with no final byte in the string is not a sequence: *start* is returned
+    with ``None`` so the caller drops the introducer alone. Consuming to the end of the
+    string instead would let one truncated escape swallow the rest of what the operator
+    was going to be told (register J6)."""
+    index = start
+    while index < len(text) and 0x30 <= ord(text[index]) <= 0x3F:
+        index += 1
+    while index < len(text) and 0x20 <= ord(text[index]) <= 0x2F:
+        index += 1
+    if index < len(text) and 0x40 <= ord(text[index]) <= 0x7E:
+        return index + 1, text[index]
+    return start, None
+
+
+def _osc_end(text: str, start: int) -> int | None:
+    """Where the OSC string whose payload begins at *start* ends -- at a bell, a string
+    terminator, or ``ESC \\`` -- or ``None`` when it is unterminated, for the same
+    reason ``_csi_end`` refuses a truncated sequence."""
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char in (BELL, STRING_TERMINATOR):
+            return index + 1
+        if char == ESCAPE and text[index + 1 : index + 2] == "\\":
+            return index + 2
+        index += 1
+    return None
+
+
+def _neutralise(text: str, *, feed: bool) -> str:
+    """The neutraliser both policies share (register J1).
+
+    Two passes, in the order the register fixes. The whitespace controls become a
+    single space first, so nothing removed afterwards can fuse the words they
+    separated. Then one walk takes whole CSI and OSC sequences -- the whole sequence, so
+    ``\\033[31mRED`` becomes ``RED`` and never the orphaned ``[31mRED``. Every remaining
+    ``Cc``/``Cf`` codepoint goes last, one codepoint at a time.
+
+    That last part is deliberately narrow: a lone ``ESC`` takes only itself, never the
+    character behind it, even though a terminal would read the pair as a two-character
+    escape. Eating that character would break a secret a Backend spliced an ``ESC``
+    into back into two fragments that ``redact`` cannot match -- which is the evasion
+    register J2 exists to close. Dropping the introducer alone already leaves the
+    sequence inert, and it leaves the secret whole for the matcher."""
+    if not text:
+        return text
+    text = "".join(
+        char if char == "\t" and feed else " " if char in WHITESPACE_CONTROLS else char
+        for char in text
+    )
+    kept: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == ESCAPE and text[index + 1 : index + 2] == "[":
+            end, final = _csi_end(text, index + 2)
+            if final is None:
+                index += 1
+                continue
+            if feed and final == SGR_FINAL:
+                kept.append(text[index:end])
+            index = end
+            continue
+        if char == C1_CSI:
+            # The eight-bit CSI is never kept, on either stream: a Backend that wants
+            # to colour its own feed has the seven-bit form, and this one is what a
+            # guard written against ``\033`` misses.
+            end, final = _csi_end(text, index + 1)
+            index = end if final is not None else index + 1
+            continue
+        if (char == ESCAPE and text[index + 1 : index + 2] == "]") or char == C1_OSC:
+            terminated = _osc_end(text, index + 2 if char == ESCAPE else index + 1)
+            index = terminated if terminated is not None else index + 1
+            continue
+        if char == "\t" and feed:
+            kept.append(char)
+            index += 1
+            continue
+        if unicodedata.category(char) in ("Cc", "Cf"):
+            index += 1
+            continue
+        kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
+def neutralise(text: str) -> str:
+    """Backend-authored text made safe to render to an operator (register J1): no
+    escape sequence, no bell, no format codepoint, and never more than one row.
+
+    This is the boundary ``protocol.extract_stage`` already drew for the Stage marker,
+    generalised to every other field a Backend authors that reaches the same terminal.
+    It runs *before* ``redact`` at each choke point (register J2), so a secret with a
+    control character spliced into it is rejoined and then matched. What it removes is
+    control of the terminal, not what the Backend said: no line is dropped and no
+    message is shortened (register J6). The one exception is an OSC payload -- a window
+    title, a clipboard write -- which is an instruction addressed to the terminal
+    rather than a word addressed to the operator, and goes with the sequence carrying
+    it."""
+    return _neutralise(text, feed=False)
+
+
+def neutralise_feed(text: str) -> str:
+    """The same neutraliser, relaxed for the opt-in ``--verbose`` feed: the Backend's
+    own SGR colour and its tabs survive, and nothing else does.
+
+    #42 passed the feed through verbatim and documented that; this narrows it. An
+    un-redirected ``--verbose`` puts the feed on the same terminal as the dashboard, so
+    a cursor-motion escape erases Ralph's own lines from here just as well as from a
+    concluding message, and a feed line carrying a newline or a carriage return escapes
+    the row its speaker prefix names it on. Colour and indentation are what make the
+    raw transcript worth asking for and cannot do either, so they stay.
+
+    Kept colour is closed at the end of the line. SGR is terminal state, not line
+    state: a Backend that opens ``\\033[8m`` and never resets it would otherwise
+    conceal every row that follows -- the next feed line, its own speaker prefix, and
+    Ralph's status line repainted around it. Closing the row is what makes "its colour
+    stays" mean the Backend's own line and not the operator's screen."""
+    kept = _neutralise(text, feed=True)
+    if ESCAPE not in kept:
+        return kept
+    # Only genuinely open colour is closed. A Backend that resets its own line is
+    # left byte-for-byte as it wrote it, which is the whole of what #42 protected.
+    last = kept[kept.rfind(ESCAPE) :]
+    final = last.find(SGR_FINAL)
+    closed = final >= 0 and last[: final + 1] in (RESET, f"{ESCAPE}[{SGR_FINAL}")
+    return kept if closed else kept + RESET
+
+
 def summarize_message(text: str) -> str:
     """Collapse a Backend concluding message to one line and cap its length for the
     outcome block. Display only: the caller never writes this back to disk, so the
@@ -745,7 +933,7 @@ class StreamRunConsole:
                     "warning",
                     "warning: the backend requested operator input earlier in the "
                     "session but its final message withdrew it; continuing to the next "
-                    f"iteration: {summarize_message(redact(observation.quote))}",
+                    f"iteration: {summarize_message(redact(neutralise(observation.quote)))}",
                 )
             elif isinstance(observation, UnmarkedQuestion):
                 self._message(
@@ -753,13 +941,13 @@ class StreamRunConsole:
                     "warning: final message ended on an unmarked operator-directed "
                     "question; continuing to the next iteration (no "
                     "<promise>NEEDS_INPUT</promise> marker and no question tool used): "
-                    f"{summarize_message(redact(observation.quote))}",
+                    f"{summarize_message(redact(neutralise(observation.quote)))}",
                 )
             elif isinstance(observation, (Narrated, ToolActivity, StepObserved)):
                 self._commentary(observation)
             elif isinstance(observation, KilledTask):
                 label = (
-                    f"task {observation.task_id}"
+                    f"task {neutralise(observation.task_id)}"
                     if observation.task_id
                     else "an unnamed background task"
                 )
@@ -886,16 +1074,20 @@ class StreamRunConsole:
         self._finalize()
         if self._quiet:
             return
-        session = outcome.session_id or "no session id"
+        session = neutralise(outcome.session_id) if outcome.session_id else "no session id"
         self._fact(
             f"iteration {outcome.number} of {outcome.iterations}",
             f"{outcome.outcome} in {format_duration(outcome.duration_seconds)}, "
             f"session {session}",
         )
         # The Backend's concluding message: the one utterance worth keeping, shown as
-        # Backend content (uncoloured) and truncated for display only.
-        if outcome.concluding_message and outcome.concluding_message.strip():
-            self._content(summarize_message(outcome.concluding_message))
+        # Backend content (uncoloured) and truncated for display only. Neutralised and
+        # then redacted before it is summarized (register J2), so the placeholder is
+        # what the display limit measures and a secret can never be clipped back into
+        # view -- the same order the two migrated warnings above use.
+        message = summarize_message(redact(neutralise(outcome.concluding_message or "")))
+        if message.strip():
+            self._content(message)
 
     def run_finished(self, summary: RunSummary) -> None:
         # A terminal path may arrive without an ``iteration_finished`` (a failure mid
@@ -949,12 +1141,12 @@ class StreamRunConsole:
         # OPERATOR``, ``reason:``, ``manual resume:``, and ``continue Ralph:`` are the
         # first-column anchors tooling and habits match on (register G19).
         self._line("failure", "========== RALPH NEEDS OPERATOR ==========")
-        self._line("failure", f"reason: {help.reason}")
+        self._line("failure", f"reason: {neutralise(help.reason)}")
         self._line("failure", f"ralph run: {help.run_id}")
         if help.session_id:
-            self._line("failure", f"{help.backend} session: {help.session_id}")
+            self._line("failure", f"{help.backend} session: {neutralise(help.session_id)}")
         if help.detail:
-            self._line("failure", f"question/error: {help.detail}")
+            self._line("failure", f"question/error: {neutralise(help.detail)}")
         if help.session_id and help.resume_command:
             # Without a session there is nothing to resume; the handoff still offers
             # the remaining-budget command so the loop can be continued.
@@ -987,7 +1179,7 @@ class StreamRunConsole:
         # existing stderr assertions on it still hold; the next step names the run
         # directory itself — the retained diagnostics, and the backend's stream when a
         # session got that far — so the block carries the evidence path on its own.
-        self._message("failure", reason)
+        self._message("failure", neutralise(reason))
         self._message(
             "chrome",
             f"next step: inspect the retained diagnostics under {run_dir}, then run "
@@ -1043,7 +1235,7 @@ class StreamRunConsole:
         that produced it (register G11)."""
         who = self._backend
         if subagent:
-            who = f"{who}{FEED_SUBAGENT_SEPARATOR}{subagent}"
+            who = f"{who}{FEED_SUBAGENT_SEPARATOR}{neutralise(subagent)}"
         return who + FEED_SPEAKER_DELIMITER
 
     def _commentary(self, observation: Narrated | ToolActivity | StepObserved) -> None:
@@ -1098,9 +1290,11 @@ class StreamRunConsole:
         # Ralph paints nothing onto the feed, on a terminal or off it (register G12):
         # the speaker prefix is plain text and no palette role is applied, so a
         # redirected transcript carries no ANSI of Ralph's own and nothing here can be
-        # read as Ralph's voice. Backend text is passed through as the Backend wrote
-        # it -- unchanged from when the feed was the default view -- through the same
-        # redaction choke point as every other operator-facing string (register G17).
+        # read as Ralph's voice. Backend text keeps its own colour and indentation and
+        # loses what would let it leave its row (``neutralise_feed``), and goes through
+        # the same redaction choke point as every other operator-facing string
+        # (register G17). The speaker is neutralised too: a subagent identifier is
+        # Backend-authored, and a newline in one would put the prefix mid-line.
         if self._feed is None:
             return
         with self._lock:
@@ -1110,7 +1304,17 @@ class StreamRunConsole:
             # of the painted status (register G3). Both calls are no-ops when nothing
             # is painted, so a redirected feed costs the dashboard nothing.
             self._erase_status_locked()
-            self._feed.write(redact(self._speaker(subagent) + text) + "\n")
+            # Redaction is a standing guarantee (register G17); the Backend's colour
+            # is a convenience. Keeping SGR means a credential spliced with one is not
+            # rejoined, so ``redact`` cannot match it -- and the retained-artifact
+            # matcher cannot either, because the surviving parameter bytes are
+            # printable, not control codepoints. A line whose secret only appears once
+            # the escapes go is therefore rendered without them.
+            body = neutralise_feed(text)
+            bare = neutralise(text)
+            if redact(bare) != bare:
+                body = bare
+            self._feed.write(redact(self._speaker(subagent) + body) + "\n")
             self._feed.flush()
             self._paint_status_locked()
 
@@ -1235,12 +1439,12 @@ class StreamRunConsole:
             self._iteration,
             self._iterations,
             elapsed,
-            redact(self._tool) if self._tool else None,
+            redact(neutralise(self._tool)) if self._tool else None,
             self._tool_count,
             self._context,
             self._subagents,
             self._width(),
-            stage=redact(self._stage) if self._stage else None,
+            stage=redact(neutralise(self._stage)) if self._stage else None,
             stage_age_seconds=(
                 time.monotonic() - self._stage_at if self._stage_at is not None else None
             ),

