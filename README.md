@@ -420,7 +420,12 @@ session, which could then never be asked to stop politely.
 
 Known subscription credentials, including `CLAUDE_CODE_OAUTH_TOKEN`, are
 redacted from readable progress and every retained diagnostic stream in case
-backend output echoes an environment value.
+backend output echoes an environment value. A backend cannot slip one past that by
+breaking it up: a credential is recognised across control and format characters
+spliced between its own characters — whether the stream carries the character itself
+or the JSON escape naming it — and the whole spliced run is replaced, so what lands
+on disk cannot be put back together. Nothing outside a recognised credential is
+touched, so a retained stream that holds none is exactly what the backend wrote.
 
 Runtime prompts, options, structured output, diagnostics, session checkpoints,
 and outcomes are retained under the selected worktree's resolved Git directory

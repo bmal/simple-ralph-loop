@@ -184,6 +184,21 @@ the one keychain carved out of the keychain denial because `gh` keeps its token
 there) and therefore cannot be protected by the sandbox.
 _Avoid_: allowed secret
 
+**Redaction**:
+The one matcher every printed line and every retained stream is scrubbed through
+before it leaves Ralph, so a Backend that echoes an In-scope credential back
+publishes `[redacted]` rather than the value. It is control-insensitive: a secret
+is recognised across the control and format codepoints a Backend splices between
+its characters, in either spelling a stream can hold them — the codepoint itself,
+or the JSON escape naming it — and the whole spliced span is replaced, so what
+lands on disk cannot be un-spliced. What that widens is what counts as a *match*,
+never what counts as a secret: a short value is still never redacted, and nothing
+outside a matched span changes, so a stream holding no credential is exactly what
+the Backend wrote. The Run console neutralises before it redacts, which closes the
+same evasion for the screen; this closes it for the evidence, which no amount of
+console work reaches.
+_Avoid_: masking, filtering, sanitising (the neutraliser's job, not this one)
+
 **Profile template**:
 The universal, operator-independent Seatbelt policy in tracked source (write
 allow-list, read deny-list). Ralph fills it with runtime absolute paths to
