@@ -16,7 +16,7 @@ isolation defends against accident, not malice — see [Safety](#safety).
 - macOS with `/usr/bin/caffeinate` and Python 3.11 or newer
 - Git and an authenticated `gh` CLI, with a GitHub `origin` and named branch
 - OpenCode 1.17.20 or newer, authenticated to OpenAI with ChatGPT OAuth only
-- Claude Code 2.1.208 or newer, authenticated to a Claude Pro or Max
+- Claude Code 2.1.280 or newer, authenticated to a Claude Pro or Max
   subscription through `claude.ai` or `CLAUDE_CODE_OAUTH_TOKEN`
 
 Run `opencode auth login` and choose OpenAI OAuth for ChatGPT. Run `claude` and
@@ -98,12 +98,12 @@ proves; each is default-off, independent of the others, announced loudly at
 launch, and reproduced into the recovery commands Ralph prints.
 
 OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
-`claude-opus-5`. Each run opens with a header stating the settings it
+`claude-opus-5-5`. Each run opens with a header stating the settings it
 resolved and the directory its evidence will be retained in, before any budget
 is spent:
 
 ```
-ralph: backend claude, model claude-opus-5
+ralph: backend claude, model claude-opus-5-5
 ralph: iterations 4, timeout 3600s
 ralph: repository example/project, branch main
 ralph: worktree /Users/you/code/project

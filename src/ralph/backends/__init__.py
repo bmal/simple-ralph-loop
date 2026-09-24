@@ -63,7 +63,7 @@ from . import claude, opencode
 
 
 DEFAULT_MODELS = {
-    "claude": "claude-opus-5",
+    "claude": "claude-opus-5-5",
     "opencode": "openai/gpt-5.6-sol",
 }
 

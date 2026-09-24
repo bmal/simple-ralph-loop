@@ -962,7 +962,7 @@ class InteractiveLabelTest(RalphCliTestCase):
     def test_resume_does_not_accept_the_interactive_label_option(self) -> None:
         result = self.resume_ralph(
             "claude",
-            "claude-opus-5",
+            "claude-opus-5-5",
             "claude-session-1",
             "--interactive-label",
             "owner-decides",

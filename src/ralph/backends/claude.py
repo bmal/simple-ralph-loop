@@ -203,14 +203,14 @@ if TYPE_CHECKING:
     from . import ObservationSink
 
 
-MIN_CLAUDE_VERSION = (2, 1, 208)
+MIN_CLAUDE_VERSION = (2, 1, 280)
 # Host locations consulted to detect MDM-managed Claude configuration. Both are
 # absolute system paths in production; dedicated test seams (see
 # claude_managed_root / claude_profiles_executable) let the suite isolate the
 # checks from real host state without weakening the production defaults.
 DEFAULT_CLAUDE_MANAGED_ROOT = "/Library/Application Support/ClaudeCode"
 DEFAULT_CLAUDE_PROFILES = "/usr/bin/profiles"
-# Built-in tool names a subscription Claude Code >= 2.1.208 session may report
+# Built-in tool names a subscription Claude Code >= 2.1.280 session may report
 # in its init event (observed against 2.1.224 and 2.1.281). MCP tools are namespaced
 # `mcp__server__tool` and plugin tools carry their own names, so anything
 # outside this set still fails the subset assertion closed. A Claude Code
@@ -454,7 +454,7 @@ def preflight(
     agent_deviation = reject_claude_customizations(worktree, allow_agents)
     version = command(["claude", "--version"], cwd=worktree, env=env).stdout
     if version_tuple(version, "Claude Code") < MIN_CLAUDE_VERSION:
-        raise RalphError("Claude Code 2.1.208 or newer is required")
+        raise RalphError("Claude Code 2.1.280 or newer is required")
     status_text = command(["claude", "auth", "status"], cwd=worktree, env=env).stdout
     try:
         status = json.loads(status_text)

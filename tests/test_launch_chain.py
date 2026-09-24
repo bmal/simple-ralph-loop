@@ -264,7 +264,7 @@ class RecoveryCommandReproductionTest(RalphCliTestCase):
 
     def test_handoff_reproduces_the_interactive_label(self) -> None:
         _resume, restart = self._handed_off(
-            "--iterations", "2", "--interactive-label", self.LABEL, model="claude-opus-5"
+            "--iterations", "2", "--interactive-label", self.LABEL, model="claude-opus-5-5"
         )
 
         self.assertIn(f"--interactive-label {self.LABEL}", restart)

@@ -630,7 +630,7 @@ class CleanAndResumeConsoleTest(unittest.TestCase):
     def _resume(self, **overrides: object) -> ResumeSettings:
         defaults: dict[str, object] = {
             "backend": "claude",
-            "model": "claude-opus-5",
+            "model": "claude-opus-5-5",
             "session_id": "claude-session-1",
             "host_isolated": True,
             "reproven": ("subscription-only authentication", "customization isolation"),
@@ -754,7 +754,7 @@ class CleanAndResumeConsoleTest(unittest.TestCase):
     def test_the_resume_header_names_the_session_and_what_was_reproven(self) -> None:
         joined = "\n".join(self._lines(lambda console: console.resume_started(self._resume())))
         self.assertIn("claude", joined)
-        self.assertIn("claude-opus-5", joined)
+        self.assertIn("claude-opus-5-5", joined)
         self.assertIn("claude-session-1", joined)
         self.assertIn("subscription-only authentication", joined)
         self.assertIn("customization isolation", joined)

@@ -51,7 +51,7 @@ class RunLoopTest(RalphCliTestCase):
 
         claude = self.run_ralph(backend="claude")
         self.assertEqual(claude.returncode, 0, claude.stderr)
-        self.assertIn("ralph: backend claude, model claude-opus-5", claude.stderr)
+        self.assertIn("ralph: backend claude, model claude-opus-5-5", claude.stderr)
 
         for path in self.calls.iterdir():
             path.unlink()
