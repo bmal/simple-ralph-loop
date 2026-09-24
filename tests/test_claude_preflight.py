@@ -304,6 +304,30 @@ class ClaudePreflightTest(RalphCliTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.calls / "claude").exists())
 
+    def test_claude_2_1_281_init_contract_is_accepted(self) -> None:
+        # The tools a real Claude Code 2.1.281 session reports under Ralph's
+        # settings. That release added `ArtifactComments` and `ArtifactData` to the
+        # built-in set and began loading two built-in plugins into every session;
+        # Ralph switches those off through --settings, so `plugins` stays empty.
+        event_lines = self._claude_events("<promise>COMPLETE</promise>").splitlines()
+        init = json.loads(event_lines[0])
+        init["tools"] = [
+            "Task", "Artifact", "ArtifactComments", "ArtifactData", "Bash",
+            "CronCreate", "CronDelete", "CronList", "DesignSync", "Edit",
+            "EnterWorktree", "ExitWorktree", "ListAgents", "Monitor", "NotebookEdit",
+            "PushNotification", "Read", "RemoteTrigger", "ReportFindings",
+            "ScheduleWakeup", "SendMessage", "Skill", "TaskStop", "ToolSearch",
+            "WebFetch", "WebSearch", "Workflow", "Write",
+        ]
+        init["claude_code_version"] = "2.1.281"
+        event_lines[0] = json.dumps(init)
+        result = self.run_ralph(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocation = (self.calls / "claude").read_text()
+        self.assertIn('"enabledPlugins":{"agents-md@builtin":false,"telemetry@builtin":false}', invocation)
+
     def test_api_key_sourced_claude_session_fails_closed(self) -> None:
         # Any reported API-key source means the session is metered, not
         # subscription OAuth; every such value must stop the run. "oauth" is

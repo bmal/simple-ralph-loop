@@ -211,7 +211,7 @@ MIN_CLAUDE_VERSION = (2, 1, 208)
 DEFAULT_CLAUDE_MANAGED_ROOT = "/Library/Application Support/ClaudeCode"
 DEFAULT_CLAUDE_PROFILES = "/usr/bin/profiles"
 # Built-in tool names a subscription Claude Code >= 2.1.208 session may report
-# in its init event (observed against 2.1.224). MCP tools are namespaced
+# in its init event (observed against 2.1.224 and 2.1.281). MCP tools are namespaced
 # `mcp__server__tool` and plugin tools carry their own names, so anything
 # outside this set still fails the subset assertion closed. A Claude Code
 # upgrade that ships a new built-in halts every run until its name is added
@@ -219,6 +219,8 @@ DEFAULT_CLAUDE_PROFILES = "/usr/bin/profiles"
 CLAUDE_BUILTIN_TOOLS = {
     "Agent",
     "Artifact",
+    "ArtifactComments",
+    "ArtifactData",
     "AskUserQuestion",
     "Bash",
     "CronCreate",
@@ -257,11 +259,16 @@ CLAUDE_BUILTIN_TOOLS = {
     "Workflow",
     "Write",
 }
+# Claude Code 2.1.281 loads two built-in plugins into every session and reports
+# them in the init event's `plugins`; switching them off here keeps that list
+# empty, so the no-plugins proof holds without admitting any plugin source.
+CLAUDE_BUILTIN_PLUGINS = ("agents-md@builtin", "telemetry@builtin")
 CLAUDE_SETTINGS = json.dumps(
     {
         "autoMemoryEnabled": False,
         "disableAllHooks": True,
         "disableClaudeAiConnectors": True,
+        "enabledPlugins": {plugin: False for plugin in CLAUDE_BUILTIN_PLUGINS},
     },
     separators=(",", ":"),
 )
