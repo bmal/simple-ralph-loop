@@ -176,7 +176,7 @@ class UnsafeNoSandboxResumeTest(RalphCliTestCase):
         return sorted(self._ralph_state().glob("resume/sandbox.sb"))
 
     def test_resume_is_sandboxed_identically_by_default(self) -> None:
-        result = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_9")
+        result = self.resume_ralph("opencode", "openai/gpt-6-sol", "ses_9")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         # The resume argv is wrapped: caffeinate -im sandbox-exec -f <profile> …
@@ -193,7 +193,7 @@ class UnsafeNoSandboxResumeTest(RalphCliTestCase):
 
     def test_resume_flag_disables_the_wrap_with_a_warning(self) -> None:
         result = self.resume_ralph(
-            "opencode", "openai/gpt-5.6-sol", "ses_9", "--unsafe-no-sandbox"
+            "opencode", "openai/gpt-6-sol", "ses_9", "--unsafe-no-sandbox"
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)

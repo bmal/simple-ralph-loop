@@ -129,7 +129,7 @@ class LoopProtocolTest(RalphCliTestCase):
         self.assertIn("iterations remaining: 2", result.stderr)
         self.assertIn("ralph resume --backend opencode", result.stderr)
         self.assertIn("--session ses_1", result.stderr)
-        self.assertIn("--model openai/gpt-5.6-sol", result.stderr)
+        self.assertIn("--model openai/gpt-6-sol", result.stderr)
         self.assertIn("--iterations 2", result.stderr)
         run_dir = next((self.repo / ".git" / "ralph" / "runs").iterdir())
         outcome = json.loads((run_dir / "outcome.json").read_text())

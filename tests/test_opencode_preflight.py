@@ -48,7 +48,7 @@ class OpencodePreflightTest(RalphCliTestCase):
     def test_opencode_validates_every_exported_assistant_route_and_records_fallback(self) -> None:
         alternate = self._export_messages(
             "Done",
-            [("openai", "gpt-5.6-sol"), ("anthropic", "claude-opus-5-5")],
+            [("openai", "gpt-6-sol"), ("anthropic", "claude-opus-5-5")],
         )
         rejected = self.run_ralph(env={"FAKE_EXPORT": alternate})
         self.assertEqual(rejected.returncode, 2)
@@ -58,7 +58,7 @@ class OpencodePreflightTest(RalphCliTestCase):
             path.unlink()
         fallback_export = self._export_messages(
             "Implemented.",
-            [("openai", "gpt-5.6-sol"), ("openai", "gpt-5.5-codex")],
+            [("openai", "gpt-6-sol"), ("openai", "gpt-5.5-codex")],
         )
         fallback = self.run_ralph(
             env={
@@ -91,7 +91,7 @@ class OpencodePreflightTest(RalphCliTestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         run_dir = sorted((self.repo / ".git" / "ralph" / "runs").iterdir())[-1]
         session = json.loads((run_dir / "session.json").read_text())
-        self.assertEqual(session["ralph_verification"]["initial_model"], "openai/gpt-5.6-sol")
+        self.assertEqual(session["ralph_verification"]["initial_model"], "openai/gpt-6-sol")
         self._assert_only_retained_artifacts(run_dir)
 
     def test_opencode_names_an_unparsable_export_apart_from_the_metadata_contract(self) -> None:
@@ -126,7 +126,7 @@ class OpencodePreflightTest(RalphCliTestCase):
                         "sessionID": "ses_1",
                         "role": "assistant",
                         "providerID": "openai",
-                        "modelID": "gpt-5.6-sol",
+                        "modelID": "gpt-6-sol",
                     }
                 },
             },
@@ -240,7 +240,7 @@ class OpencodePreflightTest(RalphCliTestCase):
         # Without the flag, resuming the agents configuration is refused before
         # the backend relaunches.
         refused = self.resume_ralph(
-            "opencode", "openai/gpt-5.6-sol", "ses_1", env={"FAKE_CONFIG": agents_config}
+            "opencode", "openai/gpt-6-sol", "ses_1", env={"FAKE_CONFIG": agents_config}
         )
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("OpenCode agents must be disabled", refused.stderr)
@@ -253,7 +253,7 @@ class OpencodePreflightTest(RalphCliTestCase):
         # warning, and the relaunch argv never carries the flag itself.
         allowed = self.resume_ralph(
             "opencode",
-            "openai/gpt-5.6-sol",
+            "openai/gpt-6-sol",
             "ses_1",
             "--unsafe-allow-agents",
             env={"FAKE_CONFIG": agents_config},

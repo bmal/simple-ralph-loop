@@ -31,7 +31,7 @@ class RunLoopTest(RalphCliTestCase):
         self.assertIn("<promise>COMPLETE</promise>", composed)
         self.assertIn("explicit completion conditions", composed)
         invocation = (self.calls / "opencode").read_text()
-        self.assertIn("run --model openai/gpt-5.6-sol --format json --auto", invocation)
+        self.assertIn("run --model openai/gpt-6-sol --format json --auto", invocation)
         self.assertIn("-im", (self.calls / "caffeinate").read_text())
         child_env = (self.calls / "env").read_text()
         self.assertIn("OPENCODE_DISABLE_AUTOUPDATE=true", child_env)
@@ -44,7 +44,7 @@ class RunLoopTest(RalphCliTestCase):
         # DEFAULT_MODELS rather than an explicit --model.
         opencode = self.run_ralph()
         self.assertEqual(opencode.returncode, 0, opencode.stderr)
-        self.assertIn("ralph: backend opencode, model openai/gpt-5.6-sol", opencode.stderr)
+        self.assertIn("ralph: backend opencode, model openai/gpt-6-sol", opencode.stderr)
 
         for path in self.calls.iterdir():
             path.unlink()

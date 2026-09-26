@@ -125,7 +125,7 @@ def _wrapped_step_finish(tokens: dict, part_id: str = "prt_ws", session: str = "
 class OpenCodeObservationExtractionTest(unittest.TestCase):
     def _feed(self, events: list[dict]) -> RecordingSink:
         sink = RecordingSink()
-        result = EventResult("openai/gpt-5.6-sol", sink)
+        result = EventResult("openai/gpt-6-sol", sink)
         for event in events:
             result.accept(event)
         return sink
@@ -344,7 +344,7 @@ class OpenCodeObservationExtractionTest(unittest.TestCase):
 
     def test_no_sink_is_a_no_op(self) -> None:
         # An accumulator with no sink still runs: the emits are silently dropped.
-        result = EventResult("openai/gpt-5.6-sol")
+        result = EventResult("openai/gpt-6-sol")
         result.accept(_tool_use("bash", "prt_1"))  # must not raise
         result.accept(_step_finish({"input": 1, "cache": {"read": 1}}))  # must not raise
 

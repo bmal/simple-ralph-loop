@@ -97,7 +97,7 @@ flags marked *relaxes a guarantee* are the only ones that weaken what Ralph
 proves; each is default-off, independent of the others, announced loudly at
 launch, and reproduced into the recovery commands Ralph prints.
 
-OpenCode defaults to `openai/gpt-5.6-sol`; Claude defaults to
+OpenCode defaults to `openai/gpt-6-sol`; Claude defaults to
 `claude-opus-5-5`. Each run opens with a header stating the settings it
 resolved and the directory its evidence will be retained in, before any budget
 is spent:

@@ -10,12 +10,12 @@ from harness import RalphCliTestCase
 
 class HandoffAndResumeTest(RalphCliTestCase):
     def test_resume_relaunches_sanitized_full_auto_backend(self) -> None:
-        opencode = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_9")
+        opencode = self.resume_ralph("opencode", "openai/gpt-6-sol", "ses_9")
         self.assertEqual(opencode.returncode, 0, opencode.stderr)
         resume_call = (self.calls / "opencode-resume").read_text()
         self.assertIn("--session ses_9", resume_call)
         self.assertIn("--auto", resume_call)
-        self.assertIn("--model openai/gpt-5.6-sol", resume_call)
+        self.assertIn("--model openai/gpt-6-sol", resume_call)
         self.assertIn(f"--dir {self.repo.resolve()}", resume_call)
         self.assertIn("-im", (self.calls / "caffeinate").read_text())
         resume_env = (self.calls / "opencode-resume-env").read_text()
@@ -56,10 +56,10 @@ class HandoffAndResumeTest(RalphCliTestCase):
         self.assertTrue((self.calls / "claude-resume").exists())
 
     def test_resume_says_host_isolation_is_not_enforced_when_it_is_not(self) -> None:
-        confined = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_9")
+        confined = self.resume_ralph("opencode", "openai/gpt-6-sol", "ses_9")
         self.assertEqual(confined.returncode, 0, confined.stderr)
         unconfined = self.resume_ralph(
-            "opencode", "openai/gpt-5.6-sol", "ses_9", "--unsafe-no-sandbox"
+            "opencode", "openai/gpt-6-sol", "ses_9", "--unsafe-no-sandbox"
         )
 
         self.assertEqual(unconfined.returncode, 0, unconfined.stderr)
@@ -72,7 +72,7 @@ class HandoffAndResumeTest(RalphCliTestCase):
     def test_resume_refuses_unsafe_recovery_environment(self) -> None:
         secret = "sk-live-secret-value"
         api = self.resume_ralph(
-            "opencode", "openai/gpt-5.6-sol", "ses_1", env={"OPENAI_API_KEY": secret}
+            "opencode", "openai/gpt-6-sol", "ses_1", env={"OPENAI_API_KEY": secret}
         )
         self.assertNotEqual(api.returncode, 0)
         self.assertIn("API credential", api.stderr)
@@ -83,7 +83,7 @@ class HandoffAndResumeTest(RalphCliTestCase):
             path.unlink()
         changed = self.resume_ralph(
             "opencode",
-            "openai/gpt-5.6-sol",
+            "openai/gpt-6-sol",
             "ses_1",
             env={"FAKE_AUTH": "OpenAI oauth\nAnthropic api"},
         )
@@ -95,7 +95,7 @@ class HandoffAndResumeTest(RalphCliTestCase):
             path.unlink()
         plugin_dir = self.repo / ".opencode" / "plugin"
         plugin_dir.mkdir(parents=True)
-        plugin = self.resume_ralph("opencode", "openai/gpt-5.6-sol", "ses_1")
+        plugin = self.resume_ralph("opencode", "openai/gpt-6-sol", "ses_1")
         self.assertNotEqual(plugin.returncode, 0)
         self.assertIn("external plugins or custom tools", plugin.stderr)
         self.assertFalse((self.calls / "opencode-resume").exists())

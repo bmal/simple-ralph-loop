@@ -269,7 +269,7 @@ class RalphCliTestCase(unittest.TestCase):
                 fi
                 ;;
               "--pure debug config") printf '%s\\n' "${FAKE_CONFIG}" ;;
-              "--pure models openai") printf '%s\\n' "${FAKE_MODELS:-openai/gpt-5.6-sol}" ;;
+              "--pure models openai") printf '%s\\n' "${FAKE_MODELS:-openai/gpt-6-sol}" ;;
               "--pure export "*)
                 if test -n "${FAKE_RAW_EXPORT_FILE:-}"; then
                   cat "$FAKE_RAW_EXPORT_FILE"
@@ -452,7 +452,7 @@ class RalphCliTestCase(unittest.TestCase):
             """,
         )
 
-    def _events(self, text: str, model: str = "gpt-5.6-sol", session_id: str = "ses_1") -> str:
+    def _events(self, text: str, model: str = "gpt-6-sol", session_id: str = "ses_1") -> str:
         del model
         return json.dumps(
             {
@@ -469,7 +469,7 @@ class RalphCliTestCase(unittest.TestCase):
             }
         )
 
-    def _export(self, text: str, model: str = "gpt-5.6-sol", session_id: str = "ses_1") -> str:
+    def _export(self, text: str, model: str = "gpt-6-sol", session_id: str = "ses_1") -> str:
         return json.dumps(
             {
                 "info": {"id": session_id},
@@ -526,8 +526,8 @@ class RalphCliTestCase(unittest.TestCase):
     def _config(self, agents: dict | None = None) -> str:
         return json.dumps(
             {
-                "model": "openai/gpt-5.6-sol",
-                "small_model": "openai/gpt-5.6-sol",
+                "model": "openai/gpt-6-sol",
+                "small_model": "openai/gpt-6-sol",
                 "enabled_providers": ["openai"],
                 "provider": {"openai": {"options": {"timeout": False}}},
                 "mcp": {},

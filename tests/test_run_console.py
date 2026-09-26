@@ -96,7 +96,7 @@ def _painted_status_lines(out: str) -> list[str]:
 def _settings(**overrides: object) -> RunSettings:
     defaults: dict[str, object] = {
         "backend": "opencode",
-        "model": "openai/gpt-5.6-sol",
+        "model": "openai/gpt-6-sol",
         "iterations": 4,
         "timeout": 3600.0,
         "repository": "example/project",
@@ -143,14 +143,14 @@ class TerminalConsoleTest(unittest.TestCase):
         )
         # The same facts, unchanged, once the escapes are removed.
         self.assertIn(
-            "ralph: backend opencode, model openai/gpt-5.6-sol", self._plain(terminal)
+            "ralph: backend opencode, model openai/gpt-6-sol", self._plain(terminal)
         )
 
     def test_no_color_suppresses_the_palette_on_a_terminal(self) -> None:
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             lines = self._render()
         self.assertNotIn("\033[", "".join(lines))
-        self.assertIn("ralph: backend opencode, model openai/gpt-5.6-sol", lines)
+        self.assertIn("ralph: backend opencode, model openai/gpt-6-sol", lines)
 
     def test_a_narrow_terminal_shortens_fields_instead_of_wrapping(self) -> None:
         columns = 48
@@ -825,7 +825,7 @@ class RunHeaderTest(RalphCliTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         run_dir = next((self.repo.resolve() / ".git" / "ralph" / "runs").iterdir())
         for expected in (
-            "ralph: backend opencode, model openai/gpt-5.6-sol",
+            "ralph: backend opencode, model openai/gpt-6-sol",
             "ralph: iterations 3, timeout 900s",
             "ralph: repository example/project, branch main",
             f"ralph: worktree {self.repo.resolve()}",
@@ -894,7 +894,7 @@ class RunHeaderTest(RalphCliTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("\033", result.stderr)
-        self.assertIn("ralph: backend opencode, model openai/gpt-5.6-sol", result.stderr)
+        self.assertIn("ralph: backend opencode, model openai/gpt-6-sol", result.stderr)
 
 
 class BackendFeedRunTest(RalphCliTestCase):
