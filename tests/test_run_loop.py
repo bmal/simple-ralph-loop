@@ -198,14 +198,14 @@ class RunLoopTest(RalphCliTestCase):
 
         for path in self.calls.iterdir():
             path.unlink()
-        hooks = self.repo / ".claude" / "hooks"
+        plugins = self.repo / ".claude" / "plugins"
         claude = self.run_ralph(
             "--iterations",
             "2",
             backend="claude",
             env={
                 "FAKE_CLAUDE_EVENTS": self._claude_events("First child complete."),
-                "FAKE_CLAUDE_MUTATE_CUSTOMIZATION": str(hooks),
+                "FAKE_CLAUDE_MUTATE_CUSTOMIZATION": str(plugins),
             },
         )
         self.assertEqual(claude.returncode, 2)

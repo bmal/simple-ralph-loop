@@ -398,6 +398,19 @@ class RalphCliTestCase(unittest.TestCase):
                   trap 'printf INT >> "$FAKE_CALLS/claude-signals"' INT
                   trap 'printf TERM >> "$FAKE_CALLS/claude-signals"' TERM
                 fi
+                # FAKE_CLAUDE_RUN_HOOKS=before|after plays a Claude that ignored
+                # disableAllHooks: it runs every hook command in its --settings,
+                # before the stream (as SessionStart would) or after it (as Stop).
+                fake_settings=""
+                fake_prev=""
+                for fake_arg in "$@"; do
+                  if test "$fake_prev" = "--settings"; then fake_settings="$fake_arg"; fi
+                  fake_prev="$fake_arg"
+                done
+                fire_hooks() {
+                  printf '%s' "$fake_settings" | "$FAKE_PYTHON" -c 'import json, subprocess, sys; [subprocess.run(h["command"], shell=True, check=True) for gs in json.load(sys.stdin).get("hooks", {}).values() for g in gs for h in g["hooks"]]'
+                }
+                test "${FAKE_CLAUDE_RUN_HOOKS:-}" != "before" || fire_hooks
                 if test -n "${FAKE_CLAUDE_SEQUENCE_DIR:-}"; then
                   count_file="$FAKE_CALLS/claude-run-count"
                   count=0
@@ -411,6 +424,7 @@ class RalphCliTestCase(unittest.TestCase):
                   printf '%s\n' "${FAKE_CLAUDE_EVENTS}"
                 fi
                 env | sort > "$FAKE_CALLS/claude-env"
+                test "${FAKE_CLAUDE_RUN_HOOKS:-}" != "after" || fire_hooks
                 if test -n "${FAKE_CLAUDE_RAW_STDOUT_FILE:-}"; then
                   cat "$FAKE_CLAUDE_RAW_STDOUT_FILE"
                   exit 0
@@ -790,6 +804,8 @@ class RalphCliTestCase(unittest.TestCase):
                 "RALPH_CLAUDE_MANAGED_ROOT": str(self.managed_root),
                 "RALPH_CLAUDE_PROFILES": str(self.bin / "profiles"),
                 "FAKE_CALLS": str(self.calls),
+                # The interpreter the fake Claude runs its --settings hooks with.
+                "FAKE_PYTHON": sys.executable,
                 "FAKE_CONFIG": self._config(),
                 "FAKE_AUTH": "┌  Credentials ~/.local/share/opencode/auth.json\n│\n●  OpenAI oauth\n│\n└  1 credentials",
                 "FAKE_EVENTS": self._events("Work complete.\n<promise>COMPLETE</promise>"),

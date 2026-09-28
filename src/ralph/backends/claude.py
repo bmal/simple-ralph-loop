@@ -7,7 +7,10 @@ Invariants:
   metered key), ``bypassPermissions`` full-auto mode, no external MCP servers or
   plugins, a tool set that is a subset of ``CLAUDE_BUILTIN_TOOLS``, and the same
   session id — every time, so a longer stream is a stronger proof, not a weaker
-  one. Anything else fails closed. The session id is checkpointed on the first
+  one. Anything else fails closed. The init reports nothing about hooks, so hook
+  exclusion is proven by a canary instead: Ralph's own ``--settings`` register a
+  hook on every measured event beside ``disableAllHooks``, and a canary file
+  appearing at any init or at stream end fails closed (ADR-0002). The session id is checkpointed on the first
   init before the rest is validated so a later contract failure is still a
   resumable handoff. A *pre-result* init opens a turn on this proof; a *post-result*
   init passes the identical proof but opens no turn — it is teardown, not a new
@@ -132,8 +135,8 @@ Invariants:
   the Backend's own events pass); and, above, a ``background_tasks_changed`` bearing
   a foreign id, which cannot open the second-turn relaxation.
 - ``--unsafe-allow-agents`` relaxes only the agent vectors (``.claude/agents`` and
-  the settings ``agent`` key). Managed, server-managed, hooks, plugins, and every
-  other unsafe settings key stay refused and are checked *before* the local
+  the settings ``agent`` key). Managed, server-managed, plugins, and every other
+  unsafe settings key stay refused and are checked *before* the local
   customization gather, so the opt-out hint is advertised only when an agent vector
   is the sole blocker and never masquerades as a remedy for something it cannot fix.
 - A stop Ralph itself caused (timeout/interrupt) is classified *before* any contract
@@ -161,6 +164,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import threading
 from typing import Any, TYPE_CHECKING
@@ -263,16 +267,25 @@ CLAUDE_BUILTIN_TOOLS = {
 # them in the init event's `plugins`; switching them off here keeps that list
 # empty, so the no-plugins proof holds without admitting any plugin source.
 CLAUDE_BUILTIN_PLUGINS = ("agents-md@builtin", "telemetry@builtin")
-CLAUDE_SETTINGS = json.dumps(
-    {
-        "autoMemoryEnabled": False,
-        "disableAllHooks": True,
-        "disableClaudeAiConnectors": True,
-        "enabledPlugins": {plugin: False for plugin in CLAUDE_BUILTIN_PLUGINS},
-    },
-    separators=(",", ":"),
-)
-CLAUDE_CUSTOMIZATION_DIRS = ("agents", "hooks", "plugins")
+_CLAUDE_BASE_SETTINGS = {
+    "autoMemoryEnabled": False,
+    "disableAllHooks": True,
+    "disableClaudeAiConnectors": True,
+    "enabledPlugins": {plugin: False for plugin in CLAUDE_BUILTIN_PLUGINS},
+}
+CLAUDE_SETTINGS = json.dumps(_CLAUDE_BASE_SETTINGS, separators=(",", ":"))
+# Hook exclusion is proven, not assumed (ADR-0002). A repository may commit hooks
+# for the people who work in it, and Ralph admits them: `disableAllHooks` above
+# switches off every hook source for the session -- project settings, skill and
+# agent frontmatter -- as measured on Claude Code 2.1.283. The init event reports
+# nothing about hooks, so an Iteration's settings also register a canary on each
+# event that measurement exercised, each touching its own file in the
+# Iteration's run directory. Hooks switched off, the canary never fires; a file
+# appearing means the switch stopped working and the Iteration fails closed.
+CLAUDE_HOOK_CANARY_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+CLAUDE_HOOK_CANARY_DIR = "hook-canary"
+CLAUDE_HOOKS_FIRED = "Claude ran a hook although Ralph disabled hooks"
+CLAUDE_CUSTOMIZATION_DIRS = ("agents", "plugins")
 # Settings keys that, if present in `.claude/settings.json`, defeat the proof of
 # safe isolation. Only `agent` is relaxable via --unsafe-allow-agents.
 UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
@@ -284,14 +297,13 @@ UNSAFE_CLAUDE_SETTINGS_KEYS = frozenset(
         "enabledPlugins",
         "env",
         "extraKnownMarketplaces",
-        "hooks",
     }
 )
 CUSTOMIZATION_REFUSAL = "Claude customizations must be disabled before running Ralph"
 # Appended to the refusal only when a Claude agent vector — the `.claude/agents`
 # directory or the settings.json `agent` key — is the *sole* blocker, so the
 # operator can discover the supported opt-out from the failure itself. It is
-# withheld from every other refusal (a hooks/plugins directory, managed or
+# withheld from every other refusal (a plugins directory, managed or
 # server-managed configuration, or any other unsafe settings key, including when
 # `agent` appears alongside one) because the flag cannot relax those and must
 # never be advertised as a false remedy.
@@ -329,6 +341,38 @@ BACKGROUND_TASK_DIRECTIVE = (
     "on it) or cancel it and say what you left unverified, so the next iteration can "
     "pick it up deliberately."
 )
+
+
+def iteration_settings(canary: Path) -> str:
+    # The `--settings` an automated Iteration runs under: the base settings plus
+    # the hook canary, one file per event under `canary`. The command is an
+    # absolute `touch` with a quoted path, because a hook runs with the session's
+    # cwd and PATH and a relative marker would silently land nowhere.
+    settings: dict[str, Any] = dict(_CLAUDE_BASE_SETTINGS)
+    settings["hooks"] = {
+        event: [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/usr/bin/touch " + shlex.quote(str(canary / event)),
+                    }
+                ],
+            }
+        ]
+        for event in CLAUDE_HOOK_CANARY_EVENTS
+    }
+    return json.dumps(settings, separators=(",", ":"))
+
+
+def hooks_fired(canary: Path) -> bool:
+    # True when any canary hook left its file. A canary directory that has gone
+    # missing proves nothing either way, so it counts as fired: fail closed.
+    try:
+        return any(canary.iterdir())
+    except OSError:
+        return True
 
 
 def validate_model(model: str) -> None:
@@ -389,7 +433,7 @@ def reject_claude_customizations(worktree: Path, allow_agents: bool = False) -> 
     claude_dir = worktree / ".claude"
     # --unsafe-allow-agents relaxes only the agent vectors: the
     # `.claude/agents` directory and the settings.json `agent` key. It exists for
-    # repos whose loop develops or depends on subagents. Hooks, plugins, managed
+    # repos whose loop develops or depends on subagents. Plugins, managed
     # configuration, and every other unsafe setting stay refused, and runtime
     # MCP/plugin/tool isolation is still proven from the init event. The trade is
     # deliberate and unsafe: Ralph can no longer prove which subagents loaded, so
@@ -562,8 +606,17 @@ class ClaudeTurn:
 
 
 class ClaudeEventResult:
-    def __init__(self, model: str, observe: "ObservationSink | None" = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        observe: "ObservationSink | None" = None,
+        hook_canary: Path | None = None,
+    ) -> None:
         self.expected_model = model
+        # The Iteration's hook canary directory (ADR-0002), checked on every init
+        # beside the rest of the Trust boundary. ``None`` skips the check, for a
+        # stream replayed without a session behind it.
+        self.hook_canary = hook_canary
         self.session_id: str | None = None
         self.turns: list[ClaudeTurn] = []
         self.background_seen = False
@@ -752,6 +805,8 @@ class ClaudeEventResult:
             or not set(tools).issubset(CLAUDE_BUILTIN_TOOLS)
         ):
             raise RalphError("Claude loaded an unknown or external tool")
+        if self.hook_canary is not None and hooks_fired(self.hook_canary):
+            raise RalphError(CLAUDE_HOOKS_FIRED)
         return model
 
     def _accept_assistant(self, event: dict[str, Any]) -> None:
@@ -971,6 +1026,10 @@ def execute_iteration(
     # inner sandbox off), so the two do not fight and the outer profile is sole.
     stdout_path = run_dir / "stdout.ndjson"
     stderr_path = run_dir / "stderr.log"
+    # The hook canary (ADR-0002) lives in the Iteration's own run directory, which
+    # host isolation already lets the session write, and starts empty.
+    canary = run_dir / CLAUDE_HOOK_CANARY_DIR
+    canary.mkdir(exist_ok=True)
     args = session_argv(
         [
             "claude",
@@ -987,11 +1046,11 @@ def execute_iteration(
             "project",
             "--strict-mcp-config",
             "--settings",
-            CLAUDE_SETTINGS,
+            iteration_settings(canary),
         ],
         sandbox_profile,
     )
-    result = ClaudeEventResult(model, observe)
+    result = ClaudeEventResult(model, observe, hook_canary=canary)
     try:
         process = subprocess.Popen(
             args,
@@ -1160,6 +1219,11 @@ def _consume_claude_iteration(
     # failure below all still name the abandoned task (I7).
     report_killed_tasks(result)
     raise_if_controlled_stop(controller, "Claude", result.session_id)
+    if result.hook_canary is not None and hooks_fired(result.hook_canary):
+        # A hook that fired after the last init (a tool call, the final Stop) is
+        # caught here, before any outcome is judged on a session that broke the
+        # Trust boundary.
+        raise_backend_contract_failure(result.session_id, CLAUDE_HOOKS_FIRED)
     if stderr_invalid:
         raise_backend_contract_failure(
             result.session_id, "Claude emitted invalid UTF-8 on stderr"

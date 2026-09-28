@@ -270,9 +270,9 @@ an unattended billed run cannot prove which agents loaded. On Claude the agent
 vectors are the `.claude/agents` directory and the `.claude/settings.json`
 `agent` key; when such a vector is the *only* reason a repository is refused,
 the error names `--unsafe-allow-agents` so the supported opt-out is
-discoverable from the failure; every other refusal — a hooks or plugins
-directory, managed or server-managed configuration, or any other unsafe settings
-key, including when `agent` appears alongside one — keeps the plain message,
+discoverable from the failure; every other refusal — a plugins directory,
+managed or server-managed configuration, or any other unsafe settings key,
+including when `agent` appears alongside one — keeps the plain message,
 because the flag cannot relax those. On OpenCode, project and global agent
 definitions load even under `--pure` and all surface in the effective
 configuration's `agent` map, so a non-empty map is refused; that check runs
@@ -282,13 +282,30 @@ an effective configuration without an agent map is unfamiliar and fails closed.
 Pass `--unsafe-allow-agents` when a repo's loop legitimately develops or
 depends on agents: it admits the backend's agent vectors described above, and
 warns that agent isolation is not proven for that run. The flag is deliberately
-unsafe and narrowly scoped — it relaxes only those agent vectors. Hooks,
-plugins, managed configuration, MCP routing, and every other unsafe setting
-stay refused, and the runtime MCP/plugin/tool isolation proven from the
-session's init event is unchanged. The same flag is accepted by `ralph resume`
+unsafe and narrowly scoped — it relaxes only those agent vectors. Plugins,
+managed configuration, MCP routing, and every other unsafe setting stay
+refused, and the runtime MCP/plugin/tool isolation proven from the session's
+init event is unchanged. The same flag is accepted by `ralph resume`
 with either backend, and Ralph reproduces it in the `resume` and `run` commands
 it prints for a handed-off session so recovery re-establishes the same relaxed
 boundary.
+
+Claude hooks a repository commits for the people who work in it — a `hooks`
+key in `.claude/settings.json` (with its scripts, conventionally under
+`.claude/hooks`), or `hooks` in skill and agent frontmatter — are admitted but
+never run: Ralph starts every Claude session with `disableAllHooks`, which
+switches off each of those sources (measured on Claude Code 2.1.283;
+[ADR-0002](docs/adr/0002-claude-hook-exclusion-proven-at-runtime.md) records what
+each measurement covered). Because the
+session's init event says nothing about hooks, each Iteration also proves the
+switch held: Ralph's own settings register a canary hook on `SessionStart`,
+`UserPromptSubmit`, `PreToolUse` and `Stop`, each of which would leave a file in
+the Iteration's `hook-canary/` evidence directory. The canary is checked at every
+init and again at end of stream; a file there means hooks ran, and the Iteration
+fails closed as a backend contract failure instead of being judged. No flag
+relaxes this, and none is needed to admit a repository's hooks. `ralph resume`
+runs with hooks switched off too, but carries no canary: it hands over to an
+interactive session Ralph no longer reads.
 
 Every automated iteration and every recovery session is wrapped in a Seatbelt
 sandbox (host isolation, described under [Safety](#safety)). Pass
@@ -372,7 +389,7 @@ turn that launched it makes the CLI open a second turn with a fresh init. Ralph
 reads the session to end of stream and accepts these multi-turn streams instead
 of ending the run: every turn's init re-proves the full trust boundary
 (subscription-only auth, full-auto mode, no external MCP servers, plugins, or
-unknown tools, and the same session id), the turns' results are attributed in
+unknown tools, no hook canary fired, and the same session id), the turns' results are attributed in
 order, and the iteration is judged on the final turn's last message from the
 backend itself — a completion claim superseded by anything the backend said
 afterwards, in that turn or an earlier one, does not stop the run early, and a

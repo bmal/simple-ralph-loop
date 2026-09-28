@@ -200,6 +200,8 @@ authentication, customization isolation, and host isolation. For a Claude sessio
 it is re-proved on every `system/init` event — including a post-result teardown
 init, which passes the identical proof but opens no turn — so a longer stream is a
 stronger proof, never a weaker one, and stream position cannot weaken validation.
+The init reports nothing about hooks, so their exclusion is proven beside it by a
+canary hook that must never fire (ADR-0002).
 _Avoid_: security model, safety checks
 
 **Host isolation**:

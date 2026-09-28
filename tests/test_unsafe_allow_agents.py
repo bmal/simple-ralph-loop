@@ -4,6 +4,7 @@ never relaxes, and how the refusal advertises it."""
 from __future__ import annotations
 
 import json
+import re
 
 from harness import RalphCliTestCase
 
@@ -27,15 +28,15 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
         for path in self.calls.iterdir():
             path.unlink()
 
-        # The flag is scoped to agents: a co-present hooks directory is still
+        # The flag is scoped to agents: a co-present plugins directory is still
         # refused, and the backend is never launched.
-        hooks = self.repo / ".claude" / "hooks"
-        hooks.mkdir()
-        with_hooks = self.run_ralph("--unsafe-allow-agents", backend="claude")
-        self.assertNotEqual(with_hooks.returncode, 0)
-        self.assertIn("Claude customizations", with_hooks.stderr)
+        plugins = self.repo / ".claude" / "plugins"
+        plugins.mkdir()
+        with_plugins = self.run_ralph("--unsafe-allow-agents", backend="claude")
+        self.assertNotEqual(with_plugins.returncode, 0)
+        self.assertIn("Claude customizations", with_plugins.stderr)
         self.assertFalse((self.calls / "claude").exists())
-        hooks.rmdir()
+        plugins.rmdir()
 
         # settings.json: the flag admits the `agent` key but not other unsafe keys.
         settings = self.repo / ".claude" / "settings.json"
@@ -46,7 +47,7 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
         for path in self.calls.iterdir():
             path.unlink()
         settings.write_text(
-            json.dumps({"agent": {"reviewer": {}}, "hooks": {}}), encoding="utf-8"
+            json.dumps({"agent": {"reviewer": {}}, "env": {}}), encoding="utf-8"
         )
         mixed = self.run_ralph("--unsafe-allow-agents", backend="claude")
         self.assertNotEqual(mixed.returncode, 0)
@@ -106,19 +107,17 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
                 settings.unlink()
             return result.stderr
 
-        # A hooks directory and a plugins directory each stay plain.
-        _refusal(agents_present=False, dir_name="hooks", keys={})
+        # A plugins directory stays plain.
         _refusal(agents_present=False, dir_name="plugins", keys={})
-        # A mixed agents+hooks layout stays plain (agents is not the sole blocker).
-        _refusal(agents_present=True, dir_name="hooks", keys={})
+        # A mixed agents+plugins layout stays plain (agents is not the sole blocker).
         _refusal(agents_present=True, dir_name="plugins", keys={})
         # Another unsafe key alone stays plain.
-        _refusal(agents_present=False, dir_name=None, keys={"hooks": {}})
+        _refusal(agents_present=False, dir_name=None, keys={"enabledPlugins": {}})
         _refusal(agents_present=False, dir_name=None, keys={"env": {"X": "1"}})
         # `agent` alongside another unsafe key stays plain.
-        _refusal(agents_present=False, dir_name=None, keys={"agent": {}, "hooks": {}})
+        _refusal(agents_present=False, dir_name=None, keys={"agent": {}, "env": {}})
         # The agents directory alongside a non-agent settings key stays plain.
-        _refusal(agents_present=True, dir_name=None, keys={"hooks": {}})
+        _refusal(agents_present=True, dir_name=None, keys={"env": {}})
 
     def test_managed_config_refusal_never_advertises_the_opt_out(self) -> None:
         # Managed configuration is refused even when an agents directory is the
@@ -197,7 +196,6 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
             "enabledPlugins",
             "env",
             "extraKnownMarketplaces",
-            "hooks",
         )
         for key in other_keys:
             with self.subTest(key=key):
@@ -271,7 +269,9 @@ class UnsafeAllowAgentsTest(RalphCliTestCase):
                 if line.startswith("-p ")
             ]
             self.assertEqual(len(lines), 1)
-            return lines[0]
+            # The hook canary names the run's own directory (ADR-0002); runs
+            # differ in that and nothing else the flag could touch.
+            return re.sub(r"/runs/[^/]+/hook-canary/", "/runs/RUN/hook-canary/", lines[0])
 
         # The flag is a preflight relaxation only: the launch argv is identical
         # to a run without it and never carries the flag itself.
