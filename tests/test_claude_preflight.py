@@ -326,7 +326,44 @@ class ClaudePreflightTest(RalphCliTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         invocation = (self.calls / "claude").read_text()
-        self.assertIn('"enabledPlugins":{"agents-md@builtin":false,"telemetry@builtin":false}', invocation)
+        self.assertIn('"enabledPlugins":{"agents-md@builtin":false,"telemetry@builtin":false', invocation)
+
+    def test_claude_2_1_296_builtin_plugin_is_switched_off(self) -> None:
+        # Claude Code 2.1.296 began loading a third built-in plugin,
+        # `cc-plugin-plugin-authoring@builtin`, into every session; a live init
+        # under the 2.1.281 settings listed it in `plugins` and halted the run.
+        # Ralph switches it off through --settings with the other two.
+        event_lines = self._claude_events("<promise>COMPLETE</promise>").splitlines()
+        init = json.loads(event_lines[0])
+        init["claude_code_version"] = "2.1.296"
+        event_lines[0] = json.dumps(init)
+        result = self.run_ralph(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocation = (self.calls / "claude").read_text()
+        self.assertIn(
+            '"enabledPlugins":{"agents-md@builtin":false,"telemetry@builtin":false,'
+            '"cc-plugin-plugin-authoring@builtin":false}',
+            invocation,
+        )
+
+    def test_claude_init_listing_a_builtin_plugin_fails_closed(self) -> None:
+        # Switching a built-in plugin off is what keeps `plugins` empty; if one
+        # still loads, the no-plugins proof must refuse it rather than admit it.
+        event_lines = self._claude_events("<promise>COMPLETE</promise>").splitlines()
+        init = json.loads(event_lines[0])
+        init["plugins"] = [{
+            "name": "cc-plugin-plugin-authoring",
+            "path": "builtin",
+            "source": "cc-plugin-plugin-authoring@builtin",
+        }]
+        event_lines[0] = json.dumps(init)
+        result = self.run_ralph(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Claude loaded external MCP servers or plugins", result.stderr)
 
     def test_api_key_sourced_claude_session_fails_closed(self) -> None:
         # Any reported API-key source means the session is metered, not

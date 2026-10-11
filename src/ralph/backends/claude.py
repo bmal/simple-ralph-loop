@@ -263,10 +263,16 @@ CLAUDE_BUILTIN_TOOLS = {
     "Workflow",
     "Write",
 }
-# Claude Code 2.1.281 loads two built-in plugins into every session and reports
-# them in the init event's `plugins`; switching them off here keeps that list
-# empty, so the no-plugins proof holds without admitting any plugin source.
-CLAUDE_BUILTIN_PLUGINS = ("agents-md@builtin", "telemetry@builtin")
+# Claude Code loads built-in plugins into every session and reports them in the
+# init event's `plugins` -- two since 2.1.281, a third (`plugin-authoring`)
+# since 2.1.296. Switching them off here keeps that list empty, so the
+# no-plugins proof holds without admitting any plugin source. A Claude Code
+# upgrade that ships a new built-in plugin halts every run until it is added.
+CLAUDE_BUILTIN_PLUGINS = (
+    "agents-md@builtin",
+    "telemetry@builtin",
+    "cc-plugin-plugin-authoring@builtin",
+)
 _CLAUDE_BASE_SETTINGS = {
     "autoMemoryEnabled": False,
     "disableAllHooks": True,
