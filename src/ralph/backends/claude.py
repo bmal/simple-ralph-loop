@@ -265,13 +265,16 @@ CLAUDE_BUILTIN_TOOLS = {
 }
 # Claude Code loads built-in plugins into every session and reports them in the
 # init event's `plugins` -- two since 2.1.281, a third (`plugin-authoring`)
-# since 2.1.296. Switching them off here keeps that list empty, so the
-# no-plugins proof holds without admitting any plugin source. A Claude Code
-# upgrade that ships a new built-in plugin halts every run until it is added.
+# since 2.1.296, and two more (`privacy`, `easel`) since 2.1.322. Switching them
+# off here keeps that list empty, so the no-plugins proof holds without
+# admitting any plugin source. A Claude Code upgrade that ships a new built-in
+# plugin halts every run until it is added.
 CLAUDE_BUILTIN_PLUGINS = (
     "agents-md@builtin",
     "telemetry@builtin",
     "cc-plugin-plugin-authoring@builtin",
+    "cc-plugin-privacy@builtin",
+    "cc-plugin-easel@builtin",
 )
 _CLAUDE_BASE_SETTINGS = {
     "autoMemoryEnabled": False,

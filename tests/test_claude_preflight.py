@@ -344,7 +344,28 @@ class ClaudePreflightTest(RalphCliTestCase):
         invocation = (self.calls / "claude").read_text()
         self.assertIn(
             '"enabledPlugins":{"agents-md@builtin":false,"telemetry@builtin":false,'
-            '"cc-plugin-plugin-authoring@builtin":false}',
+            '"cc-plugin-plugin-authoring@builtin":false',
+            invocation,
+        )
+
+    def test_claude_2_1_322_builtin_plugins_are_switched_off(self) -> None:
+        # Claude Code 2.1.322 began loading two more built-in plugins,
+        # `cc-plugin-privacy@builtin` and `cc-plugin-easel@builtin`, into every
+        # session; a live init under the 2.1.296 settings listed both in
+        # `plugins` and halted the run. Ralph switches them off with the rest.
+        event_lines = self._claude_events("<promise>COMPLETE</promise>").splitlines()
+        init = json.loads(event_lines[0])
+        init["claude_code_version"] = "2.1.322"
+        event_lines[0] = json.dumps(init)
+        result = self.run_ralph(
+            backend="claude", env={"FAKE_CLAUDE_EVENTS": "\n".join(event_lines)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocation = (self.calls / "claude").read_text()
+        self.assertIn(
+            '"enabledPlugins":{"agents-md@builtin":false,"telemetry@builtin":false,'
+            '"cc-plugin-plugin-authoring@builtin":false,'
+            '"cc-plugin-privacy@builtin":false,"cc-plugin-easel@builtin":false}',
             invocation,
         )
 
